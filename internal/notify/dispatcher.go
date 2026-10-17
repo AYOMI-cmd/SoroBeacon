@@ -112,6 +112,9 @@ type Dispatcher struct {
 	// due escalations one pass processes.
 	EscalationInterval time.Duration
 	EscalationBatch    int
+	// now is the clock used for escalation bookkeeping. Nil means time.Now;
+	// tests substitute it so a delayed step can be reached without sleeping.
+	now func() time.Time
 }
 
 // NewDispatcher wires a Dispatcher with default retry settings.
@@ -145,6 +148,21 @@ func (d *Dispatcher) WithDisableAfterFailures(n int) *Dispatcher {
 		d.disableAfterFailures = n
 	}
 	return d
+}
+
+// WithClock replaces the clock escalation scheduling reads. Pass nil to
+// restore time.Now. Tests use it to reach a delayed step without sleeping.
+func (d *Dispatcher) WithClock(now func() time.Time) *Dispatcher {
+	d.now = now
+	return d
+}
+
+// nowTime is the dispatcher's clock, defaulting to the wall clock.
+func (d *Dispatcher) nowTime() time.Time {
+	if d.now != nil {
+		return d.now()
+	}
+	return time.Now()
 }
 
 // DisableAfterFailures returns the configured threshold. Exposed for tests.

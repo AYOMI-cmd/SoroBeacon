@@ -67,6 +67,57 @@ tables (`monitors`, `rules`, `channels`, `monitor_channels`), the
 single-row `ingest_state` checkpoint and `schema_migrations` all stay in
 the dump; the last one is tiny and must survive for the check below.
 
+## Configuration snapshots with the CLI
+
+`pg_dump` is the full-fidelity backup. For moving configuration between
+instances, the binary also has a JSON snapshot pair:
+
+```sh
+sorobeacon backup > sorobeacon-config.json
+sorobeacon restore < sorobeacon-config.json
+```
+
+> **The snapshot is a credential file.** Channel `config` is decrypted in the
+> output, so the file can restore onto an instance with a different (or no)
+> `CONFIG_ENCRYPTION_KEY` — but that also means webhook URLs, bot tokens and
+> SMTP passwords appear in it in plaintext. Protect it like the database dump
+> or the encryption key: restrictive permissions, encrypted at rest, and
+> deleted when no longer needed. The command refuses to write to a terminal,
+> and that is the only safeguard it can enforce.
+
+The snapshot contains monitors (with their channel attachments), rules,
+channels (with config), saved searches and monitor templates. It does **not**
+contain alerts, delivery attempts, dead letters, escalation state, maintenance
+windows, inhibitions, the audit log, scoped tokens or the ingest checkpoint —
+use `pg_dump` when you need history. It also covers only the **default
+workspace**; configuration in other workspaces is not exported.
+
+A restore **appends**; it never deletes or updates an existing row. On a
+non-empty database it refuses unless `--force` is passed. With `--force` the
+backup's rows are added alongside the existing ones with new IDs (the original
+`created_at` timestamps are kept), and every cross-row reference — monitor
+attachments, rule ownership, saved-search filters and template channel lists —
+is remapped to the new IDs. To replace an instance's configuration, restore
+into an empty database.
+
+`--dry-run` validates the file and reports the same row counts and the same
+accept/refuse decision as a real run, without writing anything. Combine it
+with `--force` to preview a restore into a non-empty database.
+
+A malformed, truncated or internally inconsistent file is refused before the
+database is opened, so it creates no schema and writes no rows. Validation
+covers the backup version, required timestamps, duplicate IDs, dangling
+monitor and rule references, and config shapes. An import that fails against
+the database part-way through is **not transactional**: rows written before
+the failure remain, and the next restore appends to them.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Backend failure (database unreachable, write rejected) |
+| 2 | Usage error (bad flag, unexpected argument, restore needs `--force`) |
+| 3 | Invalid backup (not JSON, truncated, inconsistent, or newer than this binary) |
+
 ## Restoring
 
 Restore into an **empty database, with the service stopped**. Substitute

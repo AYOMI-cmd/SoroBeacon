@@ -66,13 +66,13 @@ func main() {
 		case "backup":
 			if err := runBackup(args[1:]); err != nil {
 				slog.Error("backup failed", "err", err)
-				os.Exit(1)
+				os.Exit(exitCodeFor(err))
 			}
 			return
 		case "restore":
 			if err := runRestore(args[1:]); err != nil {
 				slog.Error("restore failed", "err", err)
-				os.Exit(1)
+				os.Exit(exitCodeFor(err))
 			}
 			return
 		}
