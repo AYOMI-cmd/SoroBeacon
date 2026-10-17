@@ -87,6 +87,10 @@ reference takes effect on the next delivery. A rotated secret is otherwise
 picked up when its cache entry expires; set a shorter TTL if you need faster
 propagation.
 
+Invalidation is process-wide: the resolver keeps one cache per process, not one
+per channel, so an edit to any channel clears every cached reference. The next
+delivery for every channel re-resolves its references once.
+
 ## Adding a provider
 
 `internal/secrets.Provider` is two methods:
