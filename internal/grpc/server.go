@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"time"
 
 	"google.golang.org/grpc"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // Server implements the gRPC MonitorService alongside the existing REST API.
@@ -83,39 +85,56 @@ func (s *Server) Stop() {
 // --- auth interceptors ---
 
 func (s *Server) authUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	if err := s.checkAuth(ctx); err != nil {
+	callerCtx, err := s.authContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return handler(ctx, req)
+	return handler(callerCtx, req)
 }
 
 func (s *Server) authStream(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	if err := s.checkAuth(ss.Context()); err != nil {
+	callerCtx, err := s.authContext(ss.Context())
+	if err != nil {
 		return err
 	}
-	return handler(srv, ss)
+	return handler(srv, &authenticatedServerStream{ServerStream: ss, ctx: callerCtx})
 }
 
+type authenticatedServerStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *authenticatedServerStream) Context() context.Context { return s.ctx }
+
 func (s *Server) checkAuth(ctx context.Context) error {
+	_, err := s.authContext(ctx)
+	return err
+}
+
+func (s *Server) authContext(ctx context.Context) (context.Context, error) {
 	if s.auth == nil || !s.auth.Enabled() {
-		return nil
+		return workspace.With(ctx, workspace.Default), nil
 	}
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return status.Error(codes.Unauthenticated, "missing metadata")
+		return nil, status.Error(codes.Unauthenticated, "missing metadata")
 	}
 	vals := md.Get("authorization")
 	if len(vals) == 0 {
-		return status.Error(codes.Unauthenticated, "missing authorization metadata")
+		return nil, status.Error(codes.Unauthenticated, "missing authorization metadata")
 	}
 	token, ok := auth.Bearer(vals[0])
 	if !ok {
-		return status.Error(codes.Unauthenticated, "invalid authorization header")
+		return nil, status.Error(codes.Unauthenticated, "invalid authorization header")
 	}
-	if !s.auth.Verify(token) {
-		return status.Error(codes.Unauthenticated, "invalid token")
+	req := (&http.Request{Header: make(http.Header)}).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+token)
+	principal, ok := s.auth.Principal(req)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "invalid token")
 	}
-	return nil
+	return workspace.With(ctx, principal.Workspace), nil
 }
 
 // --- service interface ---

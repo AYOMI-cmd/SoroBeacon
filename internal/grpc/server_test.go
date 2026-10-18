@@ -21,6 +21,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // gobCodec lets the hand-written service types exercise grpc-go's real
@@ -123,6 +124,18 @@ func TestCheckAuth_ValidToken(t *testing.T) {
 
 	err := s.checkAuth(ctx)
 	assert.NoError(t, err)
+}
+
+func TestAuthContextScopesBoundCredentialToWorkspace(t *testing.T) {
+	authn := auth.NewBound([]auth.Binding{{Workspace: "team-a", Token: "team-a-token"}}, 0)
+	s := &Server{auth: authn}
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer team-a-token"))
+
+	got, err := s.authContext(ctx)
+	require.NoError(t, err)
+	gotWorkspace, ok := workspace.From(got)
+	require.True(t, ok)
+	assert.Equal(t, workspace.ID("team-a"), gotWorkspace)
 }
 
 func TestCheckAuth_InvalidToken(t *testing.T) {
