@@ -207,28 +207,46 @@ type StreamAlertsRequest struct {
 
 // --- handler wrappers ---
 
-func getMonitorHandler(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+func getMonitorHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 	req := &GetMonitorRequest{}
 	if err := dec(req); err != nil {
 		return nil, err
 	}
-	return srv.(MonitorServiceServer).GetMonitor(ctx, req)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(MonitorServiceServer).GetMonitor(ctx, req.(*GetMonitorRequest))
+	}
+	if interceptor == nil {
+		return handler(ctx, req)
+	}
+	return interceptor(ctx, req, &grpc.UnaryServerInfo{Server: srv, FullMethod: "/sorobeacon.v1.MonitorService/GetMonitor"}, handler)
 }
 
-func listMonitorsHandler(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+func listMonitorsHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 	req := &ListMonitorsRequest{}
 	if err := dec(req); err != nil {
 		return nil, err
 	}
-	return srv.(MonitorServiceServer).ListMonitors(ctx, req)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(MonitorServiceServer).ListMonitors(ctx, req.(*ListMonitorsRequest))
+	}
+	if interceptor == nil {
+		return handler(ctx, req)
+	}
+	return interceptor(ctx, req, &grpc.UnaryServerInfo{Server: srv, FullMethod: "/sorobeacon.v1.MonitorService/ListMonitors"}, handler)
 }
 
-func listAlertsHandler(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+func listAlertsHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 	req := &ListAlertsRequest{}
 	if err := dec(req); err != nil {
 		return nil, err
 	}
-	return srv.(MonitorServiceServer).ListAlerts(ctx, req)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(MonitorServiceServer).ListAlerts(ctx, req.(*ListAlertsRequest))
+	}
+	if interceptor == nil {
+		return handler(ctx, req)
+	}
+	return interceptor(ctx, req, &grpc.UnaryServerInfo{Server: srv, FullMethod: "/sorobeacon.v1.MonitorService/ListAlerts"}, handler)
 }
 
 type streamAlertsStream struct {
