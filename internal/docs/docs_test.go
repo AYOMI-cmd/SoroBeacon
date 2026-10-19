@@ -13,15 +13,16 @@ import (
 // the tests read the real documentation files on disk wherever they run.
 const repoRoot = "../.."
 
-// pagesAddedHere are the four documentation pages this branch introduces.
-// Each must exist and be linked from docs/SUMMARY.md — the "done" condition
-// every one of the issues specifies — and they are the pages whose internal
-// links the link checker below walks.
+// pagesAddedHere are the documentation pages this branch introduces. Each must
+// exist and be linked from docs/SUMMARY.md — the "done" condition every one of
+// the issues specifies — and they are the pages whose internal links the link
+// checker below walks.
 var pagesAddedHere = []string{
 	"docs/operations/security.md",
 	"docs/operations/upgrading.md",
 	"docs/guides/writing-rules.md",
 	"docs/contributing/testing.md",
+	"docs/reference/terraform.md",
 }
 
 // markdownLink matches [text](target) links in prose. Code fences and inline
@@ -88,8 +89,8 @@ func TestSummaryLinksEveryNewPage(t *testing.T) {
 	}
 }
 
-// TestNewPagesLinksResolve walks every relative link in the four new pages
-// and fails for a target that does not exist, or a #fragment that matches no
+// TestNewPagesLinksResolve walks every relative link in the new pages and
+// fails for a target that does not exist, or a #fragment that matches no
 // heading in the target document. Dead cross-references between the guides
 // and the reference pages they deliberately link out to would otherwise go
 // unnoticed until a reader hit them.

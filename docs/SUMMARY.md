@@ -63,6 +63,7 @@
 
 * [Architecture](reference/architecture.md)
 * [HTTP API](reference/api.md)
+* [Terraform provider](reference/terraform.md)
 * [CLI flags (environment variables)](reference/cli.md)
 
 ## 🔌 Contributing
