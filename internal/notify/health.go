@@ -24,7 +24,7 @@ func TestHealthUpdate(sendErr error, at time.Time) store.ChannelHealthUpdate {
 		u.Success = true
 		return u
 	}
-	u.Error = sendErr.Error()
+	u.Error = sanitizeDeliveryError(redactURLError(sendErr)).Error()
 	u.Permanent = IsPermanent(sendErr)
 	return u
 }
