@@ -29,6 +29,7 @@ and this page should be updated.
 | `NETWORK_PASSPHRASE` | no (public nets) | SDF passphrases are public. For `NETWORK=custom` it identifies a private network — treat it as operational config, not a credential. |
 | `VAULT_TOKEN` | **yes** | Credential for the Vault secret provider. Never logged; a resolved secret is never returned by the API. |
 | `RPC_URL` / `RPC_URLS` / `SOROTRAIL_URL` | maybe | A URL is not a password, but provider URLs sometimes embed tokens in the path or query. Do not commit those. |
+| `ALERT_ENRICHMENT_URL` | maybe | Off by default and not a credential itself, but the enrichment service's token often rides in the userinfo or query string. If yours does, treat it like `API_TOKEN`: mode `0600`, a secret manager in production, never in a log line or ticket. |
 | `CORS_ALLOWED_ORIGINS` | no | An allow-list, not a credential. Think hard before allowing a third-party origin: whatever credential that origin's users hold can act through their browser. |
 | everything else | no | |
 
@@ -423,6 +424,16 @@ at `warn` and counted in `sorobeacon_reorgs_total`.
 | `ARCHIVE_URL` | URL or path | empty (archiving off) | optional | Where retention copies a batch of expired alerts before deleting them. A local directory path, `file://`, `dir://`, or `s3://bucket/prefix` (region from `?region=` or `AWS_REGION`; credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `?endpoint=` for MinIO or a test server). A failed archive blocks that batch's delete, so nothing is dropped un-archived. Requires `ALERT_RETENTION` to have any effect. Archive objects are NDJSON, one alert per line, keyed by the batch's own id range so re-running is idempotent. |
 
 Archive objects contain only alert rows (contract id, event, payload, ledger); channel `config` — the webhook URLs, bot tokens and SMTP credentials — is never read by the archiver and can never appear in one.
+
+## Alert enrichment
+
+Optional HTTP JSON context fetched for an alert as it is created, before delivery. The full contract, failure behaviour, caching and an example service are in the [alert enrichment guide](guides/alert-enrichment.md); the variables:
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `ALERT_ENRICHMENT_URL` | absolute `http(s)` URL | empty (off) | optional | Endpoint called with `?contract_id=<id>&event_name=<name>` on every alert. Must be an absolute HTTP(S) URL; anything else fails at startup. The response must be a 2xx JSON object of at most 64 KiB; anything else is a soft failure and the alert is delivered unenriched. |
+| `ALERT_ENRICHMENT_TIMEOUT` | duration | `2s` | optional | Budget for one enrichment call. The client's whole-request timeout; `<= 0` falls back to the default. |
+| `ALERT_ENRICHMENT_CACHE_TTL` | duration | `5m` | optional | How long a response is reused per contract (in-memory, per process; the cache key is the contract id, not the event). `<= 0` falls back to the default. |
 
 ## Logging
 
