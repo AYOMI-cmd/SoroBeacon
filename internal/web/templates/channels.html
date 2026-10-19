@@ -11,10 +11,18 @@
 </section>
 {{end}}
 {{if .Channels}}
+<form id="bulk-channels" method="post" action="/channels/bulk">
+<p>
+  <button type="submit" name="enabled" value="true">Enable selected</button>
+  <button type="submit" name="enabled" value="false">Disable selected</button>
+  <span class="muted">Select channels, then enable or disable them in one step. There is no “all channels” action.</span>
+</p>
+</form>
 <table>
-  <tr><th>ID</th><th>Name</th><th>Type</th><th>Min Severity</th><th>Status</th><th>Health</th><th>Created</th><th></th></tr>
+  <tr><th><input type="checkbox" aria-label="Select all" onclick="document.querySelectorAll('input[name=ids]').forEach(c => c.checked = this.checked)"></th><th>ID</th><th>Name</th><th>Type</th><th>Min Severity</th><th>Status</th><th>Health</th><th>Created</th><th></th></tr>
   {{range .Channels}}
   <tr{{if .AutoDisabled}} class="attention"{{end}}>
+    <td><input type="checkbox" form="bulk-channels" name="ids" value="{{.ID}}" aria-label="Select channel {{.Name}}"></td>
     <td>{{.ID}}</td>
     <td>{{.Name}}</td>
     <td>{{.Type}}</td>
@@ -46,6 +54,7 @@
       <button hx-post="/channels/{{.ID}}/test" hx-target="#test-result-{{.ID}}" hx-swap="innerHTML">Send test</button>
       <span id="test-result-{{.ID}}" class="muted"></span>
       <form class="inline" method="post" action="/channels/{{.ID}}/toggle"><button>{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form>
+      <form class="inline" method="post" action="/channels/{{.ID}}/duplicate"><button>Duplicate</button></form>
       <form class="inline" method="post" action="/channels/{{.ID}}/delete"
             onsubmit="return confirm('Delete channel {{.Name}}?')"><button>Delete</button></form>
     </td>

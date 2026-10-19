@@ -808,6 +808,52 @@ func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channe
 	return pgx.CollectRows(rows, p.scanChannel)
 }
 
+func (p *Postgres) SetChannelsEnabled(ctx context.Context, ids []int64, enabled bool) (int, []int64, error) {
+	uniq := uniqueIDs(ids)
+	if len(uniq) == 0 {
+		return 0, []int64{}, nil
+	}
+	// The CASE arms mirror UpdateChannel: an off-to-on transition clears the
+	// health state, so a bulk re-enable is as explicit a recovery as a single one.
+	rows, err := p.pool.Query(ctx,
+		`UPDATE channels SET
+		   enabled = $1,
+		   consecutive_failures = CASE WHEN $1 AND NOT enabled THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN $1 AND NOT enabled THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN $1 AND NOT enabled THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN $1 AND NOT enabled THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN $1 AND NOT enabled THEN NULL ELSE disabled_at END
+		 WHERE id = ANY($2) AND workspace_id = $3 RETURNING id`,
+		enabled, uniq, workspaceID(ctx))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	found := make(map[int64]struct{}, len(uniq))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, nil, err
+		}
+		found[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	return len(found), unknownIDs(uniq, found), nil
+}
+
+// unknownIDs returns the ids in want that are absent from found, never nil.
+func unknownIDs(want []int64, found map[int64]struct{}) []int64 {
+	unknown := make([]int64, 0)
+	for _, id := range want {
+		if _, ok := found[id]; !ok {
+			unknown = append(unknown, id)
+		}
+	}
+	return unknown
+}
+
 func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(p.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
