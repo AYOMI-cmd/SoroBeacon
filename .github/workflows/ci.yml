@@ -63,6 +63,46 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://sorobeacon:sorobeacon@localhost:5432/sorobeacon?sslmode=disable
 
+  # terraform-provider-sorobeacon/ is a nested module, so nothing above sees
+  # it: `go build ./...` from the root stops at the subdirectory that carries
+  # its own go.mod, by design. Without this job seven Go files ship with no
+  # build check, no vet and no lint. The whole job runs inside the module
+  # directory — that is the only thing that makes the commands see the
+  # provider — and caches on the provider's own go.sum, because setup-go's
+  # cache key comes from the go.sum it is pointed at.
+  terraform-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: terraform-provider-sorobeacon
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: terraform-provider-sorobeacon/go.mod
+          cache-dependency-path: terraform-provider-sorobeacon/go.sum
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      # The provider has no tests yet; running the command now means the job
+      # already covers them on the day they land, rather than waiting for a
+      # follow-up to notice a red suite.
+      - name: Test
+        run: go test ./... -count=1
+      # A nested module drifts silently: nothing in the root module's build
+      # notices an untidy go.mod here, and the next person to run tidy gets a
+      # diff nobody reviewed.
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+          working-directory: terraform-provider-sorobeacon
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
