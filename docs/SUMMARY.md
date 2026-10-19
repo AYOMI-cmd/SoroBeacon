@@ -63,6 +63,7 @@
 
 * [Architecture](reference/architecture.md)
 * [HTTP API](reference/api.md)
+* [gRPC API](reference/grpc.md)
 * [CLI flags (environment variables)](reference/cli.md)
 
 ## 🔌 Contributing

@@ -22,6 +22,7 @@ var pagesAddedHere = []string{
 	"docs/operations/upgrading.md",
 	"docs/guides/writing-rules.md",
 	"docs/contributing/testing.md",
+	"docs/reference/grpc.md",
 }
 
 // markdownLink matches [text](target) links in prose. Code fences and inline
