@@ -92,8 +92,8 @@ func TestSummaryLinksEveryNewPage(t *testing.T) {
 	}
 }
 
-// TestNewPagesLinksResolve walks every relative link in the four new pages
-// and fails for a target that does not exist, or a #fragment that matches no
+// TestNewPagesLinksResolve walks every relative link in the new pages and
+// fails for a target that does not exist, or a #fragment that matches no
 // heading in the target document. Dead cross-references between the guides
 // and the reference pages they deliberately link out to would otherwise go
 // unnoticed until a reader hit them.
