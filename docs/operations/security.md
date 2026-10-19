@@ -160,6 +160,10 @@ policy filter — the wrong direction for a bug to fall in.
 
 ## Scoped, expiring tokens
 
+For the full credential, scope and workspace enumeration, including the
+route-by-route scope table, the status-code contract and the surfaces where
+enforcement differs, see the [Authorization reference](../reference/authorization.md).
+
 `API_TOKEN` and `WORKSPACE_TOKENS` are **static**: they authenticate with full
 reach over their workspace, they never expire, and revoking one means editing an
 environment variable and restarting the process. That is the right shape for the

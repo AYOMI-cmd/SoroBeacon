@@ -199,6 +199,16 @@ func sqliteDSN(databaseURL string) (string, error) {
 // always normalised to UTC so comparisons never depend on the host's zone.
 func sqliteTimeString(t time.Time) string { return t.UTC().Format(sqliteTimeLayout) }
 
+// sqliteCreatedAt is the value bound for an explicit created_at, or nil so the
+// column's default applies. Restore sets it to keep a row's original timestamp;
+// ordinary creates leave CreatedAt zero and get "now".
+func sqliteCreatedAt(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return sqliteTimeString(t)
+}
+
 // parseSQLiteTime reverses sqliteTimeString. An empty string is the zero time
 // so a NULL / absent timestamp never becomes an error.
 func parseSQLiteTime(s string) (time.Time, error) {
@@ -263,9 +273,10 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 		 RETURNING id, created_at`,
-		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), workspaceID(ctx), m.Network,
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), workspaceID(ctx), m.Network, sqliteCreatedAt(m.CreatedAt),
 	).Scan(&m.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -919,10 +930,10 @@ func (s *SQLite) CreateChannel(ctx context.Context, c *Channel) error {
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 		 RETURNING id, created_at`,
-		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx),
+		c.Name, c.Type, string(config), boolToInt(c.Enabled), c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx), sqliteCreatedAt(c.CreatedAt),
 	).Scan(&c.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -2521,9 +2532,10 @@ func (s *SQLite) CreateSavedSearch(ctx context.Context, ss *SavedSearch) error {
 	}
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO saved_searches (name, filter, is_default, workspace_id) VALUES (?, ?, ?, ?)
+		`INSERT INTO saved_searches (name, filter, is_default, workspace_id, created_at)
+		 VALUES (?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
 		 RETURNING id, created_at`,
-		ss.Name, string(filter), boolToInt(ss.IsDefault), ws,
+		ss.Name, string(filter), boolToInt(ss.IsDefault), ws, sqliteCreatedAt(ss.CreatedAt),
 	).Scan(&ss.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
@@ -2658,8 +2670,10 @@ func (s *SQLite) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) 
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	var created string
 	if err := s.db.QueryRowContext(ctx,
-		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters, workspace_id) VALUES (?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
-		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON), workspaceID(ctx)).Scan(&t.ID, &created); err != nil {
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters, workspace_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+		 RETURNING id, created_at`,
+		t.Name, t.Description, string(rulesJSON), string(channelJSON), string(paramsJSON), workspaceID(ctx), sqliteCreatedAt(t.CreatedAt)).Scan(&t.ID, &created); err != nil {
 		return mapSQLiteErr(err)
 	}
 	var err error
