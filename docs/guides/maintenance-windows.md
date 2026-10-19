@@ -74,3 +74,8 @@ curl -s -X DELETE localhost:8080/api/v1/maintenance-windows/1
 
 The suppression check runs on the delivery path as a single indexed lookup, so
 a window adds one query per alert — not one per channel.
+
+A window is checked once, before an alert is delivered or an
+[escalation](../guides/escalation.md) starts. It is not re-checked for the
+later steps of an escalation that began before the window, so those steps can
+still fire during the window. Acknowledge the alert to stop them.

@@ -2,6 +2,8 @@ package lease
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"os"
 	"sync/atomic"
@@ -17,9 +19,13 @@ import (
 // logic is the same code either way.
 const testInterval = 50 * time.Millisecond
 
-// testKey keeps the integration tests off the production lock key, so a
-// SoroBeacon left running by `make up` cannot hold the lock these tests need.
-const testKey int64 = 0x746573742D6C6561 // "test-lea"
+func uniqueTestKey(t *testing.T) int64 {
+	t.Helper()
+	var b [8]byte
+	_, err := rand.Read(b[:])
+	require.NoError(t, err)
+	return int64(binary.LittleEndian.Uint64(b[:]))
+}
 
 func requirePostgres(t *testing.T) string {
 	t.Helper()
@@ -78,14 +84,14 @@ type electionNode struct {
 	done   chan struct{}
 }
 
-func newNode(t *testing.T, name, url string) *electionNode {
+func newNodeWithKey(t *testing.T, name, url string, key int64) *electionNode {
 	t.Helper()
 	inner, err := newPostgresDialer(url)
 	require.NoError(t, err)
 	d := &controllableDialer{inner: inner}
 	n := &electionNode{
 		name:  name,
-		lease: newLease(d, Options{Interval: testInterval, Key: testKey}, testLogger()),
+		lease: newLease(d, Options{Interval: testInterval, Key: key}, testLogger()),
 		job:   &jobRecorder{},
 		dial:  d,
 		done:  make(chan struct{}),
@@ -124,7 +130,8 @@ func (n *electionNode) polling() bool {
 
 func TestPostgresElectsOnePoller(t *testing.T) {
 	url := requirePostgres(t)
-	a, b := newNode(t, "a", url), newNode(t, "b", url)
+	key := uniqueTestKey(t)
+	a, b := newNodeWithKey(t, "a", url, key), newNodeWithKey(t, "b", url, key)
 	a.start()
 	b.start()
 
@@ -155,7 +162,8 @@ func TestPostgresElectsOnePoller(t *testing.T) {
 // and deliver every alert twice; it must stop instead.
 func TestPostgresLeaderStopsPollingWhenItsConnectionDies(t *testing.T) {
 	url := requirePostgres(t)
-	a, b := newNode(t, "a", url), newNode(t, "b", url)
+	key := uniqueTestKey(t)
+	a, b := newNodeWithKey(t, "a", url, key), newNodeWithKey(t, "b", url, key)
 	a.start()
 	b.start()
 
@@ -184,6 +192,96 @@ func TestPostgresLeaderStopsPollingWhenItsConnectionDies(t *testing.T) {
 		t.Fatalf("%s started the poller %d more times after losing its connection", leader.name, now-starts)
 	}
 	assertOnlyOnePolls(t, a, b)
+}
+
+func TestPostgresSessionLockLifecycle(t *testing.T) {
+	url := requirePostgres(t)
+	dialer, err := newPostgresDialer(url)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	key := uniqueTestKey(t)
+
+	firstRaw, err := dialer.Dial(ctx)
+	require.NoError(t, err)
+	secondRaw, err := dialer.Dial(ctx)
+	require.NoError(t, err)
+	first, second := firstRaw.(*pgSession), secondRaw.(*pgSession)
+	t.Cleanup(func() { _ = first.Close(context.Background()); _ = second.Close(context.Background()) })
+
+	got, err := first.TryLock(ctx, key)
+	require.NoError(t, err)
+	require.True(t, got, "first session should acquire an unheld lock")
+	got, err = second.TryLock(ctx, key)
+	require.NoError(t, err)
+	require.False(t, got, "second session must not acquire a held lock")
+
+	held, err := first.Renew(ctx)
+	require.NoError(t, err)
+	require.True(t, held, "the current lock holder should renew successfully")
+	held, err = second.Renew(ctx)
+	require.NoError(t, err)
+	require.False(t, held, "a session without a lock must not report leadership")
+	require.Error(t, second.Unlock(ctx, key), "unlocking a lock owned by another session must be refused")
+	require.NoError(t, first.Unlock(ctx, key))
+	held, err = first.Renew(ctx)
+	require.NoError(t, err)
+	require.False(t, held, "unlock must immediately end leadership")
+	got, err = second.TryLock(ctx, key)
+	require.NoError(t, err)
+	require.True(t, got, "the second session should acquire immediately after unlock")
+
+	require.NoError(t, second.Close(ctx))
+	require.NoError(t, second.Close(ctx), "closing a session twice is safe")
+}
+
+func TestPostgresConcurrentTryLockHasOneWinner(t *testing.T) {
+	url := requirePostgres(t)
+	dialer, err := newPostgresDialer(url)
+	require.NoError(t, err)
+	const contenders = 6
+	key := uniqueTestKey(t)
+	type result struct {
+		session  *pgSession
+		acquired bool
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan result, contenders)
+	for range contenders {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			sess, err := dialer.Dial(ctx)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			<-start
+			acquired, err := sess.TryLock(ctx, key)
+			results <- result{session: sess.(*pgSession), acquired: acquired, err: err}
+		}()
+	}
+	close(start)
+	winners := 0
+	var winner *pgSession
+	var sessions []*pgSession
+	for range contenders {
+		r := <-results
+		require.NoError(t, r.err)
+		sessions = append(sessions, r.session)
+		if r.acquired {
+			winners++
+			winner = r.session
+		}
+	}
+	t.Cleanup(func() {
+		for _, sess := range sessions {
+			_ = sess.Close(context.Background())
+		}
+	})
+	require.Equal(t, 1, winners, "exactly one concurrent contender must hold the advisory lock")
+	require.NoError(t, winner.Unlock(context.Background(), key))
 }
 
 // waitForSingleLeader waits until exactly one node holds the lease and is
