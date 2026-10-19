@@ -65,7 +65,7 @@
 * [Architecture](reference/architecture.md)
 * [Authorization](reference/authorization.md)
 * [HTTP API](reference/api.md)
-* [Terraform provider](reference/terraform.md)
+* [gRPC API](reference/grpc.md)
 * [CLI flags (environment variables)](reference/cli.md)
 
 ## 🔌 Contributing
