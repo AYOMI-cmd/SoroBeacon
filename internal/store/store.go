@@ -894,6 +894,12 @@ type Channels interface {
 	ListChannelsPage(ctx context.Context, f ListFilter) ([]Channel, error)
 	UpdateChannel(ctx context.Context, c *Channel) error
 	DeleteChannel(ctx context.Context, id int64) error
+	// SetChannelsEnabled sets enabled on every existing id in one statement,
+	// with the same unknown-id and duplicate-id behaviour as
+	// SetMonitorsEnabled. Turning a channel on clears the health state
+	// UpdateChannel clears on an off-to-on transition. Queued and in-flight
+	// deliveries are untouched: they live in their own tables.
+	SetChannelsEnabled(ctx context.Context, ids []int64, enabled bool) (updated int, unknown []int64, err error)
 	// ListMonitorsForChannel returns monitors attached to a channel, including
 	// every attachment so callers can identify monitors left without a channel.
 	ListMonitorsForChannel(ctx context.Context, channelID int64) ([]Monitor, error)

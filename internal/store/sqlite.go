@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1092,6 +1093,49 @@ func parseSQLiteTimePtr(ns sql.NullString) (*time.Time, error) {
 // a genuine off-to-on transition only: renaming a channel that is still
 // failing must not quietly wipe the evidence. ?4 is the enabled flag, reused
 // the way the Postgres version reuses $5.
+func (s *SQLite) SetChannelsEnabled(ctx context.Context, ids []int64, enabled bool) (int, []int64, error) {
+	uniq := uniqueIDs(ids)
+	if len(uniq) == 0 {
+		return 0, []int64{}, nil
+	}
+	// ?1 is the enabled flag, reused as UpdateChannel does; ids follow as
+	// ?2..?n+1 and the workspace is last. The CASE arms clear health state on
+	// an off-to-on transition only.
+	args := make([]any, 0, len(uniq)+2)
+	args = append(args, boolToInt(enabled))
+	marks := make([]string, len(uniq))
+	for i, id := range uniq {
+		args = append(args, id)
+		marks[i] = "?" + strconv.Itoa(i+2)
+	}
+	args = append(args, workspaceID(ctx))
+	rows, err := s.db.QueryContext(ctx,
+		`UPDATE channels SET
+		   enabled = ?1,
+		   consecutive_failures = CASE WHEN ?1 AND enabled = 0 THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN ?1 AND enabled = 0 THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN ?1 AND enabled = 0 THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN ?1 AND enabled = 0 THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN ?1 AND enabled = 0 THEN NULL ELSE disabled_at END
+		 WHERE id IN (`+strings.Join(marks, ",")+`) AND workspace_id = ?`+strconv.Itoa(len(uniq)+2)+` RETURNING id`, args...)
+	if err != nil {
+		return 0, nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+	found := make(map[int64]struct{}, len(uniq))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, nil, err
+		}
+		found[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	return len(found), unknownIDs(uniq, found), nil
+}
+
 func (s *SQLite) UpdateChannel(ctx context.Context, c *Channel) error {
 	config, err := configForWrite(s.cipher, c.ID, c.Name, c.Config)
 	if err != nil {
