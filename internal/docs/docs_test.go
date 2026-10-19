@@ -7,22 +7,25 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/sorotrail/sorobeacon/internal/auth"
 )
 
 // repoRoot is the repository root relative to this package's directory, so
 // the tests read the real documentation files on disk wherever they run.
 const repoRoot = "../.."
 
-// pagesAddedHere are the documentation pages this branch introduces. Each must
-// exist and be linked from docs/SUMMARY.md — the "done" condition every one of
-// the issues specifies — and they are the pages whose internal links the link
-// checker below walks.
+// pagesAddedHere are the documentation pages pinned by this guard: the set
+// introduced by the docs branches, each of which must exist and be linked from
+// docs/SUMMARY.md — the "done" condition every one of the issues specifies —
+// and they are the pages whose internal links the link checker below walks.
 var pagesAddedHere = []string{
 	"docs/operations/security.md",
 	"docs/operations/upgrading.md",
 	"docs/guides/writing-rules.md",
 	"docs/contributing/testing.md",
-	"docs/reference/terraform.md",
+	"docs/guides/escalation.md",
+	"docs/reference/authorization.md",
 }
 
 // markdownLink matches [text](target) links in prose. Code fences and inline
@@ -138,5 +141,31 @@ func TestNewPagesLinksResolve(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAuthorizationReferenceCoversVocabulary keeps the reference honest in the
+// direction that matters when the code grows: a scope or role added to the
+// vocabulary without a line in the page fails here instead of shipping
+// undocumented. The reverse direction (a name in the page that no longer
+// exists in code) is prose review; route patterns and shorthands make a simple
+// text-based check of every backticked value too noisy.
+func TestAuthorizationReferenceCoversVocabulary(t *testing.T) {
+	doc := readRepoFile(t, "docs/reference/authorization.md")
+	for _, scope := range auth.AllScopes {
+		if !strings.Contains(doc, string(scope)) {
+			t.Errorf("docs/reference/authorization.md does not mention scope %q", scope)
+		}
+	}
+	for _, role := range []string{"viewer", "editor", "admin"} {
+		if _, ok := auth.ParseRole(role); !ok {
+			t.Fatalf("ParseRole(%q) rejected a documented role", role)
+		}
+		if !strings.Contains(doc, role) {
+			t.Errorf("docs/reference/authorization.md does not mention role %q", role)
+		}
+	}
+	if !strings.Contains(doc, string(auth.ScopeNone)) {
+		t.Errorf("docs/reference/authorization.md does not mention scope %q", auth.ScopeNone)
 	}
 }

@@ -13,6 +13,7 @@
 
 * [Monitors & alerts](guides/monitors-and-alerts.md)
 * [The life of an alert](guides/alert-lifecycle.md)
+* [Escalation policies](guides/escalation.md)
 * [Maintenance windows](guides/maintenance-windows.md)
 * [The dashboard](guides/dashboard.md)
 * [Monitoring a token contract](guides/monitoring-a-token.md)
@@ -62,6 +63,7 @@
 ## 🛠️ Reference
 
 * [Architecture](reference/architecture.md)
+* [Authorization](reference/authorization.md)
 * [HTTP API](reference/api.md)
 * [Terraform provider](reference/terraform.md)
 * [CLI flags (environment variables)](reference/cli.md)

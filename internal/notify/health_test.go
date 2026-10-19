@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/textproto"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -97,4 +98,42 @@ func TestIsPermanent(t *testing.T) {
 			assert.Equal(t, tt.want, IsPermanent(tt.err))
 		})
 	}
+}
+
+func TestTestHealthUpdate(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+
+	t.Run("nil error is recorded as healthy success", func(t *testing.T) {
+		u := TestHealthUpdate(nil, now)
+		assert.True(t, u.Success)
+		assert.False(t, u.Permanent)
+		assert.Empty(t, u.Error)
+		assert.Equal(t, now, u.At)
+	})
+
+	t.Run("permanent failure is classified correctly", func(t *testing.T) {
+		u := TestHealthUpdate(&HTTPStatusError{StatusCode: 401, Body: "Unauthorized"}, now)
+		assert.False(t, u.Success)
+		assert.True(t, u.Permanent)
+		assert.Equal(t, now, u.At)
+		assert.NotEmpty(t, u.Error)
+	})
+
+	t.Run("transient failure is classified correctly", func(t *testing.T) {
+		u := TestHealthUpdate(&HTTPStatusError{StatusCode: 503, Body: "Service Unavailable"}, now)
+		assert.False(t, u.Success)
+		assert.False(t, u.Permanent)
+		assert.Equal(t, now, u.At)
+		assert.NotEmpty(t, u.Error)
+	})
+
+	t.Run("sanitizes error quoting token secrets", func(t *testing.T) {
+		fakeToken := "mock-token-secret-9876543210"
+		rawErr := fmt.Errorf("slack post failed token: %s", fakeToken)
+		u := TestHealthUpdate(rawErr, now)
+
+		assert.False(t, u.Success)
+		assert.NotContains(t, u.Error, fakeToken, "health update must never record raw token secrets")
+		assert.Contains(t, u.Error, "[redacted]")
+	})
 }

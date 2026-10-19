@@ -33,6 +33,10 @@ curl -s localhost:8080/api/v1/monitors -H "Authorization: Bearer $API_TOKEN"
 * With `API_TOKEN` unset the API is open, exactly as it was before
   authentication existed, and the process logs one warning at startup.
 
+The complete credential, scope and workspace rules — including the route-by-route
+scope table and the surfaces where enforcement differs (gRPC, GraphQL, metrics)
+— are in the [Authorization reference](authorization.md).
+
 {% hint style="warning" %}
 An unauthenticated instance mutates monitors and channels for anyone who can
 reach the port. Set `API_TOKEN` on anything beyond a trusted network.

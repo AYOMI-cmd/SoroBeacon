@@ -176,15 +176,26 @@ func (p *Postgres) EnsureWorkspace(ctx context.Context, id workspace.ID) error {
 
 // --- monitors ---
 
+// pgCreatedAt is nil when t is zero, so the inserted row gets the column's
+// now() default. Restore passes the backup's timestamp to keep a row's
+// original created_at.
+func pgCreatedAt(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
 func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 	ids, err := json.Marshal(m.ContractIDs)
 	if err != nil {
 		return err
 	}
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network) VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
 		 RETURNING id, created_at`,
-		m.Name, ids, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network,
+		m.Name, ids, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt),
 	).Scan(&m.ID, &m.CreatedAt)
 }
 
@@ -718,10 +729,10 @@ func (p *Postgres) CreateChannel(ctx context.Context, c *Channel) error {
 		return err
 	}
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`INSERT INTO channels (name, type, config, enabled, digest_mode, digest_window_seconds, timeout, workspace_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, now()))
 		 RETURNING id, created_at`,
-		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx),
+		c.Name, c.Type, config, c.Enabled, c.DigestMode, c.DigestWindowSeconds, c.TimeoutSeconds(), workspaceID(ctx), pgCreatedAt(c.CreatedAt),
 	).Scan(&c.ID, &c.CreatedAt)
 }
 
@@ -795,6 +806,52 @@ func (p *Postgres) ListChannelsPage(ctx context.Context, f ListFilter) ([]Channe
 		return nil, err
 	}
 	return pgx.CollectRows(rows, p.scanChannel)
+}
+
+func (p *Postgres) SetChannelsEnabled(ctx context.Context, ids []int64, enabled bool) (int, []int64, error) {
+	uniq := uniqueIDs(ids)
+	if len(uniq) == 0 {
+		return 0, []int64{}, nil
+	}
+	// The CASE arms mirror UpdateChannel: an off-to-on transition clears the
+	// health state, so a bulk re-enable is as explicit a recovery as a single one.
+	rows, err := p.pool.Query(ctx,
+		`UPDATE channels SET
+		   enabled = $1,
+		   consecutive_failures = CASE WHEN $1 AND NOT enabled THEN 0 ELSE consecutive_failures END,
+		   consecutive_permanent_failures = CASE WHEN $1 AND NOT enabled THEN 0 ELSE consecutive_permanent_failures END,
+		   last_error = CASE WHEN $1 AND NOT enabled THEN '' ELSE last_error END,
+		   last_error_at = CASE WHEN $1 AND NOT enabled THEN NULL ELSE last_error_at END,
+		   disabled_at = CASE WHEN $1 AND NOT enabled THEN NULL ELSE disabled_at END
+		 WHERE id = ANY($2) AND workspace_id = $3 RETURNING id`,
+		enabled, uniq, workspaceID(ctx))
+	if err != nil {
+		return 0, nil, err
+	}
+	defer rows.Close()
+	found := make(map[int64]struct{}, len(uniq))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, nil, err
+		}
+		found[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	return len(found), unknownIDs(uniq, found), nil
+}
+
+// unknownIDs returns the ids in want that are absent from found, never nil.
+func unknownIDs(want []int64, found map[int64]struct{}) []int64 {
+	unknown := make([]int64, 0)
+	for _, id := range want {
+		if _, ok := found[id]; !ok {
+			unknown = append(unknown, id)
+		}
+	}
+	return unknown
 }
 
 func (p *Postgres) UpdateChannel(ctx context.Context, c *Channel) error {
@@ -2088,8 +2145,9 @@ func (p *Postgres) CreateSavedSearch(ctx context.Context, s *SavedSearch) error 
 		_, _ = p.pool.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE AND workspace_id = $1`, ws)
 	}
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO saved_searches (name, filter, is_default, workspace_id) VALUES ($1, $2, $3, $4) RETURNING id, created_at`,
-		s.Name, filter, s.IsDefault, ws).Scan(&s.ID, &s.CreatedAt)
+		`INSERT INTO saved_searches (name, filter, is_default, workspace_id, created_at)
+		 VALUES ($1, $2, $3, $4, COALESCE($5, now())) RETURNING id, created_at`,
+		s.Name, filter, s.IsDefault, ws, pgCreatedAt(s.CreatedAt)).Scan(&s.ID, &s.CreatedAt)
 }
 
 func (p *Postgres) ListSavedSearches(ctx context.Context) ([]SavedSearch, error) {
@@ -2168,8 +2226,9 @@ func (p *Postgres) CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate
 	rulesJSON, _ := json.Marshal(t.Rules)
 	paramsJSON, _ := json.Marshal(t.Parameters)
 	return p.pool.QueryRow(ctx,
-		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters, workspace_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at`,
-		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON, workspaceID(ctx)).Scan(&t.ID, &t.CreatedAt)
+		`INSERT INTO monitor_templates (name, description, rules, channel_ids, parameters, workspace_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now())) RETURNING id, created_at`,
+		t.Name, t.Description, rulesJSON, templateChannelIDs(t.ChannelIDs), paramsJSON, workspaceID(ctx), pgCreatedAt(t.CreatedAt)).Scan(&t.ID, &t.CreatedAt)
 }
 
 func (p *Postgres) GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error) {
