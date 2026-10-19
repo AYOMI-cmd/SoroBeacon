@@ -79,7 +79,20 @@ func TestLoadFileErrorsOnMalformedYAML(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "CONFIG_FILE")
 	assert.ErrorContains(t, err, path)
+	assert.ErrorContains(t, err, "line 2")
 	assert.NotContains(t, err.Error(), "postgres://example/db")
+}
+
+func TestLoadFileErrorsWhenUnreadable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.yaml")
+	t.Setenv("CONFIG_FILE", path)
+	t.Setenv("DATABASE_URL", "postgres://env.example/db")
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "CONFIG_FILE")
+	assert.ErrorContains(t, err, path)
+	assert.NotContains(t, err.Error(), "postgres://env.example/db")
 }
 
 func TestLoadFileFailsValidationLikeEnv(t *testing.T) {
@@ -93,4 +106,12 @@ func TestLoadFileFailsValidationLikeEnv(t *testing.T) {
 	assert.ErrorContains(t, err, "DATABASE_URL")
 	assert.NotContains(t, err.Error(), "not-a-url")
 	assert.NotContains(t, err.Error(), "no-port")
+
+	fileError := err
+	t.Setenv("CONFIG_FILE", "")
+	t.Setenv("DATABASE_URL", "not-a-url")
+	t.Setenv("HTTP_ADDR", "no-port")
+	_, err = Load()
+	require.Error(t, err)
+	assert.EqualError(t, fileError, err.Error())
 }

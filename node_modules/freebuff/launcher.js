@@ -1,0 +1,2347 @@
+#!/usr/bin/env node
+
+const { execFileSync, spawn } = require('child_process')
+const crypto = require('crypto')
+const fs = require('fs')
+const http = require('http')
+const https = require('https')
+const os = require('os')
+const path = require('path')
+const { pipeline } = require('stream/promises')
+const zlib = require('zlib')
+
+const tar = require('tar')
+const { createReleaseHttpClient } = require('./http')
+
+const DEFAULT_DOWNLOAD_ORIGIN = 'https://codebuff.com'
+const NPM_REGISTRY_ORIGIN = 'https://registry.npmjs.org'
+
+/**
+ * Every binary target a release ships, in the order the release workflow
+ * builds them. The launcher derives its download filename from these keys and
+ * `write-binary-checksums.js` stamps one sha256 per key into the published
+ * package.json, so the two lists must agree — a test pins that.
+ */
+const PLATFORM_TARGET_KEYS = [
+  'linux-x64',
+  'linux-x64-baseline',
+  'linux-arm64',
+  'darwin-x64',
+  'darwin-x64-baseline',
+  'darwin-arm64',
+  'win32-x64',
+  'win32-x64-baseline',
+]
+
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]'])
+
+/**
+ * Registrable domains that serve release downloads. An https override must
+ * name one of these or a subdomain of one.
+ */
+const RELEASE_ORIGIN_DOMAINS = ['codebuff.com', 'freebuff.com']
+
+function isReleaseOriginHost(hostname) {
+  const host = hostname.toLowerCase()
+  return RELEASE_ORIGIN_DOMAINS.some(
+    (domain) => host === domain || host.endsWith(`.${domain}`),
+  )
+}
+
+/**
+ * A release version the launcher will put into a download URL or a file
+ * name: strict `MAJOR.MINOR.PATCH` with an optional dot-separated
+ * alphanumeric prerelease, and nothing else — no build metadata, no
+ * leading `v`, no whitespace, `/`, `..`, `%` or `?`. The version reaches
+ * `/api/releases/download/<version>/<file>` and the partial-archive path
+ * from the npm registry document or the local metadata file, and neither
+ * is a place that should be able to rewrite a URL path or escape a
+ * directory.
+ */
+const STRICT_RELEASE_VERSION =
+  /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})(?:-(?:0|[1-9]\d{0,8}|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d{0,8}|\d*[A-Za-z-][0-9A-Za-z-]*))*)?$/
+
+function isStrictReleaseVersion(version) {
+  return (
+    typeof version === 'string' &&
+    version.length <= 64 &&
+    STRICT_RELEASE_VERSION.test(version)
+  )
+}
+
+/**
+ * Decide where release archives are downloaded from.
+ *
+ * NEXT_PUBLIC_CODEBUFF_APP_URL is read at runtime, so anyone able to set an
+ * environment variable could point the launcher at another origin. The
+ * archive's sha256 comes from npm, not from that origin, so a substituted
+ * archive is refused either way; the origin is still held to the hosts that
+ * actually serve releases. The override is honoured only over https to a
+ * codebuff.com / freebuff.com host, or over http/https on a loopback host
+ * (local release servers in development and tests). Anything else is
+ * ignored with a warning and the default origin is used.
+ */
+function resolveDownloadOrigin(configuredOrigin, { warn = () => {} } = {}) {
+  if (typeof configuredOrigin !== 'string' || configuredOrigin.trim() === '') {
+    return DEFAULT_DOWNLOAD_ORIGIN
+  }
+
+  const trimmed = configuredOrigin.trim().replace(/\/+$/, '')
+  let parsed
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    warn(
+      `Ignoring NEXT_PUBLIC_CODEBUFF_APP_URL=${configuredOrigin}: not a valid URL. Downloading from ${DEFAULT_DOWNLOAD_ORIGIN}.`,
+    )
+    return DEFAULT_DOWNLOAD_ORIGIN
+  }
+
+  const isLocal = LOCAL_HOSTNAMES.has(parsed.hostname.toLowerCase())
+  const isHttp = parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  // Only an origin: credentials or a query would ride along on every request.
+  const isBareOrigin =
+    !parsed.username && !parsed.password && !parsed.search && !parsed.hash
+  if (isHttp && isLocal && isBareOrigin) {
+    return trimmed
+  }
+  if (
+    parsed.protocol === 'https:' &&
+    isReleaseOriginHost(parsed.hostname) &&
+    isBareOrigin
+  ) {
+    return trimmed
+  }
+
+  warn(
+    parsed.protocol === 'https:'
+      ? `Ignoring NEXT_PUBLIC_CODEBUFF_APP_URL=${parsed.protocol}//${parsed.host}: release downloads come only from codebuff.com or freebuff.com (or localhost). Downloading from ${DEFAULT_DOWNLOAD_ORIGIN}.`
+      : `Ignoring NEXT_PUBLIC_CODEBUFF_APP_URL=${parsed.protocol}//${parsed.host}: release downloads must use https (http is allowed only for localhost). Downloading from ${DEFAULT_DOWNLOAD_ORIGIN}.`,
+  )
+  return DEFAULT_DOWNLOAD_ORIGIN
+}
+
+function isSha256Hex(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value)
+}
+
+function computeFileSha256(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256')
+    const stream = fs.createReadStream(filePath)
+    stream.on('error', reject)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+/**
+ * Compare a file against an expected sha256. Fails closed: a missing or
+ * malformed expectation is a failure, never a pass.
+ *
+ * @returns {Promise<{ ok: boolean, actual: string | null, reason?: string }>}
+ */
+async function verifyFileSha256(filePath, expectedSha256) {
+  if (!isSha256Hex(expectedSha256)) {
+    return {
+      ok: false,
+      actual: null,
+      reason: 'no sha256 checksum is published for this archive',
+    }
+  }
+  const actual = await computeFileSha256(filePath)
+  if (actual !== expectedSha256.toLowerCase()) {
+    return {
+      ok: false,
+      actual,
+      reason: `sha256 mismatch: expected ${expectedSha256.toLowerCase()}, downloaded ${actual}`,
+    }
+  }
+  return { ok: true, actual }
+}
+
+/**
+ * The checksum map published for a release, or null when the document does
+ * not carry one. Values are validated on use, not here.
+ */
+function readBinaryChecksums(packageData) {
+  const checksums = packageData?.binaryChecksums
+  return checksums && typeof checksums === 'object' && !Array.isArray(checksums)
+    ? checksums
+    : null
+}
+
+function createLauncher(productConfig) {
+  const {
+    packageName,
+    displayName,
+    wrapperVersion = null,
+    // The `binaryChecksums` field of the wrapper's own package.json: sha256 per
+    // target for the archives of the release that shares its version. Reaches
+    // the launcher through npm, which is a separate trust root from the
+    // download origin.
+    binaryChecksums: ownBinaryChecksums = null,
+    includeTreeSitterWasm = true,
+    startupBanner = [],
+    telemetryEvent = 'cli.update_codebuff_failed',
+    telemetryProperties = {},
+    // Freebuff sessions remain open between turns. The launcher cannot know
+    // when a restart is safe, so keep the process alive until the user exits.
+    deferUpdatesUntilExit = false,
+    tempDownloadDirName = `.${packageName}-download-temp`,
+    // Tests only. os.homedir() ignores $HOME under `bun test`, so pointing HOME
+    // at a temp dir is not enough to keep a test off the real ~/.config.
+    configDir: configDirOverride = null,
+    // Tests only: stands in for the OS AVX2 probe (/proc/cpuinfo, sysctl),
+    // returning true, false, or null for "could not tell".
+    cpuAvx2Probe: cpuAvx2ProbeOverride = null,
+  } = productConfig
+
+  /**
+   * Terminal escape sequences to reset terminal state after the child process exits.
+   * When the binary is SIGKILL'd, it can't clean up its own terminal state.
+   * The wrapper (this process) survives and must reset these modes.
+   */
+  const EXIT_ALTERNATE_SCREEN_SEQUENCE = '\x1b[?1049l'
+  const SAFE_TERMINAL_RESET_SEQUENCES =
+    '\x1b[?1000l' + // Disable X10 mouse mode
+    '\x1b[?1002l' + // Disable button event mouse mode
+    '\x1b[?1003l' + // Disable any-event mouse mode (all motion)
+    '\x1b[?1006l' + // Disable SGR extended mouse mode
+    '\x1b[?1004l' + // Disable focus reporting
+    '\x1b[?2004l' + // Disable bracketed paste mode
+    '\x1b[<u' + // Pop kitty keyboard protocol flags
+    '\x1b[>4;0m' + // Reset modifyOtherKeys
+    '\x1b[?25h' // Show cursor
+
+  const FULL_TERMINAL_RESET_SEQUENCES =
+    EXIT_ALTERNATE_SCREEN_SEQUENCE + SAFE_TERMINAL_RESET_SEQUENCES
+
+  function resetTerminal(options = {}) {
+    const { exitAlternateScreen = false } = options
+
+    try {
+      if (process.stdin.isTTY && process.stdin.setRawMode) {
+        process.stdin.setRawMode(false)
+      }
+    } catch {
+      // stdin may be closed
+    }
+    try {
+      if (process.stdout.isTTY) {
+        // Exiting the alternate screen is only safe after an interactive child.
+        // Plain CLI paths like --help never enter it, and ?1049l can erase output.
+        process.stdout.write(
+          exitAlternateScreen
+            ? FULL_TERMINAL_RESET_SEQUENCES
+            : SAFE_TERMINAL_RESET_SEQUENCES,
+        )
+      }
+    } catch {
+      // stdout may be closed
+    }
+  }
+
+  /**
+   * How long a binary has to survive before a crash stops looking like a
+   * startup failure. Used to bound the STATUS_STACK_BUFFER_OVERRUN heuristic
+   * below, which is only trustworthy for deaths during startup.
+   */
+  const STARTUP_CRASH_WINDOW_MS = 10000
+
+  /** Bytes of the binary's stderr kept for the crash report. */
+  const STDERR_TAIL_BYTES = 8192
+
+  function getUnsignedExitCode(code) {
+    return code != null && code < 0 ? code >>> 0 : code
+  }
+
+  function isWindowsNativeCrashCode(code) {
+    const unsignedCode = getUnsignedExitCode(code)
+    return (
+      process.platform === 'win32' &&
+      (unsignedCode === 0xc000001d ||
+        unsignedCode === 0xc0000005 ||
+        unsignedCode === 0xc0000409)
+    )
+  }
+
+  function shouldExitAlternateScreen(code, signal) {
+    return Boolean(signal) || isWindowsNativeCrashCode(code)
+  }
+
+  function isIllegalInstructionExit(code, signal) {
+    const unsignedCode = getUnsignedExitCode(code)
+    return (
+      signal === 'SIGILL' ||
+      (process.platform === 'win32' && unsignedCode === 0xc000001d)
+    )
+  }
+
+  /**
+   * A startup death that is probably this machine failing to run the optimized
+   * build, reported under the *other* Windows spelling.
+   *
+   * Bun is written in Zig, and a Zig panic on Windows reports itself with
+   * __fastfail(FAST_FAIL_FATAL_APP_EXIT) — NTSTATUS 0xC0000409
+   * (STATUS_STACK_BUFFER_OVERRUN, exit code 3221226505), not
+   * STATUS_ILLEGAL_INSTRUCTION. So a CPU without AVX2 does not reliably die on
+   * the illegal instruction itself: Bun detects the missing feature, then
+   * panics while starting up anyway (oven-sh/bun#28399), and the crash arrives
+   * as 0xC0000409. Only the SIGILL spelling was wired to the baseline
+   * fallback, which is why these machines crash-looped forever.
+   *
+   * On its own 0xC0000409 only means "the binary aborted", so this is bounded
+   * to deaths during startup. A panic ten minutes into a session is an
+   * ordinary bug, and reading it as a missing instruction set would send a
+   * perfectly capable machine to the slower build.
+   */
+  function isStartupCpuFeatureCrash(code, signal, msAlive) {
+    return (
+      process.platform === 'win32' &&
+      getUnsignedExitCode(code) === 0xc0000409 &&
+      !signal &&
+      typeof msAlive === 'number' &&
+      msAlive < STARTUP_CRASH_WINDOW_MS
+    )
+  }
+
+  /**
+   * Bun's own crash report saying this CPU cannot run the optimized build.
+   *
+   * On Windows the exit code does not carry that. Bun's crash handler catches
+   * EXCEPTION_ILLEGAL_INSTRUCTION itself, prints a report, then leaves through
+   * Zig's std.posix.abort(), which on Windows is ExitProcess(3). So an AVX2
+   * build on a CPU without AVX2 exits with plain code 3, neither
+   * 0xC000001D nor 0xC0000409, and both checks above miss it. The Sept 27
+   * report (i3-2100, Bun 1.3.14) is exactly this:
+   *
+   *   CPU: sse42 avx
+   *   Features: no_avx2
+   *   panic: Illegal instruction at address 0x7FF61902F82C
+   *   panicked during a panic. Aborting.
+   *
+   * The report is in the stderr tail watchLaunch() keeps on Windows. Either line
+   * is proof, not a guess. `Features: no_avx2` is Bun's own CPUID answer, and a
+   * Bun "Illegal instruction" panic is the same Windows exception
+   * 0xC000001D reports, intercepted before it became the exit code. Only Bun's
+   * exact formats count, so ordinary output that mentions them does not.
+   */
+  const BUN_NO_AVX2_FEATURE = /^Features:[^\n]*\bno_avx2\b/m
+  const BUN_ILLEGAL_INSTRUCTION_PANIC =
+    /^panic(?:\([^)\n]*\))?: Illegal instruction at address 0x[0-9a-f]+/im
+
+  /**
+   * Bun's `CPU:` header line lists the features it detected (`CPU: sse42
+   * popcnt avx avx2`). avx2 in that list is Bun's own CPUID saying the CPU has
+   * it, so an illegal instruction on such a machine is not a missing AVX2.
+   */
+  const BUN_CPU_LINE = /^CPU:([^\n]*)$/m
+
+  function stderrReportsAvx2Present(stderrTail) {
+    if (!stderrTail) return false
+    const match = BUN_CPU_LINE.exec(sanitizeForReplay(stderrTail))
+    return Boolean(match && /(?:^|\s)avx2(?:\s|$)/i.test(match[1]))
+  }
+
+  function stderrReportsMissingCpuFeature(code, signal, stderrTail) {
+    if (!stderrTail || (code === 0 && !signal)) return false
+    const text = sanitizeForReplay(stderrTail)
+    return (
+      BUN_NO_AVX2_FEATURE.test(text) || BUN_ILLEGAL_INSTRUCTION_PANIC.test(text)
+    )
+  }
+
+  function createConfig(packageName) {
+    const homeDir = os.homedir()
+    const configDir =
+      configDirOverride || path.join(homeDir, '.config', 'manicode')
+    const binaryName =
+      process.platform === 'win32' ? `${packageName}.exe` : packageName
+
+    return {
+      homeDir,
+      configDir,
+      binaryName,
+      binaryPath: path.join(configDir, binaryName),
+      metadataPath: path.join(configDir, `${packageName}-metadata.json`),
+      // A deferred download may wait here for an hour. Another invocation
+      // must not replace its staged binary (or delete it while downloading).
+      tempDownloadDir: path.join(
+        configDir,
+        deferUpdatesUntilExit
+          ? `${tempDownloadDirName}-${process.pid}`
+          : tempDownloadDirName,
+      ),
+      userAgent: `${packageName}-cli`,
+      requestTimeout: 20000,
+      downloadRequestTimeout: 120000,
+      downloadMaxAttempts: 3,
+    }
+  }
+
+  const CONFIG = createConfig(packageName)
+  const pendingUpdates = new WeakMap()
+  const { downloadFile, httpGet, withRetries } = createReleaseHttpClient({
+    env: process.env,
+    userAgent: CONFIG.userAgent,
+    requestTimeout: CONFIG.requestTimeout,
+  })
+
+  function getPostHogConfig() {
+    const apiKey =
+      process.env.CODEBUFF_POSTHOG_API_KEY ||
+      process.env.NEXT_PUBLIC_POSTHOG_API_KEY
+    const host =
+      process.env.CODEBUFF_POSTHOG_HOST ||
+      process.env.NEXT_PUBLIC_POSTHOG_HOST_URL
+
+    if (!apiKey || !host) {
+      return null
+    }
+
+    return { apiKey, host }
+  }
+
+  /**
+   * Track update failure event to PostHog.
+   * Fire-and-forget - errors are silently ignored.
+   */
+  function trackUpdateFailed(errorMessage, version, context = {}) {
+    try {
+      const posthogConfig = getPostHogConfig()
+      if (!posthogConfig) {
+        return
+      }
+
+      const payload = JSON.stringify({
+        api_key: posthogConfig.apiKey,
+        event: telemetryEvent,
+        properties: {
+          distinct_id: `anonymous-${CONFIG.homeDir}`,
+          error: errorMessage,
+          version: version || 'unknown',
+          platform: process.platform,
+          arch: process.arch,
+          ...telemetryProperties,
+          ...context,
+        },
+        timestamp: new Date().toISOString(),
+      })
+
+      const parsedUrl = new URL(`${posthogConfig.host}/capture/`)
+      const isHttps = parsedUrl.protocol === 'https:'
+      const options = {
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || (isHttps ? 443 : 80),
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        },
+      }
+
+      const transport = isHttps ? https : http
+      const req = transport.request(options)
+      req.on('error', () => {}) // Silently ignore errors
+      req.write(payload)
+      req.end()
+    } catch (e) {
+      // Silently ignore any tracking errors
+    }
+  }
+
+  // target key -> release archive filename, e.g. freebuff-darwin-arm64.tar.gz.
+  // The same key indexes the published `binaryChecksums` map.
+  const PLATFORM_TARGETS = Object.fromEntries(
+    PLATFORM_TARGET_KEYS.map((targetKey) => [
+      targetKey,
+      `${packageName}-${targetKey}.tar.gz`,
+    ]),
+  )
+
+  const BASELINE_FALLBACK_TARGETS = {
+    'linux-x64': 'linux-x64-baseline',
+    'darwin-x64': 'darwin-x64-baseline',
+    'win32-x64': 'win32-x64-baseline',
+  }
+
+  const term = {
+    clearLine: () => {
+      if (process.stderr.isTTY) {
+        process.stderr.write('\r\x1b[K')
+      }
+    },
+    write: (text) => {
+      term.clearLine()
+      process.stderr.write(text)
+    },
+    writeLine: (text) => {
+      term.clearLine()
+      process.stderr.write(text + '\n')
+    },
+  }
+
+  function getPlatformKey() {
+    return `${process.platform}-${process.arch}`
+  }
+
+  function getTargetOverride() {
+    const envNames = [
+      `${packageName.toUpperCase()}_BINARY_TARGET`,
+      'CODEBUFF_BINARY_TARGET',
+      'CLI_BINARY_TARGET',
+    ]
+
+    for (const envName of envNames) {
+      const target = process.env[envName]
+      if (target && PLATFORM_TARGETS[target]) {
+        return target
+      }
+    }
+
+    return null
+  }
+
+  /**
+   * `/proc/cpuinfo` answers for the kernel's view of the CPU: true or false
+   * from its `flags` lines, null when it has none to read.
+   */
+  function parseCpuinfoAvx2(text) {
+    if (typeof text !== 'string' || !/^flags\s*:/m.test(text)) return null
+    return /^flags\s*:.*\bavx2\b/m.test(text)
+  }
+
+  /** `sysctl -n hw.optional.avx2_0` prints 1 or 0 on an Intel Mac. */
+  function parseSysctlAvx2(output) {
+    const value = typeof output === 'string' ? output.trim() : ''
+    if (value === '1') return true
+    if (value === '0') return false
+    return null
+  }
+
+  // Where probeCpuAvx2() gets its answer, recorded as the evidence for a pin.
+  function cpuProbeSource() {
+    if (process.platform === 'linux') return 'cpuinfo'
+    if (process.platform === 'darwin') return 'sysctl'
+    return 'probe'
+  }
+
+  let _cpuProbeCache
+
+  /**
+   * Ask the OS whether this CPU has AVX2: true, false, or null for "could not
+   * tell". Linux reads /proc/cpuinfo. macOS asks sysctl, which costs a
+   * subprocess, so this runs only on the crash path, when re-checking an old
+   * pin, and when picking a download target for a baseline install, never on
+   * an ordinary launch. Windows has no probe: the one we had tripped Defender
+   * (see detectMachineHasAvx2), so there Bun's crash report is the evidence.
+   */
+  function probeCpuAvx2() {
+    if (_cpuProbeCache === undefined) {
+      _cpuProbeCache = cpuAvx2ProbeOverride
+        ? cpuAvx2ProbeOverride()
+        : probeCpuAvx2FromOs()
+    }
+    return _cpuProbeCache
+  }
+
+  function probeCpuAvx2FromOs() {
+    if (process.arch !== 'x64') return null
+    if (process.platform === 'linux') {
+      try {
+        return parseCpuinfoAvx2(fs.readFileSync('/proc/cpuinfo', 'utf8'))
+      } catch {
+        return null
+      }
+    }
+    if (process.platform === 'darwin') {
+      // x64 node on Apple Silicon runs under Rosetta, and sysctl (arm64 only)
+      // then describes the host, not what Rosetta emulates. No answer there.
+      if (/\bApple\b/.test(os.cpus()[0]?.model || '')) return null
+      try {
+        return parseSysctlAvx2(
+          execFileSync('/usr/sbin/sysctl', ['-n', 'hw.optional.avx2_0'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 2000,
+          }),
+        )
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+
+  let _hasAvx2Cache
+
+  function machineHasAvx2() {
+    if (_hasAvx2Cache === undefined) {
+      _hasAvx2Cache = detectMachineHasAvx2()
+    }
+    return _hasAvx2Cache
+  }
+
+  function detectMachineHasAvx2() {
+    if (process.arch !== 'x64') {
+      return true
+    }
+
+    // A recorded verdict outranks everything below it. Every record now names
+    // its evidence: Bun's crash report, the OS probe, or 'crash' for an
+    // illegal instruction nothing could explain.
+    //
+    // A record WITHOUT evidence was written by an older launcher, which pinned
+    // baseline on any SIGILL, including a bug on a CPU that has AVX2. Re-check
+    // those against the OS once: a CPU with AVX2 gets its record dropped and
+    // the optimized build back on the next update (see getDownloadTargetKey).
+    const record = readCpuFeatureRecord()
+    if (record && (record.avx2 || record.evidence)) {
+      return record.avx2
+    }
+    if (record) {
+      const probed = probeCpuAvx2()
+      if (probed !== true) {
+        writeCpuFeatureRecord(
+          false,
+          probed === false ? cpuProbeSource() : 'crash',
+        )
+        return false
+      }
+      clearCpuFeatureRecord()
+    }
+
+    // Linux can just ask, and a file read is cheap enough not to cache.
+    if (process.platform === 'linux') {
+      return probeCpuAvx2() ?? true
+    }
+
+    // Everything else assumes AVX2 — true of every x64 CPU since ~2013.
+    //
+    // Windows and macOS use the crash fallback rather than a subprocess probe.
+    // Windows has no /proc/cpuinfo equivalent we can read without
+    // spawning something, and the probe that used to fill the gap asked
+    // PowerShell to compile a C# stub and P/Invoke
+    // kernel32!IsProcessorFeaturePresent — accurate, but a textbook malware
+    // shape that Windows Defender flagged as a "Suspicious PowerShell command
+    // line" on real user machines. The illegal-instruction handler corrects us
+    // instead: tryFallbackToBaseline() calls recordMachineLacksAvx2(), so a
+    // machine without AVX2 pays exactly one failed launch and is answered by
+    // the cache read above from then on.
+    return true
+  }
+
+  /**
+   * Positive evidence that this CPU runs the optimized build: a recorded
+   * verdict with evidence, or the OS probe. The optimistic default does not
+   * count. This is what lets a baseline install move back to the optimized
+   * build; without evidence, baseline stays put.
+   */
+  function knownToHaveAvx2() {
+    if (!machineHasAvx2()) return false
+    const record = readCpuFeatureRecord()
+    if (record?.avx2 === true && record.evidence) return true
+    return probeCpuAvx2() === true
+  }
+
+  // Called from the illegal-instruction fallback, only when the CPU is shown
+  // to lack AVX2 or nothing can say either way (see tryFallbackToBaseline).
+  // Persisting here is what keeps the optimistic assumption above from costing
+  // more than a single crash — and it is deliberately separate from the
+  // metadata target, so a lost or rewritten metadata file can't resurrect the
+  // AVX2 build on a CPU that can't run it.
+  function recordMachineLacksAvx2(evidence = 'crash') {
+    _hasAvx2Cache = false
+    writeCpuFeatureRecord(false, evidence)
+  }
+
+  function getCpuFeatureCachePath() {
+    return path.join(CONFIG.configDir, 'cpu-features.json')
+  }
+
+  /** `{ avx2, evidence }`; evidence is null on a record from an older launcher. */
+  function readCpuFeatureRecord() {
+    try {
+      const cache = JSON.parse(
+        fs.readFileSync(getCpuFeatureCachePath(), 'utf8'),
+      )
+      if (typeof cache.avx2 !== 'boolean') return null
+      return {
+        avx2: cache.avx2,
+        evidence:
+          typeof cache.evidence === 'string' && cache.evidence
+            ? cache.evidence
+            : null,
+      }
+    } catch {
+      return null
+    }
+  }
+
+  function readCachedAvx2() {
+    return readCpuFeatureRecord()?.avx2 ?? null
+  }
+
+  function writeCpuFeatureRecord(value, evidence) {
+    try {
+      fs.mkdirSync(CONFIG.configDir, { recursive: true })
+      fs.writeFileSync(
+        getCpuFeatureCachePath(),
+        JSON.stringify({ avx2: value, evidence }),
+      )
+    } catch {
+      // Best effort; we'll just re-probe next launch.
+    }
+  }
+
+  function clearCpuFeatureRecord() {
+    try {
+      fs.unlinkSync(getCpuFeatureCachePath())
+    } catch {
+      // Already gone, or unwritable; either way nothing pins baseline now.
+    }
+  }
+
+  function getDefaultTargetKey() {
+    const override = getTargetOverride()
+    if (override) {
+      return override
+    }
+
+    const platformKey = getPlatformKey()
+    // Linux still detects up front (reading /proc/cpuinfo is free). Windows
+    // and macOS are optimistic-then-corrected; the old Windows PowerShell
+    // probe tripped Defender. See
+    // detectMachineHasAvx2() and tryFallbackToBaseline(). Once a machine has
+    // failed once, readCachedAvx2() answers here and baseline is chosen up front
+    // exactly as it used to be.
+    //
+    // This assumes every baseline target is gated on AVX2 specifically, which
+    // holds today (linux-x64, darwin-x64 and win32-x64 have baseline builds, all
+    // AVX2-gated). If a baseline build is ever added for a different reason, give
+    // BASELINE_FALLBACK_TARGETS a per-target capability and check that instead.
+    if (BASELINE_FALLBACK_TARGETS[platformKey] && !machineHasAvx2()) {
+      return BASELINE_FALLBACK_TARGETS[platformKey]
+    }
+
+    return platformKey
+  }
+
+  function getBaselineFallbackTargetKey() {
+    // Runtime safety net: if proactive detection was unavailable or wrong and the
+    // optimized binary still dies with SIGILL, fall back to baseline.
+    return BASELINE_FALLBACK_TARGETS[getPlatformKey()] || null
+  }
+
+  function isTargetAllowedForThisMachine(target) {
+    const override = getTargetOverride()
+    if (override) {
+      return target === override
+    }
+    // Check the baseline fallback first: it's always safe on its platform and
+    // avoids running CPU detection when a baseline binary is already installed.
+    return (
+      target === getBaselineFallbackTargetKey() ||
+      target === getDefaultTargetKey()
+    )
+  }
+
+  function getDownloadTargetKey() {
+    const override = getTargetOverride()
+    if (override) {
+      return override
+    }
+
+    const metadata = getCurrentMetadata()
+    if (metadata?.target && isTargetAllowedForThisMachine(metadata.target)) {
+      // An installed baseline keeps running (isTargetAllowedForThisMachine
+      // always allows it), but it is not a life sentence: once there is
+      // evidence the CPU has AVX2, the next download goes back to the optimized
+      // build. That is how a machine sent to baseline by a crash that was not a
+      // missing AVX2 re-probes on the next version.
+      if (
+        metadata.target === getBaselineFallbackTargetKey() &&
+        knownToHaveAvx2()
+      ) {
+        return getDefaultTargetKey()
+      }
+      return metadata.target
+    }
+
+    return getDefaultTargetKey()
+  }
+
+  /**
+   * One version document from the npm registry: `latest` or an exact version.
+   * Returns null when the registry cannot answer. The document is the source
+   * of the expected archive checksums for any release other than the
+   * wrapper's own, so it is fetched over TLS from the registry and never from
+   * the download origin.
+   */
+  async function fetchRegistryRelease(versionOrTag) {
+    try {
+      const res = await httpGet(
+        `${NPM_REGISTRY_ORIGIN}/${packageName}/${encodeURIComponent(versionOrTag)}`,
+      )
+
+      if (res.statusCode !== 200) {
+        res.resume()
+        return null
+      }
+
+      const body = await streamToString(res)
+      const packageData = JSON.parse(body)
+      if (!isStrictReleaseVersion(packageData.version)) {
+        return null
+      }
+
+      return {
+        version: packageData.version,
+        binaryChecksums: readBinaryChecksums(packageData),
+      }
+    } catch (error) {
+      return null
+    }
+  }
+
+  async function getLatestRelease() {
+    return fetchRegistryRelease('latest')
+  }
+
+  async function getLatestVersion() {
+    const release = await getLatestRelease()
+    return release?.version ?? null
+  }
+
+  /**
+   * The checksum map to verify `version`'s archives against.
+   *
+   * Order: a map the caller already holds (the registry document that named
+   * the version), then the wrapper's own package.json when the versions
+   * match, then a registry lookup of that exact version. Null means no map
+   * could be found, which the caller must treat as a failure.
+   */
+  async function resolveBinaryChecksums(version, provided = null) {
+    if (provided && typeof provided === 'object') {
+      return provided
+    }
+    if (wrapperVersion && version === wrapperVersion && ownBinaryChecksums) {
+      return ownBinaryChecksums
+    }
+    const release = await fetchRegistryRelease(version)
+    return release?.binaryChecksums ?? null
+  }
+
+  function createChecksumError(message, version, targetKey) {
+    const error = new Error(message)
+    error.code = 'ECHECKSUM'
+    error.stage = 'checksum'
+    error.retryable = false
+    error.version = version
+    error.target = targetKey
+    return error
+  }
+
+  async function getExpectedChecksum(version, targetKey, provided = null) {
+    const checksums = await resolveBinaryChecksums(version, provided)
+    const expected = checksums?.[targetKey]
+    if (!isSha256Hex(expected)) {
+      throw createChecksumError(
+        `No sha256 checksum is published for ${packageName} ${version} (${targetKey}); refusing to install an unverifiable binary.`,
+        version,
+        targetKey,
+      )
+    }
+    return expected.toLowerCase()
+  }
+
+  function streamToString(stream) {
+    return new Promise((resolve, reject) => {
+      let data = ''
+      stream.on('data', (chunk) => (data += chunk))
+      stream.on('end', () => resolve(data))
+      stream.on('error', reject)
+    })
+  }
+
+  function getCurrentVersion() {
+    try {
+      const metadata = getCurrentMetadata()
+      if (!metadata) {
+        return null
+      }
+      // Also verify the binary still exists
+      if (!fs.existsSync(CONFIG.binaryPath)) {
+        return null
+      }
+      const metadataTarget = metadata.target || getPlatformKey()
+      if (!isTargetAllowedForThisMachine(metadataTarget)) {
+        return null
+      }
+      return getMetadataVersion(metadata)
+    } catch (error) {
+      return null
+    }
+  }
+
+  function getMetadataVersion(metadata) {
+    return typeof metadata?.version === 'string' && metadata.version
+      ? metadata.version
+      : null
+  }
+
+  function getCurrentMetadata() {
+    try {
+      if (!fs.existsSync(CONFIG.metadataPath)) {
+        return null
+      }
+      return JSON.parse(fs.readFileSync(CONFIG.metadataPath, 'utf8'))
+    } catch {
+      return null
+    }
+  }
+
+  function parseVersion(version) {
+    if (typeof version !== 'string') return null
+
+    const match = version.match(
+      /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+    )
+    if (!match) return null
+
+    const prerelease = match[4]?.split('.') ?? []
+    if (prerelease.some((part) => /^0\d+$/.test(part))) return null
+
+    return {
+      main: match.slice(1, 4).map(BigInt),
+      prerelease,
+    }
+  }
+
+  function compareVersions(v1, v2) {
+    const p1 = parseVersion(v1)
+    const p2 = parseVersion(v2)
+
+    // Published package versions are valid semver. Treat malformed cached
+    // metadata as stale so the wrapper repairs it instead of trusting it.
+    if (!p1) return -1
+    if (!p2) return 1
+
+    for (let i = 0; i < p1.main.length; i++) {
+      if (p1.main[i] < p2.main[i]) return -1
+      if (p1.main[i] > p2.main[i]) return 1
+    }
+
+    if (p1.prerelease.length === 0) {
+      return p2.prerelease.length === 0 ? 0 : 1
+    }
+    if (p2.prerelease.length === 0) return -1
+
+    for (
+      let i = 0;
+      i < Math.max(p1.prerelease.length, p2.prerelease.length);
+      i++
+    ) {
+      const identifier1 = p1.prerelease[i]
+      const identifier2 = p2.prerelease[i]
+      if (identifier1 === undefined) return -1
+      if (identifier2 === undefined) return 1
+      if (identifier1 === identifier2) continue
+
+      const numeric1 = /^\d+$/.test(identifier1)
+      const numeric2 = /^\d+$/.test(identifier2)
+      if (numeric1 && numeric2) {
+        return BigInt(identifier1) < BigInt(identifier2) ? -1 : 1
+      }
+      if (numeric1 !== numeric2) return numeric1 ? -1 : 1
+      return identifier1 < identifier2 ? -1 : 1
+    }
+
+    return 0
+  }
+
+  function formatBytes(bytes) {
+    if (bytes === 0) return '0 B'
+    const k = 1024
+    const sizes = ['B', 'KB', 'MB', 'GB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
+  }
+
+  function createProgressBar(percentage, width = 30) {
+    const filled = Math.round((width * percentage) / 100)
+    const empty = width - filled
+    return '[' + '█'.repeat(filled) + '░'.repeat(empty) + ']'
+  }
+
+  function isRetryableDownloadError(error) {
+    if (error && typeof error.retryable === 'boolean') return error.retryable
+    return !['EACCES', 'ENOSPC', 'EPERM', 'EROFS'].includes(error?.code)
+  }
+
+  function getPartialArchivePath(version, targetKey) {
+    if (!isStrictReleaseVersion(version)) {
+      throw new Error(`Invalid release version for an archive path: ${version}`)
+    }
+    return path.join(
+      CONFIG.configDir,
+      `.${packageName}-${version}-${targetKey}.tar.gz.part`,
+    )
+  }
+
+  function getFileSize(filePath) {
+    try {
+      return fs.statSync(filePath).size
+    } catch (error) {
+      if (error.code === 'ENOENT') return 0
+      throw error
+    }
+  }
+
+  function removeFileIfPresent(filePath) {
+    try {
+      fs.unlinkSync(filePath)
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+
+  function formatDownloadSource(downloadUrl) {
+    try {
+      const parsedUrl = new URL(downloadUrl)
+      return `${parsedUrl.origin}${parsedUrl.pathname}`
+    } catch {
+      return downloadUrl
+    }
+  }
+
+  function printDownloadFailure(error) {
+    const code = error.code ? ` (${error.code})` : ''
+    console.error(
+      `❌ Failed to download ${packageName}: ${error.message}${code}`,
+    )
+
+    if (error.requestUrl) {
+      console.error(
+        `Download source: ${formatDownloadSource(error.requestUrl)}`,
+      )
+    }
+    if (error.code === 'ECHECKSUM') {
+      // Not a transport failure: retrying fetches the same bytes. Either the
+      // package on npm carries no checksum for this target (a release bug)
+      // or the archive served did not match it.
+      console.error(
+        'The archive was not installed because it could not be verified against',
+      )
+      console.error(
+        'the checksum published on npm. If this persists, please report it at:',
+      )
+      console.error('  https://github.com/CodebuffAI/codebuff/issues')
+      return
+    }
+    if (error.downloadedBytes > 0) {
+      const total = error.totalBytes
+        ? ` of ${formatBytes(error.totalBytes)}`
+        : ''
+      console.error(
+        `Saved ${formatBytes(error.downloadedBytes)}${total}; the next run will resume this download.`,
+      )
+    } else if (error.requestUrl) {
+      console.error(
+        'Please retry. The release host may be temporarily unavailable.',
+      )
+    } else {
+      console.error(
+        'The downloaded update could not be installed; the existing binary was preserved when possible.',
+      )
+    }
+  }
+
+  function prepareTempDownloadDir() {
+    if (fs.existsSync(CONFIG.tempDownloadDir)) {
+      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+    }
+    fs.mkdirSync(CONFIG.tempDownloadDir, { recursive: true })
+  }
+
+  /**
+   * Admit only the files a release archive is known to contain, as plain
+   * files at the archive root. The workflow packs exactly the binary and
+   * tree-sitter.wasm; anything else in an archive — a path with `..`, a
+   * symlink, a stray directory — is a sign of tampering, not a newer layout,
+   * and is dropped. preservePaths:false is tar's own guard against absolute
+   * and parent-traversing entries; this filter is the allowlist on top.
+   */
+  function isAllowedArchiveEntry(entryPath, entry) {
+    if (entry && entry.type !== 'File') return false
+    const normalized = String(entryPath).replace(/^(\.\/)+/, '')
+    if (normalized === CONFIG.binaryName) return true
+    return includeTreeSitterWasm && normalized === 'tree-sitter.wasm'
+  }
+
+  async function downloadAndExtract(
+    downloadUrl,
+    version,
+    targetKey,
+    { quiet = false, expectedChecksum = null } = {},
+  ) {
+    let attempts = 0
+    const partialArchivePath = getPartialArchivePath(version, targetKey)
+    let totalBytes = null
+
+    try {
+      return await withRetries(
+        async (attempt) => {
+          attempts = attempt
+          prepareTempDownloadDir()
+          if (!quiet) term.write('Downloading...')
+
+          let lastProgressTime = Date.now()
+          const result = await downloadFile(downloadUrl, partialArchivePath, {
+            timeout: CONFIG.downloadRequestTimeout,
+            onProgress: ({ downloadedBytes, totalBytes: progressTotal }) => {
+              totalBytes = progressTotal
+              if (quiet) return
+              const now = Date.now()
+              if (
+                now - lastProgressTime < 100 &&
+                downloadedBytes !== progressTotal
+              ) {
+                return
+              }
+              lastProgressTime = now
+              if (progressTotal) {
+                const pct = Math.round((downloadedBytes / progressTotal) * 100)
+                term.write(
+                  `Downloading... ${createProgressBar(pct)} ${pct}% of ${formatBytes(progressTotal)}`,
+                )
+              } else {
+                term.write(`Downloading... ${formatBytes(downloadedBytes)}`)
+              }
+            },
+          })
+          totalBytes = result.totalBytes
+
+          // Verify the archive as downloaded, before a single byte of it is
+          // unpacked. The expected hash came from npm, not from the host that
+          // served the archive, so the download origin (and every redirect
+          // hop) can no longer substitute a binary.
+          if (!quiet) term.write('Verifying download...')
+          const verification = await verifyFileSha256(
+            partialArchivePath,
+            expectedChecksum,
+          )
+          if (!verification.ok) {
+            removeFileIfPresent(partialArchivePath)
+            throw createChecksumError(
+              `Downloaded ${packageName} ${version} (${targetKey}) failed verification: ${verification.reason}`,
+              version,
+              targetKey,
+            )
+          }
+
+          try {
+            await pipeline(
+              fs.createReadStream(partialArchivePath),
+              zlib.createGunzip(),
+              tar.x({
+                cwd: CONFIG.tempDownloadDir,
+                preservePaths: false,
+                filter: isAllowedArchiveEntry,
+              }),
+            )
+          } catch (error) {
+            // A complete archive that cannot be extracted is corrupt. Do not
+            // resume it on the next attempt.
+            removeFileIfPresent(partialArchivePath)
+            throw error
+          }
+
+          const tempBinaryPath = path.join(
+            CONFIG.tempDownloadDir,
+            CONFIG.binaryName,
+          )
+          if (!fs.existsSync(tempBinaryPath)) {
+            const files = fs.readdirSync(CONFIG.tempDownloadDir)
+            removeFileIfPresent(partialArchivePath)
+            const error = new Error(
+              `Binary not found after extraction. Expected: ${CONFIG.binaryName}, Available files: ${files.join(', ')}`,
+            )
+            error.retryable = false
+            throw error
+          }
+
+          removeFileIfPresent(partialArchivePath)
+          return tempBinaryPath
+        },
+        {
+          maxAttempts: CONFIG.downloadMaxAttempts,
+          shouldRetry: isRetryableDownloadError,
+          onRetry: ({ nextAttempt, delayMs }) => {
+            if (quiet) return
+            term.writeLine(
+              `Download interrupted. Retrying in ${delayMs / 1000}s (${nextAttempt}/${CONFIG.downloadMaxAttempts})...`,
+            )
+          },
+        },
+      )
+    } catch (error) {
+      try {
+        fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+      } catch {
+        // Best effort after a failed download.
+      }
+
+      trackUpdateFailed(error.message, version, {
+        stage: error.stage || 'download',
+        errorCode: error.code,
+        statusCode: error.statusCode,
+        target: targetKey,
+        attempts,
+        bytesDownloaded: getFileSize(partialArchivePath),
+        totalBytes: error.totalBytes || totalBytes,
+      })
+      error.downloadedBytes = getFileSize(partialArchivePath)
+      error.totalBytes ||= totalBytes
+      error.requestUrl ||= downloadUrl
+      throw error
+    }
+  }
+
+  async function stageBinary(
+    version,
+    targetKey = getDownloadTargetKey(),
+    options = {},
+  ) {
+    const fileName = PLATFORM_TARGETS[targetKey]
+
+    // Before anything is built from it: the version becomes a URL path
+    // segment and part of a file name below.
+    if (!isStrictReleaseVersion(version)) {
+      const error = new Error(
+        `Refusing to download ${packageName}: ${JSON.stringify(String(version)).slice(0, 80)} is not a release version.`,
+      )
+      error.code = 'EBADVERSION'
+      error.retryable = false
+      trackUpdateFailed(error.message, 'invalid', {
+        stage: 'version_check',
+        target: targetKey,
+      })
+      throw error
+    }
+
+    if (!fileName) {
+      const error = new Error(
+        `Unsupported platform: ${process.platform} ${process.arch}`,
+      )
+      trackUpdateFailed(error.message, version, {
+        stage: 'platform_check',
+        target: targetKey,
+      })
+      throw error
+    }
+
+    // Resolved before the download so an unverifiable release is refused
+    // without spending the bandwidth, and so a missing map surfaces as its
+    // own error rather than as a mismatch.
+    let expectedChecksum
+    try {
+      expectedChecksum = await getExpectedChecksum(
+        version,
+        targetKey,
+        options.binaryChecksums,
+      )
+    } catch (error) {
+      trackUpdateFailed(error.message, version, {
+        stage: 'checksum',
+        errorCode: error.code,
+        target: targetKey,
+      })
+      throw error
+    }
+
+    const downloadOrigin = resolveDownloadOrigin(
+      process.env.NEXT_PUBLIC_CODEBUFF_APP_URL,
+      { warn: (message) => console.error(`⚠️  ${message}`) },
+    )
+    const downloadUrl = `${downloadOrigin}/api/releases/download/${version}/${fileName}`
+
+    fs.mkdirSync(CONFIG.configDir, { recursive: true })
+    const tempBinaryPath = await downloadAndExtract(
+      downloadUrl,
+      version,
+      targetKey,
+      { quiet: options.quiet, expectedChecksum },
+    )
+
+    try {
+      if (process.platform !== 'win32') {
+        fs.chmodSync(tempBinaryPath, 0o755)
+      }
+    } catch (error) {
+      try {
+        fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+      } catch {
+        // Preserve the original chmod error.
+      }
+      throw error
+    }
+
+    return { tempBinaryPath, version, targetKey }
+  }
+
+  function replaceFileWithRollback(sourcePath, targetPath, replacements) {
+    const backupPath = fs.existsSync(targetPath)
+      ? `${targetPath}.old.${Date.now()}.${replacements.length}`
+      : null
+
+    if (backupPath) {
+      fs.renameSync(targetPath, backupPath)
+    }
+
+    try {
+      fs.renameSync(sourcePath, targetPath)
+    } catch (error) {
+      if (backupPath && fs.existsSync(backupPath)) {
+        fs.renameSync(backupPath, targetPath)
+      }
+      throw error
+    }
+
+    replacements.push({ backupPath, targetPath })
+  }
+
+  function rollbackReplacements(replacements) {
+    for (const { backupPath, targetPath } of replacements.reverse()) {
+      removeFileIfPresent(targetPath)
+      if (backupPath && fs.existsSync(backupPath)) {
+        fs.renameSync(backupPath, targetPath)
+      }
+    }
+  }
+
+  function commitReplacements(replacements) {
+    for (const { backupPath } of replacements) {
+      if (!backupPath) continue
+      try {
+        removeFileIfPresent(backupPath)
+      } catch {
+        // The replacement is already committed. A stale backup is safer than
+        // rolling back a working install because cleanup failed.
+      }
+    }
+  }
+
+  function installStagedBinary(
+    { tempBinaryPath, version, targetKey },
+    // keepStagingOnFailure: leave a staged update that could not be moved
+    // into place (a file locked by antivirus or another session on Windows)
+    // for the next launch to adopt, instead of downloading it all again.
+    { quiet = false, keepStagingOnFailure = false } = {},
+  ) {
+    const replacements = []
+    let installed = false
+    const metadataTempPath = `${CONFIG.metadataPath}.new.${process.pid}`
+    // The directory the binary was staged in: this launcher's own, or one
+    // adopted from a launcher that died before it could install it.
+    const stagingDir = path.dirname(tempBinaryPath)
+
+    try {
+      fs.writeFileSync(
+        metadataTempPath,
+        JSON.stringify({ version, target: targetKey }, null, 2),
+      )
+      replaceFileWithRollback(tempBinaryPath, CONFIG.binaryPath, replacements)
+
+      // Move tree-sitter.wasm next to the binary if the tarball included
+      // it. The CLI binary loads this at startup; embedding it inside the
+      // binary itself was unreliable on Windows (bun --compile asset
+      // bundling silently dropped or unbound it across several attempts),
+      // so we ship it as a sibling file instead. Older artifacts that
+      // pre-date this change won't have the wasm and will still install —
+      // they'll just hit the same crash they had before, which is fine.
+      if (includeTreeSitterWasm) {
+        const tempWasmPath = path.join(stagingDir, 'tree-sitter.wasm')
+        if (fs.existsSync(tempWasmPath)) {
+          const targetWasmPath = path.join(
+            path.dirname(CONFIG.binaryPath),
+            'tree-sitter.wasm',
+          )
+          replaceFileWithRollback(tempWasmPath, targetWasmPath, replacements)
+        }
+      }
+
+      replaceFileWithRollback(
+        metadataTempPath,
+        CONFIG.metadataPath,
+        replacements,
+      )
+      commitReplacements(replacements)
+      installed = true
+    } catch (error) {
+      rollbackReplacements(replacements)
+      throw error
+    } finally {
+      removeFileIfPresent(metadataTempPath)
+      if ((installed || !keepStagingOnFailure) && fs.existsSync(stagingDir)) {
+        fs.rmSync(stagingDir, { recursive: true })
+      }
+    }
+
+    if (!quiet) {
+      term.clearLine()
+      console.log(`Download complete! Starting ${displayName}...`)
+    }
+  }
+
+  async function downloadBinary(
+    version,
+    targetKey = getDownloadTargetKey(),
+    options = {},
+  ) {
+    const stagedBinary = await stageBinary(version, targetKey, options)
+    installStagedBinary(stagedBinary)
+  }
+
+  function getRequiredWrapperVersion(currentVersion) {
+    if (
+      !wrapperVersion ||
+      (currentVersion !== null &&
+        compareVersions(currentVersion, wrapperVersion) >= 0)
+    ) {
+      return null
+    }
+    return wrapperVersion
+  }
+
+  async function ensureBinaryReady() {
+    const currentVersion = getCurrentVersion()
+    const requiredWrapperVersion = getRequiredWrapperVersion(currentVersion)
+
+    if (currentVersion !== null && requiredWrapperVersion === null) {
+      return
+    }
+
+    // npm installs update this JavaScript wrapper but intentionally preserve the
+    // downloaded binary. If that binary exits before the background update
+    // check starts, it can otherwise remain stuck forever. The wrapper and its
+    // release binary share a version, so repair that stale cache synchronously
+    // without adding a registry lookup to healthy launches.
+    // The wrapper release carries its own checksums; a `latest` lookup hands
+    // back the registry document's map alongside the version it named.
+    let version = requiredWrapperVersion
+    let binaryChecksums = null
+    if (!version) {
+      const latest = await getLatestRelease()
+      version = latest?.version ?? null
+      binaryChecksums = latest?.binaryChecksums ?? null
+    }
+    if (!version) {
+      console.error('❌ Failed to determine latest version')
+      console.error('Please check your internet connection and try again')
+      process.exit(1)
+    }
+
+    try {
+      await downloadBinary(version, getDownloadTargetKey(), {
+        binaryChecksums,
+      })
+    } catch (error) {
+      term.clearLine()
+      printDownloadFailure(error)
+      if (currentVersion !== null) {
+        console.error(
+          `Continuing with cached ${packageName} ${currentVersion}.`,
+        )
+        return
+      }
+      process.exit(1)
+    }
+  }
+
+  function stopRunningProcess(runningProcess) {
+    return new Promise((resolve, reject) => {
+      let forceKillTimer
+      let forceKillTimeout
+
+      const cleanup = () => {
+        clearTimeout(forceKillTimer)
+        clearTimeout(forceKillTimeout)
+        runningProcess.removeListener('exit', handleExit)
+      }
+      const handleExit = () => {
+        cleanup()
+        resolve()
+      }
+      const fail = (error) => {
+        cleanup()
+        reject(error)
+      }
+
+      runningProcess.once('exit', handleExit)
+      forceKillTimer = setTimeout(() => {
+        forceKillTimeout = setTimeout(() => {
+          fail(new Error(`${packageName} did not exit after SIGKILL`))
+        }, 1000)
+        try {
+          runningProcess.kill('SIGKILL')
+        } catch (error) {
+          fail(error)
+        }
+      }, 5000)
+      try {
+        runningProcess.kill('SIGTERM')
+      } catch (error) {
+        fail(error)
+      }
+    })
+  }
+
+  async function checkForUpdates(
+    runningProcess,
+    exitListener,
+    fetchLatestRelease = getLatestRelease,
+  ) {
+    // main() schedules this 100ms after launch, so the binary it was handed can
+    // already be dead — a startup crash that handed off to the baseline
+    // fallback, most of all. Updating around a corpse would race that
+    // relaunch's download for the shared temp directory (prepareTempDownloadDir
+    // rmSyncs it) and then spend six seconds SIGKILLing a process that has
+    // already exited.
+    if (
+      runningProcess.exitCode !== null ||
+      runningProcess.signalCode !== null
+    ) {
+      return
+    }
+
+    let stoppedForUpdate = false
+
+    try {
+      const currentVersion = getCurrentVersion()
+
+      const latestRelease = await fetchLatestRelease()
+      const latestVersion = latestRelease?.version ?? null
+      if (!latestVersion) return
+      if (
+        runningProcess.exitCode !== null ||
+        runningProcess.signalCode !== null
+      )
+        return
+
+      if (
+        // Download new version if current version is unknown or outdated.
+        currentVersion === null ||
+        compareVersions(currentVersion, latestVersion) < 0
+      ) {
+        const stagedBinary = await stageBinary(
+          latestVersion,
+          getDownloadTargetKey(),
+          { quiet: true, binaryChecksums: latestRelease.binaryChecksums },
+        )
+
+        if (deferUpdatesUntilExit) {
+          // No signals, terminal output, or binary/WASM replacement while the
+          // CLI owns the session. Even an idle model picker can admit a session
+          // while the download is in flight. A download that loses the race
+          // with exit must not install into a fallback child's running files.
+          if (
+            runningProcess.exitCode === null &&
+            runningProcess.signalCode === null
+          ) {
+            pendingUpdates.set(runningProcess, stagedBinary)
+            // Closing the terminal window kills this launcher too (SIGHUP, or
+            // CTRL_CLOSE_EVENT on Windows) before the exit handler can
+            // install. Mark the staged update ready so the next launch adopts
+            // it instead of a user who never quits from inside the CLI
+            // staying on this build forever.
+            await writeStagedManifest(stagedBinary)
+          }
+          return
+        }
+
+        term.clearLine()
+
+        runningProcess.removeListener('exit', exitListener)
+        try {
+          await stopRunningProcess(runningProcess)
+        } catch (error) {
+          runningProcess.on('exit', exitListener)
+          throw error
+        }
+        stoppedForUpdate = true
+
+        resetTerminal({ exitAlternateScreen: true })
+        console.log(`Update available: ${currentVersion} → ${latestVersion}`)
+
+        installStagedBinary(stagedBinary)
+
+        const newChild = spawnInstalledBinary({ detached: false })
+        attachExitHandler(newChild)
+
+        return new Promise(() => {})
+      }
+    } catch (error) {
+      if (stoppedForUpdate && fs.existsSync(CONFIG.binaryPath)) {
+        console.error(
+          `Update failed; restarting ${packageName} ${getCurrentVersion()}.`,
+        )
+        const child = spawnInstalledBinary({ detached: false })
+        attachExitHandler(child)
+        return new Promise(() => {})
+      }
+      try {
+        fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+      } catch {
+        // Best effort after a failed background update.
+      }
+      // A staging failure leaves the current process and binary untouched.
+    }
+  }
+
+  function installPendingUpdate(child) {
+    const staged = pendingUpdates.get(child)
+    pendingUpdates.delete(child)
+    if (!staged) return
+
+    try {
+      // A second launcher may have installed a newer release while this
+      // session was open. Never roll its installation back on our exit.
+      const currentVersion = getCurrentVersion()
+      if (
+        currentVersion &&
+        compareVersions(currentVersion, staged.version) >= 0
+      ) {
+        fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+        return
+      }
+      installStagedBinary(staged, { quiet: true, keepStagingOnFailure: true })
+      console.log(
+        `Updated ${displayName} to ${staged.version}. Ready for your next launch.`,
+      )
+    } catch (error) {
+      // Installation rolls back on failure. Updating must not change the
+      // user's exit code or resurrect a CLI they just closed.
+      console.error(`Could not install ${displayName} update: ${error.message}`)
+    }
+  }
+
+  /**
+   * Deferred staging directories are `<tempDownloadDirName>-<pid>`, plus
+   * `<…>-<pid>.adopting` while a later launcher installs one it adopted. The
+   * pid is the launcher that owns the directory.
+   */
+  const STAGED_MANIFEST_NAME = 'staged.json'
+
+  function parseStagingDirOwner(name) {
+    const prefix = `${tempDownloadDirName}-`
+    if (!name.startsWith(prefix)) return null
+    const match = /^(\d{1,10})(?:\.adopting)?$/.exec(name.slice(prefix.length))
+    return match ? Number(match[1]) : null
+  }
+
+  function isProcessAlive(pid) {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      // EPERM: it exists, it just is not ours to signal.
+      return error?.code === 'EPERM'
+    }
+  }
+
+  /**
+   * Record that a staged update is complete: the version, target and sha256 of
+   * every file installStagedBinary() will move. Written last and renamed into
+   * place, so a launcher killed mid-download or mid-extraction leaves a
+   * directory without one, which is only ever deleted. Best effort: a failure
+   * here leaves the exit-time install exactly as it was.
+   *
+   * The hashes are this launcher's own record, checked again before adoption
+   * so a file truncated or altered on disk since is never installed. They are
+   * not a second trust root: the archive was verified against npm's sha256 at
+   * download, and anything able to write this directory can already write the
+   * installed binary next to it.
+   */
+  async function writeStagedManifest({ tempBinaryPath, version, targetKey }) {
+    const stagingDir = path.dirname(tempBinaryPath)
+    const manifestPath = path.join(stagingDir, STAGED_MANIFEST_NAME)
+    const tempManifestPath = `${manifestPath}.tmp`
+    try {
+      const files = {
+        [CONFIG.binaryName]: await computeFileSha256(tempBinaryPath),
+      }
+      const wasmPath = path.join(stagingDir, 'tree-sitter.wasm')
+      if (includeTreeSitterWasm && fs.existsSync(wasmPath)) {
+        files['tree-sitter.wasm'] = await computeFileSha256(wasmPath)
+      }
+      fs.writeFileSync(
+        tempManifestPath,
+        JSON.stringify({ version, target: targetKey, files }),
+      )
+      fs.renameSync(tempManifestPath, manifestPath)
+    } catch {
+      try {
+        removeFileIfPresent(tempManifestPath)
+      } catch {
+        // The directory may already be gone: installed at exit, or removed.
+      }
+    }
+  }
+
+  function readStagedManifest(stagingDir) {
+    try {
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(stagingDir, STAGED_MANIFEST_NAME), 'utf8'),
+      )
+      const files = manifest?.files
+      if (
+        !isStrictReleaseVersion(manifest?.version) ||
+        !PLATFORM_TARGETS[manifest?.target] ||
+        !files ||
+        typeof files !== 'object' ||
+        !isSha256Hex(files[CONFIG.binaryName]) ||
+        Object.entries(files).some(
+          ([name, digest]) =>
+            !isAllowedArchiveEntry(name, null) || !isSha256Hex(digest),
+        )
+      ) {
+        return null
+      }
+      return { version: manifest.version, targetKey: manifest.target, files }
+    } catch {
+      return null
+    }
+  }
+
+  async function stagedFilesMatch(stagingDir, files) {
+    for (const [name, digest] of Object.entries(files)) {
+      const filePath = path.join(stagingDir, name)
+      if (!fs.existsSync(filePath)) return false
+      const verification = await verifyFileSha256(filePath, digest)
+      if (!verification.ok) return false
+    }
+    // Nothing unlisted may ride along into the install (the wasm is moved
+    // whenever it is present).
+    return fs
+      .readdirSync(stagingDir)
+      .every((name) => name === STAGED_MANIFEST_NAME || name in files)
+  }
+
+  /**
+   * Install an update a previous launcher downloaded but never installed, and
+   * delete what dead launchers left behind.
+   *
+   * A deferred update is installed by the launcher's exit handler, which runs
+   * only when the CLI exits on its own. Closing the terminal window or tab
+   * (SIGHUP; CTRL_CLOSE_EVENT on Windows) kills the launcher first, so a user
+   * who always leaves that way never updated: each launch downloaded the same
+   * release again and left another full copy of the binary in a
+   * `<tempDownloadDirName>-<pid>` directory.
+   *
+   * Runs before the binary starts, so nothing of ours holds the files. A
+   * directory whose owner is still running belongs to a live session that
+   * will install it on exit and is left alone. Claiming by rename means two
+   * launchers starting together never install the same directory twice.
+   * Never throws: a failure here must not stop the CLI from starting.
+   */
+  function removeDirQuietly(dir) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // Locked (Windows) or already gone; the next launch tries again.
+    }
+  }
+
+  async function adoptOrphanedStagedUpdates() {
+    if (!deferUpdatesUntilExit) return null
+    try {
+      const orphans = []
+      for (const name of fs.readdirSync(CONFIG.configDir)) {
+        const owner = parseStagingDirOwner(name)
+        if (owner === null) continue
+        // Our own pid was just assigned to us, so a directory under it is a
+        // leftover from an earlier process that had the same pid.
+        if (owner !== process.pid && isProcessAlive(owner)) continue
+        const dir = path.join(CONFIG.configDir, name)
+        orphans.push({ dir, staged: readStagedManifest(dir) })
+      }
+      if (orphans.length === 0) return null
+
+      orphans.sort((a, b) =>
+        a.staged && b.staged
+          ? compareVersions(b.staged.version, a.staged.version)
+          : a.staged
+            ? -1
+            : b.staged
+              ? 1
+              : 0,
+      )
+
+      const installedVersion = getCurrentVersion()
+      let adoptedVersion = null
+      for (const { dir, staged } of orphans) {
+        if (
+          adoptedVersion === null &&
+          staged &&
+          (installedVersion === null ||
+            compareVersions(installedVersion, staged.version) < 0) &&
+          isTargetAllowedForThisMachine(staged.targetKey)
+        ) {
+          const claimedDir = `${CONFIG.tempDownloadDir}.adopting`
+          try {
+            fs.renameSync(dir, claimedDir)
+          } catch {
+            continue // Another launcher claimed it first.
+          }
+          try {
+            if (await stagedFilesMatch(claimedDir, staged.files)) {
+              installStagedBinary(
+                {
+                  tempBinaryPath: path.join(claimedDir, CONFIG.binaryName),
+                  version: staged.version,
+                  targetKey: staged.targetKey,
+                },
+                { quiet: true, keepStagingOnFailure: true },
+              )
+              adoptedVersion = staged.version
+            } else {
+              removeDirQuietly(claimedDir)
+            }
+          } catch {
+            // Rolled back by installStagedBinary, which kept the directory.
+            // It is ours until we exit, then any later launch retries it.
+          }
+          continue
+        }
+        removeDirQuietly(dir)
+      }
+      return adoptedVersion
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Make captured output safe to print back to the terminal.
+   *
+   * The tail is replayed *after* resetTerminal() has put the terminal back in
+   * order, so it must not be able to undo that: a stray \x1b[?1049h or
+   * \x1b[?1003h in what the binary printed would re-enter the alternate screen
+   * or re-enable mouse reporting, hiding the very report it is part of. Strip
+   * the escapes and keep the words.
+   */
+  function sanitizeForReplay(text) {
+    if (!text) return ''
+    return (
+      text
+        .replace(/\r\n?/g, '\n')
+        // CSI sequences — the ones that actually change terminal state.
+        .replace(/\x1b\[[0-9;:?<>=]*[ -/]*[@-~]/g, '')
+        // Everything else: strip the control bytes and keep the text. An OSC
+        // or a lone escape loses its introducer and degrades to inert
+        // characters, which is all a crash report needs it to be.
+        .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+        .replace(/\s+$/, '')
+    )
+  }
+
+  function printCrashDiagnostics(code, signal, context = {}) {
+    const { msAlive = null, stderrTail = '' } = context
+    // Windows NTSTATUS codes (unsigned DWORD)
+    const unsignedCode = getUnsignedExitCode(code)
+    const isIllegalInstruction =
+      isIllegalInstructionExit(code, signal) ||
+      stderrReportsMissingCpuFeature(code, signal, stderrTail)
+    const isAccessViolation =
+      signal === 'SIGSEGV' ||
+      (process.platform === 'win32' && unsignedCode === 0xc0000005)
+    const isBusError = signal === 'SIGBUS'
+    const isAbort =
+      signal === 'SIGABRT' ||
+      (process.platform === 'win32' && unsignedCode === 0xc0000409)
+
+    if (!isIllegalInstruction && !isAccessViolation && !isBusError && !isAbort)
+      return
+
+    const exitInfo = signal ? `signal ${signal}` : `code ${code}`
+    console.error('')
+    console.error(`❌ ${packageName} exited immediately (${exitInfo})`)
+    console.error('')
+
+    if (isIllegalInstruction) {
+      console.error(
+        'Your CPU may not support the required instruction set (AVX2).',
+      )
+      console.error('This typically affects CPUs from before 2013.')
+      console.error('')
+      if (getCurrentMetadata()?.target === getBaselineFallbackTargetKey()) {
+        console.error(
+          'This is already the older-CPU (baseline) build — please include the',
+        )
+        console.error('output below in your report.')
+        console.error('')
+      } else {
+        printBaselineOverrideHint()
+      }
+    } else if (isAccessViolation) {
+      console.error('The binary crashed with an access violation.')
+      console.error('')
+    } else if (isBusError) {
+      console.error('The binary crashed with a bus error.')
+      console.error('This may indicate a platform compatibility issue.')
+      console.error('')
+    } else if (isAbort) {
+      const startupCpuCrash = isStartupCpuFeatureCrash(code, signal, msAlive)
+      console.error(
+        startupCpuCrash
+          ? 'The binary aborted while starting up.'
+          : 'The binary crashed with an abort signal.',
+      )
+      console.error('')
+      // Reached only once the baseline fallback has declined or failed, so name
+      // the case the user can still act on instead of leaving them with an
+      // abort code and a bug-tracker link.
+      if (startupCpuCrash) {
+        if (getCurrentMetadata()?.target === getBaselineFallbackTargetKey()) {
+          console.error(
+            'This is already the older-CPU (baseline) build, so a missing AVX2',
+          )
+          console.error(
+            'instruction set is not the whole story — please include the output',
+          )
+          console.error('below in your report.')
+          console.error('')
+        } else {
+          console.error(
+            'On x64 Windows this is usually a CPU without AVX2 support, which',
+          )
+          console.error('the standard build requires.')
+          console.error('')
+          printBaselineOverrideHint()
+        }
+      }
+    }
+
+    printSystemInfo()
+    const tailText = sanitizeForReplay(stderrTail)
+    if (tailText) {
+      console.error('')
+      console.error(`Last output from ${packageName}:`)
+      for (const line of tailText.split('\n')) {
+        console.error(`  ${line}`)
+      }
+    }
+    console.error('')
+    console.error('Please report this issue at:')
+    console.error('  https://github.com/CodebuffAI/codebuff/issues')
+    console.error('')
+  }
+
+  function printBaselineOverrideHint() {
+    const fallbackTarget = getBaselineFallbackTargetKey()
+    if (!fallbackTarget) return
+    console.error('To force the baseline (non-AVX2) build, set:')
+    console.error(
+      `  ${packageName.toUpperCase()}_BINARY_TARGET=${fallbackTarget}`,
+    )
+    console.error('')
+  }
+
+  /**
+   * What we actually know about AVX2, not what we assume.
+   *
+   * The old line printed a flat "yes" from machineHasAvx2(), which on Windows
+   * is an optimistic default and not a measurement (see detectMachineHasAvx2).
+   * Every crash report that reached us therefore claimed AVX2 was present on
+   * machines we had never asked, which is exactly the evidence that would have
+   * pointed at the CPU.
+   */
+  function describeAvx2Support() {
+    if (readCachedAvx2() === false) return 'no (recorded crash)'
+    if (process.platform === 'linux') return machineHasAvx2() ? 'yes' : 'no'
+    return 'not checked (assumed present)'
+  }
+
+  function printSystemInfo() {
+    const metadata = getCurrentMetadata()
+    console.error('System info:')
+    console.error(`  Platform: ${process.platform} ${process.arch}`)
+    console.error(`  Node:     ${process.version}`)
+    if (process.arch === 'x64') {
+      console.error(`  AVX2:     ${describeAvx2Support()}`)
+    }
+    console.error(`  Target:   ${metadata?.target || getDefaultTargetKey()}`)
+    console.error(`  Binary:   ${CONFIG.binaryPath}`)
+  }
+
+  function getInstalledBinaryStatus() {
+    try {
+      const stats = fs.statSync(CONFIG.binaryPath)
+      return stats.isFile() ? `yes (${formatBytes(stats.size)})` : 'no'
+    } catch {
+      return 'no'
+    }
+  }
+
+  function printSpawnFailure(err) {
+    resetTerminal()
+    const code = err && err.code ? ` (${err.code})` : ''
+
+    console.error(`Failed to start ${packageName}: ${err.message}${code}`)
+    console.error('')
+    printSystemInfo()
+    console.error(`  Exists:   ${getInstalledBinaryStatus()}`)
+
+    if (process.platform === 'win32') {
+      console.error('')
+      console.error(
+        'On Windows, this can happen when Windows Security or antivirus blocks',
+      )
+      console.error(
+        'or quarantines the downloaded executable, or when the binary requires',
+      )
+      console.error('CPU instructions that are not available on this machine.')
+      console.error('')
+      printBaselineOverrideHint()
+    }
+
+    console.error('')
+    console.error('Try deleting the downloaded files and running again:')
+    console.error(`  ${CONFIG.configDir}`)
+    console.error('')
+  }
+
+  function exitOnSpawnFailure(err) {
+    printSpawnFailure(err)
+    process.exit(1)
+  }
+
+  function spawnInstalledBinary(options = {}) {
+    if (!fs.existsSync(CONFIG.binaryPath)) {
+      try {
+        if (fs.existsSync(CONFIG.metadataPath))
+          fs.unlinkSync(CONFIG.metadataPath)
+      } catch {
+        // best effort
+      }
+      const error = new Error(
+        `downloaded binary is missing at ${CONFIG.binaryPath}`,
+      )
+      error.code = 'BINARY_MISSING'
+      exitOnSpawnFailure(error)
+    }
+
+    // spawn() only emits 'error' asynchronously for a few errno values
+    // (EACCES, EAGAIN, EMFILE, ENFILE, ENOENT); everything else — notably
+    // UNKNOWN on Windows when antivirus or Smart App Control blocks the
+    // exe or the download is corrupt — is thrown synchronously.
+    let child
+    try {
+      const { env: optionEnv, ...spawnOptions } = options
+      child = spawn(CONFIG.binaryPath, process.argv.slice(2), {
+        // stdin/stdout stay inherited — the TUI owns the terminal and must see
+        // a real tty. stderr is teed on Windows only; see watchLaunch.
+        stdio:
+          process.platform === 'win32'
+            ? ['inherit', 'inherit', 'pipe']
+            : ['inherit', 'inherit', 'inherit'],
+        ...spawnOptions,
+        env: {
+          ...process.env,
+          ...optionEnv,
+          CODEBUFF_LAUNCHER_PID: String(process.pid),
+          // Which npm wrapper started this binary. The wrapper never updates
+          // itself, so this is how launch telemetry tells an install that
+          // cannot install deferred updates from one that can.
+          ...(wrapperVersion
+            ? { CODEBUFF_LAUNCHER_VERSION: String(wrapperVersion) }
+            : {}),
+        },
+      })
+    } catch (err) {
+      exitOnSpawnFailure(err)
+    }
+
+    child.on('error', exitOnSpawnFailure)
+    child.launch = watchLaunch(child)
+
+    return child
+  }
+
+  /**
+   * Watch a launch so its death can be explained: how long the binary lived,
+   * and what it printed on the way out.
+   *
+   * The stderr tee is what makes a crash report self-contained. When the binary
+   * dies natively we reset the terminal, and that reset leaves the alternate
+   * screen with \x1b[?1049l — discarding its contents, including any panic Bun
+   * printed there. (The CLI's own terminal watchdog sends the same sequence, so
+   * dropping it here wouldn't help.) Every report of codebuff#792 is a launcher
+   * message with no panic text above it; keeping a copy means the next one
+   * arrives with Bun's own words in it.
+   *
+   * Only Windows pipes stderr — that's where the reports come from, and
+   * everywhere else stderr stays a real tty.
+   */
+  function watchLaunch(child) {
+    const startedAt = Date.now()
+    const chunks = []
+    let bufferedBytes = 0
+
+    child.stderr?.on('data', (chunk) => {
+      try {
+        // Straight through: as far as the binary and the user are concerned,
+        // this is still its terminal.
+        process.stderr.write(chunk)
+      } catch {
+        // stderr may be closed
+      }
+      chunks.push(chunk)
+      bufferedBytes += chunk.length
+      while (bufferedBytes > STDERR_TAIL_BYTES && chunks.length > 1) {
+        bufferedBytes -= chunks.shift().length
+      }
+    })
+
+    return {
+      msAlive: () => Date.now() - startedAt,
+      stderrTail: () =>
+        Buffer.concat(chunks).toString('utf8').slice(-STDERR_TAIL_BYTES),
+      // 'exit' can beat the last bytes through the pipe; 'close' is the event
+      // that means the stdio is drained too. The timeout is a bound on a stuck
+      // pipe and is deliberately NOT unref'd — an unref'd timer lets the
+      // process exit before it fires, which would swallow the crash report
+      // entirely. Already-drained streams resolve without waiting for it.
+      drained: () =>
+        child.stderr && !child.stderr.readableEnded
+          ? new Promise((resolve) => {
+              child.once('close', resolve)
+              child.stderr.once('end', resolve)
+              setTimeout(resolve, 250)
+            })
+          : Promise.resolve(),
+    }
+  }
+
+  async function tryFallbackToBaseline(code, signal, msAlive, stderrTail = '') {
+    // Three spellings of one failure, at two levels of certainty. SIGILL /
+    // STATUS_ILLEGAL_INSTRUCTION, or Bun's crash report naming the missing
+    // feature (see stderrReportsMissingCpuFeature), is proof this CPU cannot
+    // run this build; a Windows startup abort is a strong suspicion (see
+    // isStartupCpuFeatureCrash).
+    let confirmed =
+      isIllegalInstructionExit(code, signal) ||
+      stderrReportsMissingCpuFeature(code, signal, stderrTail)
+    if (!confirmed && !isStartupCpuFeatureCrash(code, signal, msAlive)) {
+      return false
+    }
+
+    const fallbackTarget = getBaselineFallbackTargetKey()
+    if (!fallbackTarget) {
+      return false
+    }
+
+    // An explicit target is the user's decision; don't download over it.
+    if (getTargetOverride()) {
+      return false
+    }
+
+    const metadata = getCurrentMetadata()
+    const currentTarget = metadata?.target || getDefaultTargetKey()
+    if (currentTarget === fallbackTarget) {
+      return false
+    }
+
+    // An illegal instruction proves the binary used an instruction this
+    // machine refused, not that the instruction was AVX2: a Bun or JIT bug
+    // raises SIGILL too. So ask for evidence before pinning baseline, which
+    // otherwise sticks for good.
+    //
+    // - The CPU lacks AVX2 (Bun's `Features: no_avx2`, or the OS probe):
+    //   record it. Persisting before the download is what caps the cost at
+    //   one crash: even if the download or the relaunch fails, we never
+    //   optimistically pick the AVX2 build again.
+    // - The CPU has AVX2 (the OS probe, or avx2 in Bun's `CPU:` line): this
+    //   crash is something else. Run baseline for now, since it may still
+    //   start, and record the evidence so the next update goes back to the
+    //   optimized build (getDownloadTargetKey). At worst one crash per release.
+    // - No evidence either way (Windows without Bun's report, an unreadable
+    //   /proc/cpuinfo, Rosetta): a confirmed crash is pinned as before.
+    // A suspected crash records nothing: installing the baseline already keeps
+    // this machine on it, and cpu-features.json should not assert a CPU
+    // limitation we never observed.
+    const verdict = crashAvx2Verdict(code, signal, stderrTail)
+    if (verdict.avx2 === true) {
+      writeCpuFeatureRecord(true, verdict.evidence)
+      confirmed = false
+    } else if (verdict.avx2 === false) {
+      recordMachineLacksAvx2(verdict.evidence)
+      confirmed = true
+    } else if (confirmed) {
+      recordMachineLacksAvx2('crash')
+    }
+    const cpuHasAvx2 = verdict.avx2 === true
+
+    let version = metadata?.version || null
+    let binaryChecksums = null
+    if (!version) {
+      const latest = await getLatestRelease()
+      version = latest?.version ?? null
+      binaryChecksums = latest?.binaryChecksums ?? null
+    }
+    if (!version) {
+      return false
+    }
+
+    resetTerminal({
+      exitAlternateScreen: shouldExitAlternateScreen(code, signal),
+    })
+    console.error('')
+    console.error(
+      cpuHasAvx2
+        ? `${packageName} crashed, but this CPU supports AVX2; using the older-CPU binary until the next update.`
+        : confirmed
+          ? `${packageName} is switching to the older-CPU binary for this machine.`
+          : `${packageName} crashed on startup; trying the older-CPU binary.`,
+    )
+
+    try {
+      await downloadBinary(version, fallbackTarget, { binaryChecksums })
+    } catch (error) {
+      term.clearLine()
+      console.error(`Failed to download ${fallbackTarget}: ${error.message}`)
+      return false
+    }
+
+    const child = spawnInstalledBinary({ detached: false })
+    attachExitHandler(child, false)
+    return true
+  }
+
+  /**
+   * What the evidence says about AVX2 after a crash: `{ avx2, evidence }`,
+   * avx2 null when nothing can tell. Bun's own verdict that AVX2 is missing
+   * wins, then the OS probe, then avx2 in Bun's `CPU:` line.
+   */
+  function crashAvx2Verdict(code, signal, stderrTail) {
+    if (
+      stderrTail &&
+      !(code === 0 && !signal) &&
+      BUN_NO_AVX2_FEATURE.test(sanitizeForReplay(stderrTail))
+    ) {
+      return { avx2: false, evidence: 'bun-report' }
+    }
+    const probed = probeCpuAvx2()
+    if (probed !== null) return { avx2: probed, evidence: cpuProbeSource() }
+    if (stderrReportsAvx2Present(stderrTail)) {
+      return { avx2: true, evidence: 'bun-report' }
+    }
+    return { avx2: null, evidence: null }
+  }
+
+  function attachExitHandler(child, allowBaselineFallback = true) {
+    const exitListener = async (code, signal) => {
+      // A child we never watched (only reachable from a test) reports no age
+      // rather than a suspiciously young one: absent evidence must not be read
+      // as a startup crash and trigger a download.
+      const msAlive = child.launch ? child.launch.msAlive() : Infinity
+
+      // Any failed exit, not only a native crash code: a Bun crash on Windows
+      // usually exits with plain code 3, and the reason is only in its stderr
+      // (see stderrReportsMissingCpuFeature). Clean exits skip the wait.
+      let stderrTail = ''
+      if (child.launch && (code !== 0 || signal)) {
+        await child.launch.drained()
+        stderrTail = child.launch.stderrTail()
+      }
+
+      if (
+        allowBaselineFallback &&
+        (await tryFallbackToBaseline(code, signal, msAlive, stderrTail))
+      ) {
+        return
+      }
+
+      resetTerminal({
+        exitAlternateScreen: shouldExitAlternateScreen(code, signal),
+      })
+      printCrashDiagnostics(code, signal, { msAlive, stderrTail })
+      installPendingUpdate(child)
+      process.exit(signal ? 1 : code || 0)
+    }
+
+    child.on('exit', exitListener)
+    return exitListener
+  }
+
+  async function main() {
+    for (const line of startupBanner) {
+      console.log(line)
+    }
+    if (startupBanner.length > 0) console.log('')
+
+    await adoptOrphanedStagedUpdates()
+    await ensureBinaryReady()
+
+    const child = spawnInstalledBinary()
+    const exitListener = attachExitHandler(child)
+
+    setTimeout(() => {
+      checkForUpdates(child, exitListener)
+    }, 100)
+  }
+
+  return {
+    config: productConfig,
+    main,
+    stopRunningProcess,
+    // Internals exposed for tests only. The AVX2 path is optimistic-then-
+    // corrected (see detectMachineHasAvx2), so the correction has to be
+    // exercised directly — there is no way to make a CI runner lack AVX2.
+    __testing: {
+      detectMachineHasAvx2,
+      recordMachineLacksAvx2,
+      readCachedAvx2,
+      readCpuFeatureRecord,
+      parseCpuinfoAvx2,
+      parseSysctlAvx2,
+      stderrReportsAvx2Present,
+      getDownloadTargetKey,
+      isIllegalInstructionExit,
+      isStartupCpuFeatureCrash,
+      stderrReportsMissingCpuFeature,
+      tryFallbackToBaseline,
+      adoptOrphanedStagedUpdates,
+      printCrashDiagnostics,
+      checkForUpdates,
+      spawnInstalledBinary,
+      attachExitHandler,
+      getDefaultTargetKey,
+      getCpuFeatureCachePath,
+      getCurrentVersion,
+      getMetadataVersion,
+      getRequiredWrapperVersion,
+      ensureBinaryReady,
+      isTargetAllowedForThisMachine,
+      resolveBinaryChecksums,
+      getExpectedChecksum,
+      stageBinary,
+      isAllowedArchiveEntry,
+      PLATFORM_TARGETS,
+      CONFIG,
+    },
+  }
+}
+
+module.exports = {
+  createLauncher,
+  DEFAULT_DOWNLOAD_ORIGIN,
+  PLATFORM_TARGET_KEYS,
+  resolveDownloadOrigin,
+  computeFileSha256,
+  verifyFileSha256,
+  isSha256Hex,
+}

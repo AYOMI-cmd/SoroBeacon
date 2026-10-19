@@ -73,8 +73,9 @@ See [capacity and scaling](docs/operations/scaling.md).
 
 ## Configuration
 
-All configuration comes from environment variables. The complete
-operator reference — every variable `internal/config` reads, grouped by
+Configuration comes from environment variables and, optionally, a YAML file
+selected by `CONFIG_FILE`. The complete operator reference — every variable
+`internal/config` reads, grouped by
 database / RPC / HTTP / polling / logging, with types, defaults, required
 vs optional, secrets, and `SOURCE_MODE`-only notes — is
 [docs/configuration.md](docs/configuration.md).
