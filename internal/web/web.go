@@ -375,6 +375,8 @@ func (s *Server) Routes() chi.Router {
 	r.Post("/channels/{id}/delete", s.deleteChannel)
 	r.Post("/channels/{id}/test", s.testChannel)
 	r.Post("/channels/{id}/toggle", s.toggleChannel)
+	r.Post("/channels/bulk", s.bulkChannels)
+	r.Post("/channels/{id}/duplicate", s.duplicateChannel)
 
 	r.Get("/rulebuilder/{type}", s.ruleBuilderFields)
 
@@ -1276,6 +1278,77 @@ func (s *Server) toggleChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	ch.Enabled = !ch.Enabled
 	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+func (s *Server) bulkChannels(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	enabledStr := r.FormValue("enabled")
+	if enabledStr != "true" && enabledStr != "false" {
+		http.Error(w, "enabled is required", http.StatusBadRequest)
+		return
+	}
+	raw := r.Form["ids"]
+	if len(raw) == 0 {
+		http.Error(w, "ids is required", http.StatusBadRequest)
+		return
+	}
+	if len(raw) > 100 {
+		http.Error(w, "at most 100 channels per request", http.StatusBadRequest)
+		return
+	}
+	ids := make([]int64, 0, len(raw))
+	for _, v := range raw {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid id", http.StatusBadRequest)
+			return
+		}
+		ids = append(ids, id)
+	}
+	if _, _, err := s.store.SetChannelsEnabled(r.Context(), ids, enabledStr == "true"); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
+// duplicateChannel copies a channel as a disabled, unattached channel. The
+// config is carried over through the store, never logged.
+func (s *Server) duplicateChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	src, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	all, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	names := make([]string, 0, len(all))
+	for _, c := range all {
+		names = append(names, c.Name)
+	}
+	dup := *src
+	dup.ID = 0
+	dup.CreatedAt = time.Time{}
+	dup.Name = store.CopyMonitorName(src.Name, names)
+	dup.Enabled = false
+	dup.ConsecutiveFailures, dup.ConsecutivePermanentFailures = 0, 0
+	dup.LastError, dup.LastErrorAt, dup.LastSuccessAt, dup.DisabledAt = "", nil, nil, nil
+	if err := s.store.CreateChannel(r.Context(), &dup); err != nil {
 		s.fail(w, err)
 		return
 	}

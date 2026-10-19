@@ -74,3 +74,7 @@ Rejected with `400` at create/update time:
 
 - a missing or blank `event_name`
 - a missing, unparseable, zero or negative `window`
+
+## Escalation
+
+Absence alerts are the case where a follow-up matters most: the first notification may be the only sign a keeper has stopped entirely. An [escalation policy](../guides/escalation.md) can reach a second channel if nobody acknowledges. As with every rule type, the policy replaces the monitor's flat fan-out.

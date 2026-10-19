@@ -234,7 +234,7 @@ func (s *Server) Routes() chi.Router {
 
 	r.Route("/monitors", func(r chi.Router) {
 		r.Post("/", s.createMonitor)
-		r.Get("/", s.listMonitors)
+		r.With(conditionalGET).Get("/", s.listMonitors)
 		r.Post("/bulk", s.bulkMonitors)
 		r.Route("/{id}", func(r chi.Router) {
 			r.Get("/", s.getMonitor)
@@ -256,7 +256,9 @@ func (s *Server) Routes() chi.Router {
 
 	r.Route("/channels", func(r chi.Router) {
 		r.Post("/", s.createChannel)
-		r.Get("/", s.listChannels)
+		r.With(conditionalGET).Get("/", s.listChannels)
+		r.Post("/bulk", s.bulkChannels)
+		r.Post("/{id}/duplicate", s.duplicateChannel)
 		r.Get("/{id}", s.getChannel)
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)

@@ -54,6 +54,9 @@ Digest settings are part of a channel. Set them through the API:
   visible in the dashboard and `GET /alerts`; delivery attempts record the
   digest send.
 - If a digest send fails, the window is kept and retried on the next tick.
+- Digest mode is a **flat fan-out** behaviour. A channel used in an
+  [escalation step](../guides/escalation.md) is sent the alert immediately
+  and does not accumulate a window.
 
 ## Per-alert templates
 

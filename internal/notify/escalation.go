@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/sorotrail/sorobeacon/internal/store"
@@ -33,7 +34,7 @@ func (d *Dispatcher) startEscalation(ctx context.Context, a Alert, policy *store
 		d.log.Error("marshal escalation snapshot", "alert_id", a.ID, "err", err)
 		return
 	}
-	due := time.Now().Add(seconds(policy.Steps[1].DelaySeconds))
+	due := d.nowTime().Add(seconds(policy.Steps[1].DelaySeconds))
 	if err := d.store.ScheduleEscalation(ctx, a.ID, policy.ID, snapshot, 1, due); err != nil {
 		d.log.Error("schedule escalation", "alert_id", a.ID, "policy_id", policy.ID, "err", err)
 	}
@@ -59,6 +60,11 @@ func (d *Dispatcher) deliverStep(ctx context.Context, a Alert, step store.Escala
 // ProcessDueEscalations fires every escalation step due at or before now and
 // advances (or completes) each one. It is exported so the scheduler can be
 // driven deterministically in tests instead of sleeping on a ticker.
+//
+// This method does not claim rows: two processes calling it with the same due
+// list would both deliver. Single-run is a deployment invariant, enforced by
+// leader election around RunEscalations, not by this function. Within one
+// process the persisted next-step/next-due state makes a second pass a no-op.
 func (d *Dispatcher) ProcessDueEscalations(ctx context.Context, now time.Time) (int, error) {
 	batch := d.EscalationBatch
 	if batch <= 0 {
@@ -92,6 +98,16 @@ func (d *Dispatcher) ProcessDueEscalations(ctx context.Context, now time.Time) (
 			_ = d.store.CompleteEscalation(ctx, run.AlertID)
 			continue
 		}
+		// The due-list query excludes acknowledged alerts, but an
+		// acknowledgement can commit between that read and this delivery.
+		// Re-read immediately before sending so a step due before the ack
+		// does not page someone after it.
+		if d.alertAcknowledged(ctx, run.AlertID) {
+			if err := d.store.CompleteEscalation(ctx, run.AlertID); err != nil {
+				d.log.Error("complete acknowledged escalation", "alert_id", run.AlertID, "err", err)
+			}
+			continue
+		}
 		d.deliverStep(ctx, a, policy.Steps[run.NextStep])
 		delivered++
 		if run.NextStep+1 < len(policy.Steps) {
@@ -104,6 +120,21 @@ func (d *Dispatcher) ProcessDueEscalations(ctx context.Context, now time.Time) (
 		}
 	}
 	return delivered, nil
+}
+
+// alertAcknowledged is the pre-delivery stop check. A read error fails open:
+// dropping a page because a lookup failed is worse than one step the next
+// pass can still stop, and the acknowledgement transaction remains the
+// authority. ErrNotFound is the same case as an unreadable alert.
+func (d *Dispatcher) alertAcknowledged(ctx context.Context, alertID int64) bool {
+	alert, err := d.store.GetAlert(ctx, alertID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			d.log.Warn("re-check alert acknowledgement", "alert_id", alertID, "err", err)
+		}
+		return false
+	}
+	return alert != nil && alert.AcknowledgedAt != nil
 }
 
 // RunEscalations drives the scheduler until ctx is cancelled. Because due
@@ -122,7 +153,7 @@ func (d *Dispatcher) RunEscalations(ctx context.Context) {
 			d.log.Info("escalation scheduler stopped")
 			return
 		case <-t.C:
-			n, err := d.ProcessDueEscalations(ctx, time.Now())
+			n, err := d.ProcessDueEscalations(ctx, d.nowTime())
 			if err != nil {
 				if ctx.Err() != nil {
 					continue
