@@ -250,11 +250,12 @@ func (s *Server) Routes() chi.Router {
 			r.Delete("/rules/{ruleID}", s.deleteRule)
 			r.Get("/escalation", s.getMonitorEscalation)
 			r.Put("/escalation", s.putMonitorEscalation)
-			r.Delete("/escalation", s.deleteMonitorEscalation)
-		})
+			r.Delete("/escalation", s.deleteMonitorEscalation)		})
 	})
+	// Trigger endpoint: accept external events and create alerts via rule evaluation.
+		s.RegisterTriggerRoute(r)
+		r.Route("/channels", func(r chi.Router) {
 
-	r.Route("/channels", func(r chi.Router) {
 		r.Post("/", s.createChannel)
 		r.With(conditionalGET).Get("/", s.listChannels)
 		r.Post("/bulk", s.bulkChannels)
@@ -288,10 +289,11 @@ func (s *Server) Routes() chi.Router {
 			r.Delete("/", s.deleteTemplate)
 			r.Post("/instantiate", s.instantiateTemplate)
 			r.Post("/instantiate/bulk", s.bulkInstantiateTemplate)
-		})
-	})
+		})		})
+	// Trigger endpoint: accept external events and create alerts.
+		r.Post("/triggers", s.triggerHandler)
+		r.Post("/monitors/import", s.importContracts)
 
-	r.Post("/monitors/import", s.importContracts)
 	r.Post("/ingest", s.ingest)
 
 	r.Route("/tokens", func(r chi.Router) {
@@ -380,6 +382,12 @@ func effectivePageLimit(limit int) int {
 		return 50
 	}
 	return limit
+}
+
+// RegisterTriggerRoute mounts POST /api/v1/triggers on the API router.
+// It is additive: does not remove any existing routes.
+func (s *Server) RegisterTriggerRoute(r chi.Router) {
+	r.Post("/triggers", s.triggerHandler)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
