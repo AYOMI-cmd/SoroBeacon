@@ -829,6 +829,8 @@ func ClampAlertSeriesDays(days int) int {
 
 // Monitors persists monitors and their channel attachments.
 type Monitors interface {
+	// CreateMonitor inserts m. A non-zero CreatedAt is preserved, so a
+	// restored row keeps its original timestamp; zero uses the database clock.
 	CreateMonitor(ctx context.Context, m *Monitor) error
 	GetMonitor(ctx context.Context, id int64) (*Monitor, error)
 	ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error)
@@ -884,6 +886,8 @@ type Rules interface {
 
 // Channels persists notification channels.
 type Channels interface {
+	// CreateChannel inserts c, preserving a non-zero CreatedAt so a restored
+	// row keeps its original timestamp.
 	CreateChannel(ctx context.Context, c *Channel) error
 	GetChannel(ctx context.Context, id int64) (*Channel, error)
 	ListChannels(ctx context.Context, enabledOnly bool) ([]Channel, error)
@@ -1033,6 +1037,8 @@ type SavedSearchFilter struct {
 
 // SavedSearches persists saved alert searches.
 type SavedSearches interface {
+	// CreateSavedSearch inserts s, preserving a non-zero CreatedAt so a
+	// restored row keeps its original timestamp.
 	CreateSavedSearch(ctx context.Context, s *SavedSearch) error
 	ListSavedSearches(ctx context.Context) ([]SavedSearch, error)
 	GetSavedSearch(ctx context.Context, id int64) (*SavedSearch, error)
@@ -1156,6 +1162,8 @@ func templateChannelIDs(ids []int64) []int64 {
 
 // MonitorTemplates persists monitor templates.
 type MonitorTemplates interface {
+	// CreateMonitorTemplate inserts t, preserving a non-zero CreatedAt so a
+	// restored row keeps its original timestamp.
 	CreateMonitorTemplate(ctx context.Context, t *MonitorTemplate) error
 	GetMonitorTemplate(ctx context.Context, id int64) (*MonitorTemplate, error)
 	ListMonitorTemplates(ctx context.Context) ([]MonitorTemplate, error)
