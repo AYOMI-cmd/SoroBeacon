@@ -42,9 +42,11 @@ func TestDependabotConfig(t *testing.T) {
 
 	gomod := findUpdate(t, updates, "gomod")
 	actions := findUpdate(t, updates, "github-actions")
+	docker := findUpdate(t, updates, "docker")
 
 	assertWeeklyRoot(t, gomod)
 	assertWeeklyRoot(t, actions)
+	assertWeeklyRoot(t, docker)
 
 	require.Contains(t, gomod, "go-minor-and-patch", "minor/patch Go bumps should be grouped")
 	require.Contains(t, gomod, "minor")

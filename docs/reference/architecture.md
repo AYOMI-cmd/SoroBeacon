@@ -122,4 +122,5 @@ SQLite.
 
 * Everything behind `HTTP_ADDR` (API + dashboard) requires `API_TOKEN` when it is set: the API takes `Authorization: Bearer <token>`, the dashboard takes the same token at `/login` and then a session cookie. With `API_TOKEN` unset the whole listener is **unauthenticated** (one warning at startup) so the quickstart keeps working. The probes (`/health`, `/livez`, `/readyz`) are exempt either way.
 * `/metrics` is served at the root of the same listener and is **not** behind that authentication — keep it off the public internet or add a proxy rule.
+* Authentication is not uniform across listeners: scoped tokens work only on REST, the gRPC server accepts static tokens only and reads the default workspace, and `/graphql` is mounted outside the API's auth middleware. The [Authorization reference](authorization.md) enumerates each surface and its limits.
 * Channel secrets are redacted from logs, API responses, error messages, and delivery snippets. When `CONFIG_ENCRYPTION_KEY` is set they are also encrypted at rest, so a database or backup compromise yields ciphertext rather than credentials; when it is unset they are stored as plaintext.
