@@ -389,7 +389,10 @@ strands its alert history outside every filter.
 | Variable | Type | Default | Required | What it does |
 | --- | --- | --- | --- | --- |
 | `HTTP_ADDR` | listen address | `:8080` | optional | Bind address for the API and dashboard (and `/metrics`). |
-| `CORS_ALLOWED_ORIGINS` | comma-separated origins | empty (CORS disabled) | optional | Browser Origins allowed to call the API cross-origin. Empty disables CORS. The dashboard is same-origin and never needs this. Do not allow origins you do not control: whatever credential their users hold can act through their browser. |
+| `GRPC_ADDR` | listen address | empty (gRPC disabled) | optional | Bind address for the gRPC API. Empty binds nothing, so an existing deployment opens no new port until it opts in. Cleartext HTTP/2 only — there is no TLS option — so anything that can reach the port reads the traffic in the clear; terminate TLS in front of it. See [gRPC API](reference/grpc.md). |
+| `GRAPHQL_PLAYGROUND` | `true` \| `false` | `false` | optional | Serve the GraphQL playground at `/graphql/playground`. See [GraphQL API](reference/graphql.md) for the endpoint's current state. |
+| `GRAPHQL_MAX_DEPTH` | integer 1–50 | `10` | optional | Intended maximum GraphQL query depth. Parsed and range-checked at startup; **not enforced** today. See [GraphQL API](reference/graphql.md). |
+| `GRAPHQL_MAX_COMPLEXITY` | integer 1–10000 | `1000` | optional | Intended maximum GraphQL query complexity. Parsed and range-checked at startup; **not enforced** today. See [GraphQL API](reference/graphql.md). |
 
 ## Polling
 

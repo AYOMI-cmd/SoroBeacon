@@ -63,6 +63,7 @@
 
 * [Architecture](reference/architecture.md)
 * [HTTP API](reference/api.md)
+* [GraphQL API](reference/graphql.md)
 * [CLI flags (environment variables)](reference/cli.md)
 
 ## 🔌 Contributing
