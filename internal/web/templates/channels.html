@@ -53,6 +53,7 @@
     <td>
       <button hx-post="/channels/{{.ID}}/test" hx-target="#test-result-{{.ID}}" hx-swap="innerHTML">Send test</button>
       <span id="test-result-{{.ID}}" class="muted"></span>
+      <form class="inline" method="get" action="/channels/{{.ID}}/edit"><button>Edit</button></form>
       <form class="inline" method="post" action="/channels/{{.ID}}/toggle"><button>{{if .Enabled}}Disable{{else}}Enable{{end}}</button></form>
       <form class="inline" method="post" action="/channels/{{.ID}}/duplicate"><button>Duplicate</button></form>
       <form class="inline" method="post" action="/channels/{{.ID}}/delete"
