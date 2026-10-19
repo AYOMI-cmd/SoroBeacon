@@ -36,13 +36,15 @@ func TestDependabotConfig(t *testing.T) {
 	require.Regexp(t, `(?m)^version:\s*2\s*$`, text)
 
 	updates := splitUpdates(text)
-	require.Len(t, updates, 2, "want gomod and github-actions ecosystems")
+	require.Len(t, updates, 3, "want gomod, github-actions and docker ecosystems")
 
 	gomod := findUpdate(t, updates, "gomod")
 	actions := findUpdate(t, updates, "github-actions")
+	docker := findUpdate(t, updates, "docker")
 
 	assertWeeklyRoot(t, gomod)
 	assertWeeklyRoot(t, actions)
+	assertWeeklyRoot(t, docker)
 
 	require.Contains(t, gomod, "go-minor-and-patch", "minor/patch Go bumps should be grouped")
 	require.Contains(t, gomod, "minor")

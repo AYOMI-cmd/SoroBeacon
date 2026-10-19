@@ -536,6 +536,52 @@
         }
       }
     },
+    "/channels/bulk": {
+      "post": {
+        "summary": "Bulk enable or disable channels",
+        "description": "Sets enabled on an explicit list of channel IDs (at most 100) in one statement. Unknown IDs are returned and do not prevent the known ones from applying, exactly as for monitors. Disabling does not drop queued or in-flight deliveries. There is no all-channels shorthand.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BulkMonitorInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkMonitorResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/channels/{id}/duplicate": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Duplicate a channel",
+        "description": "Copies the channel under a unique name. The copy carries the source's config, including credentials, is created disabled so it cannot deliver before review, and has no monitor attachments.",
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Channel" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/channels/{id}/test": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }

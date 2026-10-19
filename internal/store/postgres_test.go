@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -58,6 +59,51 @@ func testStore(t *testing.T) *Postgres {
 	t.Cleanup(st.Close)
 	require.NoError(t, st.resetConformance(context.Background()))
 	return st
+}
+
+// Restore passes a backup's created_at through the Create methods. A non-zero
+// CreatedAt is data and must not be replaced by now(); only the zero value may
+// fall back to the column default.
+func TestPostgresCreatePreservesExplicitCreatedAt(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	created := time.Date(2025, 11, 12, 13, 14, 15, 678901000, time.UTC)
+
+	monitor := &Monitor{Name: "timestamp-monitor", Enabled: true, Network: "testnet", CreatedAt: created}
+	require.NoError(t, st.CreateMonitor(ctx, monitor))
+	gotMonitor, err := st.GetMonitor(ctx, monitor.ID)
+	require.NoError(t, err)
+	require.True(t, created.Equal(gotMonitor.CreatedAt), "monitor created_at: want %s, got %s", created, gotMonitor.CreatedAt)
+
+	channel := &Channel{
+		Name:      "timestamp-channel",
+		Type:      "webhook",
+		Config:    json.RawMessage(`{"url":"https://example.com/hook"}`),
+		Enabled:   true,
+		CreatedAt: created,
+	}
+	require.NoError(t, st.CreateChannel(ctx, channel))
+	gotChannel, err := st.GetChannel(ctx, channel.ID)
+	require.NoError(t, err)
+	require.True(t, created.Equal(gotChannel.CreatedAt), "channel created_at: want %s, got %s", created, gotChannel.CreatedAt)
+
+	search := &SavedSearch{Name: "timestamp-search", CreatedAt: created}
+	require.NoError(t, st.CreateSavedSearch(ctx, search))
+	gotSearch, err := st.GetSavedSearch(ctx, search.ID)
+	require.NoError(t, err)
+	require.True(t, created.Equal(gotSearch.CreatedAt), "saved search created_at: want %s, got %s", created, gotSearch.CreatedAt)
+
+	template := &MonitorTemplate{
+		Name:       "timestamp-template",
+		Rules:      []MonitorTemplateRule{},
+		ChannelIDs: []int64{},
+		Parameters: []TemplateParameter{},
+		CreatedAt:  created,
+	}
+	require.NoError(t, st.CreateMonitorTemplate(ctx, template))
+	gotTemplate, err := st.GetMonitorTemplate(ctx, template.ID)
+	require.NoError(t, err)
+	require.True(t, created.Equal(gotTemplate.CreatedAt), "template created_at: want %s, got %s", created, gotTemplate.CreatedAt)
 }
 
 // rawChannelConfig reads the config column straight out of the table, so a

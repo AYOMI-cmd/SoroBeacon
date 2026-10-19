@@ -299,6 +299,94 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 	writeNoContent(w)
 }
 
+// maxBulkChannels is the documented ceiling on POST /channels/bulk, matching
+// the monitor endpoint. There is no "all channels" shorthand on purpose.
+const maxBulkChannels = 100
+
+// bulkChannels enables or disables several channels at once, mirroring
+// bulkMonitors: an unknown id is reported in unknown_ids and does not stop the
+// known ones from applying. Disabling only flips the flag; queued and
+// in-flight deliveries sit in their own tables and are not touched.
+func (s *Server) bulkChannels(w http.ResponseWriter, r *http.Request) {
+	var req bulkMonitorRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+	var details []FieldError
+	if len(req.IDs) == 0 {
+		details = append(details, FieldError{Field: "ids", Reason: "must not be empty"})
+	}
+	if len(req.IDs) > maxBulkChannels {
+		details = append(details, FieldError{Field: "ids", Reason: "at most 100 channels per request"})
+	}
+	if req.Enabled == nil {
+		details = append(details, FieldError{Field: "enabled", Reason: "enabled is required"})
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
+		return
+	}
+	updated, unknown, err := s.store.SetChannelsEnabled(r.Context(), req.IDs, *req.Enabled)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if unknown == nil {
+		unknown = []int64{}
+	}
+	s.factory.InvalidateSecretCache()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated":     updated,
+		"unknown_ids": unknown,
+		"enabled":     *req.Enabled,
+	})
+}
+
+// duplicateChannel copies a channel under a unique name. The copy carries the
+// source's config, credentials included: re-entering a webhook URL or SMTP
+// password to change only the room is exactly the toil this endpoint removes,
+// and the copy is created disabled so nothing is delivered before review. It
+// reads and writes through the store's own paths, so decryption and
+// re-encryption never touch a logger, and it has no monitor attachments: a
+// duplicate is a new destination, not a second subscriber.
+func (s *Server) duplicateChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	src, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	all, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	names := make([]string, 0, len(all))
+	for _, c := range all {
+		names = append(names, c.Name)
+	}
+	dup := store.Channel{
+		Name:                store.CopyMonitorName(src.Name, names),
+		Type:                src.Type,
+		Config:              src.Config,
+		Enabled:             false, // never inherit enabled: a duplicate must be reviewed first
+		DigestMode:          src.DigestMode,
+		DigestWindowSeconds: src.DigestWindowSeconds,
+		MinSeverity:         src.MinSeverity,
+		Timeout:             src.Timeout,
+	}
+	if err := s.store.CreateChannel(r.Context(), &dup); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.factory.InvalidateSecretCache()
+	writeJSON(w, http.StatusCreated, dup)
+}
+
 // testChannel sends a synthetic alert through a channel so users can verify
 // its configuration end to end.
 func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {

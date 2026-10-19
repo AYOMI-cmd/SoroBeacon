@@ -78,6 +78,13 @@ curl -s -X POST localhost:8080/api/v1/channels/1/test
 | `access_key_id` | no | Static access key. When omitted, the SDK's default credential chain is used. |
 | `secret_access_key` | no | Static secret key. When omitted, the SDK's default credential chain is used. **Treated as a secret** — never logged or returned by the API. |
 
+`region` is authoritative: construction checks only that `topic_arn` starts
+with `arn:aws:sns:`, and does not compare the ARN's embedded region with the
+`region` field. A mismatch is accepted when the channel is created and
+surfaces as a provider-side error on the first publish, so keep the two
+aligned. Static credentials are likewise used only when **both** fields are
+present; supplying one alone leaves the default chain in charge.
+
 ## Payload
 
 Each alert is published as a JSON message to the SNS topic:
@@ -111,6 +118,12 @@ Non-2xx responses (returned as SDK errors) count as failures and are retried wit
 | **Default credential chain** | Production on AWS (EC2, ECS, EKS, Lambda) | Omit static credentials; SDK resolves from instance role, env vars, config files, etc. |
 
 Both modes use SigV4 signing automatically via the AWS SDK.
+
+Construction does not probe for credentials. With static credentials omitted,
+the channel is accepted even if no credential is currently available: the SDK
+resolves and refreshes credentials per request, which is what allows an
+instance role that appears after boot to work. A missing credential therefore
+fails the first delivery, not channel creation.
 
 ## Security
 

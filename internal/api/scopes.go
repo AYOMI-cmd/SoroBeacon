@@ -45,7 +45,9 @@ var routeScopes = map[string][]auth.Scope{
 	"DELETE /channels/{id}": {auth.ScopeChannelsWrite},
 	// Testing a channel sends a real notification through it, which is a write
 	// even though nothing is stored.
-	"POST /channels/{id}/test": {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/test":      {auth.ScopeChannelsWrite},
+	"POST /channels/bulk":           {auth.ScopeChannelsWrite},
+	"POST /channels/{id}/duplicate": {auth.ScopeChannelsWrite},
 
 	"POST /templates":        {auth.ScopeTemplatesWrite},
 	"GET /templates":         {auth.ScopeTemplatesRead},
