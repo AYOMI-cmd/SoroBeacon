@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"slices"
 	"strconv"
@@ -34,6 +36,57 @@ type channelRequest struct {
 	Type    *string          `json:"type"`
 	Config  *json.RawMessage `json:"config"`
 	Enabled *bool            `json:"enabled"`
+	// DigestMode and DigestWindowSeconds opt the channel into batched
+	// delivery. Omitted keeps immediate delivery (the pre-digest default).
+	DigestMode          *string `json:"digest_mode"`
+	DigestWindowSeconds *int64  `json:"digest_window_seconds"`
+	// MinSeverity is the minimum alert severity this channel will receive.
+	// Empty means no filter (receive all severities).
+	MinSeverity *string          `json:"min_severity"`
+	Timeout     *json.RawMessage `json:"timeout"`
+}
+
+// validateDigest checks a channel's digest settings. Empty mode means
+// immediate delivery; "window" requires a positive window so a half-filled
+// form cannot batch alerts forever.
+func validateDigest(mode string, windowSeconds int64) []FieldError {
+	switch mode {
+	case store.DigestModeOff:
+		if windowSeconds < 0 {
+			return []FieldError{{Field: "digest_window_seconds", Reason: "must not be negative"}}
+		}
+		return nil
+	case store.DigestModeWindow:
+		if windowSeconds <= 0 {
+			return []FieldError{{Field: "digest_window_seconds", Reason: "must be greater than 0 when digest_mode is window"}}
+		}
+		return nil
+	default:
+		return []FieldError{{Field: "digest_mode", Reason: `must be "" or "window"`}}
+	}
+}
+
+// validateMinSeverity checks a channel's min_severity setting. Empty means
+// no filter; otherwise it must be one of the valid severity values.
+func validateMinSeverity(minSeverity string) []FieldError {
+	if minSeverity == "" {
+		return nil
+	}
+	if _, ok := store.ParseSeverity(minSeverity); !ok {
+		return []FieldError{{Field: "min_severity", Reason: `must be "info", "warning", or "critical"`}}
+	}
+	return nil
+}
+
+func timeoutDetail(raw *json.RawMessage) (time.Duration, *FieldError) {
+	if raw == nil {
+		return 0, nil
+	}
+	d, err := store.ParseTimeout(*raw)
+	if err != nil {
+		return 0, &FieldError{Field: "timeout", Reason: err.Error()}
+	}
+	return d, nil
 }
 
 func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +101,15 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 	if req.Type == nil || *req.Type == "" {
 		details = append(details, FieldError{Field: "type", Reason: "type is required"})
 	}
+	timeout := store.DefaultChannelTimeout
+	if req.Timeout != nil {
+		t, terr := timeoutDetail(req.Timeout)
+		if terr != nil {
+			details = append(details, *terr)
+		} else {
+			timeout = t
+		}
+	}
 	config := json.RawMessage(`{}`)
 	if req.Config != nil {
 		config = *req.Config
@@ -60,20 +122,41 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 			details = append(details, channelConfigDetails(err)...)
 		}
 	}
+	var digestMode string
+	var digestWindow int64
+	if req.DigestMode != nil {
+		digestMode = *req.DigestMode
+	}
+	if req.DigestWindowSeconds != nil {
+		digestWindow = *req.DigestWindowSeconds
+	}
+	details = append(details, validateDigest(digestMode, digestWindow)...)
+	var minSeverity string
+	if req.MinSeverity != nil {
+		minSeverity = *req.MinSeverity
+	}
+	details = append(details, validateMinSeverity(minSeverity)...)
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return
 	}
 	ch := store.Channel{
-		Name:    *req.Name,
-		Type:    *req.Type,
-		Config:  config,
-		Enabled: req.Enabled == nil || *req.Enabled,
+		Name:                *req.Name,
+		Type:                *req.Type,
+		Config:              config,
+		Enabled:             req.Enabled == nil || *req.Enabled,
+		DigestMode:          digestMode,
+		DigestWindowSeconds: digestWindow,
+		MinSeverity:         store.Severity(minSeverity),
+		Timeout:             timeout,
 	}
 	if err := s.store.CreateChannel(r.Context(), &ch); err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	// A new channel may reference a secret that was corrected or rotated,
+	// so drop cached values and resolve fresh on the next delivery.
+	s.factory.InvalidateSecretCache()
 	writeJSON(w, http.StatusCreated, ch)
 }
 
@@ -147,15 +230,43 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 			ch.Type = *req.Type
 		}
 	}
+	if req.Timeout != nil {
+		t, terr := timeoutDetail(req.Timeout)
+		if terr != nil {
+			details = append(details, *terr)
+		} else {
+			ch.Timeout = t
+		}
+	}
 	if req.Config != nil {
 		ch.Config = *req.Config
 	}
 	if req.Enabled != nil {
 		ch.Enabled = *req.Enabled
 	}
+	if req.DigestMode != nil {
+		ch.DigestMode = *req.DigestMode
+	}
+	if req.DigestWindowSeconds != nil {
+		ch.DigestWindowSeconds = *req.DigestWindowSeconds
+	}
+	if req.MinSeverity != nil {
+		if *req.MinSeverity == "" {
+			ch.MinSeverity = ""
+		} else {
+			parsed, ok := store.ParseSeverity(*req.MinSeverity)
+			if !ok {
+				details = append(details, FieldError{Field: "min_severity", Reason: `must be "info", "warning", or "critical"`})
+			} else {
+				ch.MinSeverity = parsed
+			}
+		}
+	}
 	if _, err := s.factory.New(ch.Type, ch.Config); err != nil {
 		details = append(details, channelConfigDetails(err)...)
 	}
+	details = append(details, validateDigest(ch.DigestMode, ch.DigestWindowSeconds)...)
+	details = append(details, validateMinSeverity(string(ch.MinSeverity))...)
 	if len(details) > 0 {
 		writeValidation(w, r, details)
 		return
@@ -164,6 +275,7 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.factory.InvalidateSecretCache()
 	writeJSON(w, http.StatusOK, ch)
 }
 
@@ -174,10 +286,105 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteChannel(r.Context(), id); err != nil {
+		// A channel referenced by an escalation step must be detached first;
+		// a 409 says so instead of leaving a dangling reference behind.
+		if errors.Is(err, store.ErrChannelInUse) {
+			writeErr(w, r, http.StatusConflict, err.Error())
+			return
+		}
 		s.fail(w, r, err)
 		return
 	}
+	s.factory.InvalidateSecretCache()
 	writeNoContent(w)
+}
+
+// maxBulkChannels is the documented ceiling on POST /channels/bulk, matching
+// the monitor endpoint. There is no "all channels" shorthand on purpose.
+const maxBulkChannels = 100
+
+// bulkChannels enables or disables several channels at once, mirroring
+// bulkMonitors: an unknown id is reported in unknown_ids and does not stop the
+// known ones from applying. Disabling only flips the flag; queued and
+// in-flight deliveries sit in their own tables and are not touched.
+func (s *Server) bulkChannels(w http.ResponseWriter, r *http.Request) {
+	var req bulkMonitorRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+	var details []FieldError
+	if len(req.IDs) == 0 {
+		details = append(details, FieldError{Field: "ids", Reason: "must not be empty"})
+	}
+	if len(req.IDs) > maxBulkChannels {
+		details = append(details, FieldError{Field: "ids", Reason: "at most 100 channels per request"})
+	}
+	if req.Enabled == nil {
+		details = append(details, FieldError{Field: "enabled", Reason: "enabled is required"})
+	}
+	if len(details) > 0 {
+		writeValidation(w, r, details)
+		return
+	}
+	updated, unknown, err := s.store.SetChannelsEnabled(r.Context(), req.IDs, *req.Enabled)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if unknown == nil {
+		unknown = []int64{}
+	}
+	s.factory.InvalidateSecretCache()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated":     updated,
+		"unknown_ids": unknown,
+		"enabled":     *req.Enabled,
+	})
+}
+
+// duplicateChannel copies a channel under a unique name. The copy carries the
+// source's config, credentials included: re-entering a webhook URL or SMTP
+// password to change only the room is exactly the toil this endpoint removes,
+// and the copy is created disabled so nothing is delivered before review. It
+// reads and writes through the store's own paths, so decryption and
+// re-encryption never touch a logger, and it has no monitor attachments: a
+// duplicate is a new destination, not a second subscriber.
+func (s *Server) duplicateChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, r, http.StatusBadRequest, "invalid id")
+		return
+	}
+	src, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	all, err := s.store.ListChannels(r.Context(), false)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	names := make([]string, 0, len(all))
+	for _, c := range all {
+		names = append(names, c.Name)
+	}
+	dup := store.Channel{
+		Name:                store.CopyMonitorName(src.Name, names),
+		Type:                src.Type,
+		Config:              src.Config,
+		Enabled:             false, // never inherit enabled: a duplicate must be reviewed first
+		DigestMode:          src.DigestMode,
+		DigestWindowSeconds: src.DigestWindowSeconds,
+		MinSeverity:         src.MinSeverity,
+		Timeout:             src.Timeout,
+	}
+	if err := s.store.CreateChannel(r.Context(), &dup); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.factory.InvalidateSecretCache()
+	writeJSON(w, http.StatusCreated, dup)
 }
 
 // testChannel sends a synthetic alert through a channel so users can verify
@@ -206,9 +413,28 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 		EventID:     "test-0000000000000000000",
 		CreatedAt:   time.Now(),
 	}
-	if err := notifier.Send(r.Context(), testAlert); err != nil {
+	testCtx, cancel := context.WithTimeout(r.Context(), ch.TimeoutDuration())
+	defer cancel()
+	if err := notifier.Send(testCtx, testAlert); err != nil {
+		s.recordChannelTestHealth(r.Context(), ch.ID, err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"status": "failed", "error": err.Error()})
 		return
 	}
+	s.recordChannelTestHealth(r.Context(), ch.ID, nil)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+// recordChannelTestHealth folds a test send's outcome into the channel's
+// health, so an operator who has just fixed a channel watches it clear and one
+// who tests a still-broken channel sees the count keep climbing. Leaving it
+// out would make the reported health disagree with the button the operator
+// just pressed.
+//
+// A bookkeeping failure is logged, not returned: the send is what the caller
+// asked about, and health is derived state.
+func (s *Server) recordChannelTestHealth(ctx context.Context, channelID int64, sendErr error) {
+	u := notify.TestHealthUpdate(sendErr, time.Now())
+	if err := s.store.RecordChannelHealth(ctx, channelID, u); err != nil {
+		s.log.Error("record channel health", "channel_id", channelID, "err", err)
+	}
 }

@@ -3,6 +3,7 @@
   {{if .Monitor.Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}
 </h1>
 <p class="muted">Contracts: {{range .Monitor.ContractIDs}}{{template "copyID" .}} {{end}}</p>
+{{with .Monitor.Network}}<p class="muted">Network: {{.}} — a monitor cannot be moved to another chain; delete and recreate it to switch.</p>{{end}}
 <p>Last matched:
   {{if eq .Monitor.Cue "never"}}<span class="pill never">never</span>
   {{else}}{{.Monitor.MatchedHTML}}{{if eq .Monitor.Cue "silent"}} <span class="pill silent">silent</span>{{end}}
@@ -13,14 +14,65 @@
 </form>
 <p class="muted">Duplicate copies rules and channel attachments under a new name, created disabled so it cannot alert until reviewed.</p>
 
-<h2>Rules</h2>
+<h2>Activity</h2>
+{{if .Stats.Alerts}}
+<div class="stats">
+  <div class="stat"><b>{{.Stats.Alerts}}</b> alerts</div>
+  <div class="stat"><b>{{.Stats.AlertsLast24h}}</b> in 24h</div>
+  <div class="stat"><b>{{.Stats.AlertsLast7d}}</b> in 7d</div>
+  <div class="stat"><b>{{.Stats.DeliveriesOK}}</b> delivered</div>
+  <div class="stat"><b>{{.Stats.DeliveriesFail}}</b> delivery failed</div>
+</div>
+<p class="muted">Most recent alert: {{.LastAlert}}</p>
+<table>
+  <tr><th>Rule</th><th>Type</th><th>Alerts</th></tr>
+  {{range .Stats.Rules}}
+  <tr><td>#{{.RuleID}}</td><td>{{.Type}}</td><td>{{.Alerts}}</td></tr>
+  {{end}}
+</table>
+<p class="muted">Counts cover every alert stored for this monitor, including retracted ones. A rule listed with 0 alerts has never matched.</p>
+{{else}}
+<div class="empty">
+  <h2>No alerts yet</h2>
+  <p>Nothing has fired for this monitor, so there are no counts to show. This is the healthy state for a monitor that watches a quiet contract.</p>
+</div>
+{{end}}
+
+<h2>Recent alerts</h2>
+{{/* No severity column: the alert reads do not select severity, so every row
+    would print the same fallback pill. The alerts page owns that column. */}}
+{{if .RecentAlerts}}
+<table>
+  <tr><th>ID</th><th>Rule</th><th>Event</th><th>At</th></tr>
+  {{range .RecentAlerts}}
+  <tr>
+    <td><a href="/alerts/{{.ID}}">{{.ID}}</a></td>
+    <td>#{{.RuleID}}</td>
+    <td>{{template "copyID" .EventID}}</td>
+    <td>{{if .RetractedAt}}<span class="pill off" title="orphaned by a chain reorg">retracted</span> {{end}}{{formatTime .CreatedAt $.Timezone}}{{with relTime .CreatedAt}} <span class="muted">({{.}})</span>{{end}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else if eq .Monitor.Cue "never"}}
+<div class="empty">
+  <h2>This monitor has never fired</h2>
+  <p>No event has matched it since it was created. If that is not expected, check that the rules below name events the contract actually emits, that the monitor is enabled, and that its contracts are on the network being polled.</p>
+  <p><a href="#rules">Review its rules</a> &middot; <a href="https://github.com/sorotrail/SoroBeacon/blob/main/docs/guides/writing-rules.md">Writing rules</a></p>
+</div>
+{{else}}
+<p class="muted">No stored alert for this monitor — its last match is older than the alerts kept.</p>
+{{end}}
+<p><a href="{{.AlertsHref}}">All alerts for this monitor &rarr;</a></p>
+
+<h2 id="rules">Rules</h2>
 {{if .Rules}}
 <table>
-  <tr><th>ID</th><th>Type</th><th>Params</th><th>Status</th><th></th></tr>
+  <tr><th>ID</th><th>Type</th><th>Severity</th><th>Params</th><th>Status</th><th></th></tr>
   {{range .Rules}}
   <tr>
     <td>{{.ID}}</td>
     <td>{{.Type}}</td>
+    <td>{{if .Severity}}<span class="pill {{severityClass .Severity}}">{{.Severity}}</span>{{else}}<span class="pill warning">warning</span>{{end}}</td>
     <td><code>{{printf "%s" .Params}}</code></td>
     <td>{{if .Enabled}}<span class="pill on">enabled</span>{{else}}<span class="pill off">disabled</span>{{end}}</td>
     <td>
@@ -58,6 +110,12 @@
       <label for="params">Params (JSON)</label>
       <textarea id="params" name="params" rows="4">{"event_name": "transfer"}</textarea>
     </details>
+    <label for="severity">Severity</label>
+    <select id="severity" name="severity">
+      <option value="info">Info</option>
+      <option value="warning" selected>Warning</option>
+      <option value="critical">Critical</option>
+    </select>
     <div id="params-preview" class="muted" style="margin:.5rem 0"></div>
     <p><button>Add rule</button></p>
   </form>

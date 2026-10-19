@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
@@ -16,7 +18,7 @@ import (
 )
 
 // parseAlertFilter reads the shared alert listing query params
-// (monitor_id, rule_id, contract_id, from, to as RFC 3339, sort, limit,
+// (monitor_id, rule_id, contract_id, q, from, to as RFC 3339, sort, limit,
 // cursor). GET /alerts and GET /alerts.csv both call it so the two
 // endpoints cannot drift on which params exist or how bad values are
 // reported. On failure it has already written the error envelope.
@@ -41,6 +43,22 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 		f.RuleID = id
 	}
 	f.ContractID = q.Get("contract_id")
+	// Network narrows the listing to one chain, read the same way the monitor
+	// and channel listings read it (see parseListFilter). Unset means every
+	// network the instance polls, which is what a caller that predates
+	// multi-network sees.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	// The term is trimmed here rather than left for the store because the cap
+	// is about the text actually searched: a term padded with spaces to one
+	// character over the limit is a short search whose padding is not part of
+	// it, so measuring the raw value would reject on the spaces.
+	if term := store.NormalizeAlertSearch(q.Get("q")); term != "" {
+		if utf8.RuneCountInString(term) > store.MaxAlertSearchLen {
+			writeErr(w, r, http.StatusBadRequest, fmt.Sprintf("invalid q (max %d characters)", store.MaxAlertSearchLen))
+			return f, false
+		}
+		f.Query = term
+	}
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "created_at_desc", "created_at_asc":
@@ -76,11 +94,20 @@ func parseAlertFilter(w http.ResponseWriter, r *http.Request) (store.AlertFilter
 		}
 		f.AfterID = id
 	}
+	if v := q.Get("severity"); v != "" {
+		if parsed, ok := store.ParseSeverity(v); ok {
+			f.Severity = parsed
+		} else {
+			writeErr(w, r, http.StatusBadRequest, `invalid severity (must be "info", "warning", or "critical")`)
+			return f, false
+		}
+	}
 	return f, true
 }
 
 // listAlerts serves GET /alerts with query filters:
-// monitor_id, rule_id, contract_id, from, to (RFC 3339), sort
+// monitor_id, rule_id, contract_id, q (case-insensitive substring of the
+// source event id or the payload text), from, to (RFC 3339), sort
 // (created_at_desc default, created_at_asc), limit, cursor (last seen
 // alert id; comparison follows sort).
 func (s *Server) listAlerts(w http.ResponseWriter, r *http.Request) {
@@ -131,8 +158,11 @@ const alertExportPageSize = 500
 // part of the endpoint's contract: spreadsheet templates and importers key
 // off column position, so new columns are appended, never inserted.
 var alertCSVHeader = []string{
-	"id", "monitor_name", "rule_id", "contract_id",
+	"id", "monitor_name", "rule_id", "severity", "contract_id",
 	"event_name", "event_id", "ledger", "created_at", "payload",
+	// Appended, never inserted: an importer keyed on column position keeps
+	// working, and a single-network instance simply exports it empty.
+	"network",
 }
 
 // exportAlertsCSV serves GET /alerts.csv. It shares parseAlertFilter with
@@ -220,16 +250,24 @@ func alertCSVRow(a store.Alert, monitorName string) []string {
 		Ledger     uint32 `json:"ledger"`
 	}
 	_ = json.Unmarshal(a.Payload, &p)
+	sev := string(a.Severity)
+	if sev == "" {
+		sev = "warning"
+	}
 	return []string{
 		strconv.FormatInt(a.ID, 10),
 		csvSafe(monitorName),
 		strconv.FormatInt(a.RuleID, 10),
+		csvSafe(sev),
 		csvSafe(p.ContractID),
 		csvSafe(p.EventName),
 		csvSafe(a.EventID),
 		strconv.FormatUint(uint64(p.Ledger), 10),
 		a.CreatedAt.UTC().Format(time.RFC3339),
 		csvSafe(string(a.Payload)),
+		// Which chain's node produced the row — on a multi-network instance
+		// the same contract id in two exports means two different contracts.
+		csvSafe(a.Network),
 	}
 }
 
@@ -347,12 +385,14 @@ func writeRetryGate(w http.ResponseWriter, r *http.Request, err error) {
 
 func notifyAlertFromStore(ctx context.Context, st store.Store, a store.Alert) notify.Alert {
 	na := notify.Alert{
-		ID:        a.ID,
-		MonitorID: a.MonitorID,
-		RuleID:    a.RuleID,
-		EventID:   a.EventID,
-		Payload:   a.Payload,
-		CreatedAt: a.CreatedAt,
+		ID:         a.ID,
+		MonitorID:  a.MonitorID,
+		RuleID:     a.RuleID,
+		EventID:    a.EventID,
+		Payload:    a.Payload,
+		Enrichment: a.Enrichment,
+		CreatedAt:  a.CreatedAt,
+		Severity:   string(a.Severity),
 	}
 	var p struct {
 		ContractID string `json:"contract_id"`

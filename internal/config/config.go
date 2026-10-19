@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sorotrail/sorobeacon/internal/secrets"
 )
 
 // Defaults used when the corresponding environment variable is unset.
@@ -19,6 +21,10 @@ const (
 	DefaultRPCURL       = "https://soroban-testnet.stellar.org"
 	DefaultPollInterval = 5 * time.Second
 	DefaultHTTPAddr     = ":8080"
+	// DefaultOTLPSampleRate keeps every trace when tracing is enabled.
+	// Sampling is an operator lever for busy deployments, not a way to hide
+	// spans by default: the whole feature is off unless OTLP_ENDPOINT is set.
+	DefaultOTLPSampleRate = 1.0
 	// DefaultHTTPMaxBodyBytes is 1 MiB. Rule params are nested JSON and
 	// channel configs are small; 1 MiB is well above any legitimate write
 	// payload while bounding unauthenticated POSTs on a small instance.
@@ -31,6 +37,10 @@ const (
 	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
 	// to cover the practical reorg depth.
 	DefaultReorgTrackingWindow uint32 = 128
+	// DefaultGraphQLMaxDepth is the maximum query depth for GraphQL.
+	// DefaultGraphQLMaxComplexity is the maximum query complexity for GraphQL.
+	DefaultGraphQLMaxDepth      = 10
+	DefaultGraphQLMaxComplexity = 1000
 )
 
 // Config holds all runtime configuration. Every field maps to one
@@ -39,7 +49,17 @@ type Config struct {
 	// Network is the Stellar network to monitor — its name, passphrase
 	// and RPC endpoint, resolved from NETWORK / RPC_URL /
 	// NETWORK_PASSPHRASE by ParseNetwork.
+	//
+	// It is the *primary* network: with NETWORKS set it is that list's first
+	// entry, and it is the network the startup upgrade labels pre-multi-network
+	// monitors and alerts with. Networks holds the full list to poll.
 	Network Network
+	// Networks is every Stellar network this instance polls, primary first,
+	// from NETWORKS (falling back to NETWORK alone). It is never empty, so
+	// single-network deployments are one-element lists rather than a special
+	// case — which is what keeps the poller supervisor free of any "if there
+	// is only one" branch.
+	Networks []Network
 	// RPCURL is the first Stellar RPC endpoint (JSON-RPC 2.0 over HTTP).
 	// This is Network.RPCURL; kept as a direct field since most call sites
 	// only need the URL.
@@ -63,6 +83,11 @@ type Config struct {
 	// DatabaseMaxConnIdleTime is the pgx pool MaxConnIdleTime. Zero
 	// means use the driver default (DATABASE_MAX_CONN_IDLE_TIME).
 	DatabaseMaxConnIdleTime time.Duration
+	// ReplicaDatabaseURL is a second Postgres connection string serving the
+	// read-only queries the store routes (REPLICA_DATABASE_URL). Empty means
+	// no replica: every read stays on DatabaseURL, which is how every
+	// deployment behaved before replica routing existed.
+	ReplicaDatabaseURL string
 	// ConfigEncryptionKey is the decoded AES-GCM key used to encrypt
 	// channels.config at rest (CONFIG_ENCRYPTION_KEY, base64). Nil means
 	// encryption is disabled and configs stay plaintext, preserving the
@@ -75,15 +100,34 @@ type Config struct {
 	// authentication existed, and the process logs one startup warning.
 	// Hold the tokens here, not the raw string: the values are secrets and
 	// must never be logged or echoed.
+	//
+	// These tokens are unscoped: each one selects the default workspace.
+	// WORKSPACE_TOKENS (WorkspaceTokens below) is how a shared instance
+	// hands out one token per team.
 	APITokens []string
+	// WorkspaceTokens is the parsed WORKSPACE_TOKENS list, one
+	// workspace=token binding per comma-separated entry. It is what makes an
+	// instance multi-tenant over static credentials: the credential decides
+	// which workspace a request acts on, so no client can ask for another
+	// team's data. Load rejects an entry whose id is not a valid workspace id
+	// and a token that appears twice for two different workspaces.
+	WorkspaceTokens []WorkspaceToken
+	// OIDC is the parsed OIDC_* block. Enabled() is false with OIDC_ISSUER
+	// unset, which leaves single sign-on off and the dashboard on its static
+	// token exactly as before.
+	OIDC OIDC
 	// PollInterval is how often the poller asks the RPC for new events.
 	PollInterval time.Duration
 	// SourceMode selects where events come from: "rpc" (standalone,
-	// default) or "sorotrail" (upstream, reads a SoroTrail indexer).
+	// default), "sorotrail" (upstream, reads a SoroTrail indexer), or
+	// "horizon" (reads contract events from a Horizon server).
 	SourceMode string
 	// SoroTrailURL is the base URL of a SoroTrail indexer; required when
 	// SourceMode is "sorotrail", ignored otherwise.
 	SoroTrailURL string
+	// HorizonURL is the base URL of a Horizon server; required when
+	// SourceMode is "horizon", ignored otherwise.
+	HorizonURL string
 	// CORSAllowedOrigins is the allow-list of browser Origins permitted to
 	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
 	// Empty disables CORS; the dashboard is same-origin and never needs it.
@@ -114,13 +158,29 @@ type Config struct {
 	// are kept. Zero (the default, when ALERT_RETENTION is unset) keeps
 	// everything forever so upgrades never start deleting history.
 	AlertRetention time.Duration
+	// AlertEnrichmentURL is an optional operator-supplied HTTP JSON source.
+	AlertEnrichmentURL      string
+	AlertEnrichmentTimeout  time.Duration
+	AlertEnrichmentCacheTTL time.Duration
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// OTLP is the OpenTelemetry tracing configuration. Endpoint empty (the
+	// default, OTLP_ENDPOINT unset) disables tracing entirely: no exporter,
+	// no exporter goroutines, no measurable overhead — spans collapse to
+	// no-ops. When set it is the OTLP/HTTP base URL spans are shipped to.
+	OTLP OTLPConfig
 	// GRPCAddr is the listen address for the optional gRPC server
 	// (GRPC_ADDR). Empty (the default) disables gRPC entirely so existing
 	// deployments do not open a new port without opting in.
 	GRPCAddr string
+	// ChannelDisableAfterFailures is how many consecutive permanent channel
+	// failures (401/403/404 — a revoked bot token, a deleted webhook) take a
+	// channel out of rotation. Zero, the default when the variable is unset,
+	// never auto-disables: silently switching off someone's alerting is a
+	// worse outcome than the failure it would fix, so opting in is the
+	// operator's call.
+	ChannelDisableAfterFailures int
 	// ReorgTrackingWindow is how many recent ledgers' hashes the poller keeps
 	// and re-checks each cycle for reorg detection
 	// (REORG_TRACKING_WINDOW, default 128). Zero disables detection, which is
@@ -130,13 +190,81 @@ type Config struct {
 	// be before it may alert (REORG_CONFIRMATION_DEPTH, default 0). Zero
 	// alerts immediately, the historical default.
 	ReorgConfirmationDepth uint32
+	// SecretsProvider selects the external secret provider used to resolve
+	// ${secret:...} references in channel configs (SECRETS_PROVIDER).
+	// Empty (the default) disables external secrets: references are then
+	// treated as literals, so an upgrade changes nothing.
+	SecretsProvider string
+	// SecretsCacheTTL is how long a resolved secret is reused
+	// (SECRETS_CACHE_TTL, default secrets.DefaultTTL). Zero disables
+	// caching so every construction re-fetches.
+	SecretsCacheTTL time.Duration
+	// VaultAddr is the HashiCorp Vault address (VAULT_ADDR); required when
+	// SecretsProvider is "vault".
+	VaultAddr string
+	// VaultToken is the Vault token (VAULT_TOKEN). It is a credential and
+	// is never logged.
+	VaultToken string
+	// VaultNamespace is the optional Vault Enterprise namespace
+	// (VAULT_NAMESPACE).
+	VaultNamespace string
 	// ArchiveURL is where retention copies alerts before deleting them
 	// (ARCHIVE_URL). Empty (the default) leaves archiving off, so retention
 	// behaves exactly as it did before the feature. A local directory path,
 	// file://, dir:// or s3://bucket/prefix are accepted; the archive package
 	// validates it when the pruner is built.
 	ArchiveURL string
+
+	// GraphQL is the GraphQL endpoint configuration.
+	GraphQL GraphQLConfig
+
+	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
+	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
+	NotifyRateLimitSlackRPS float64
+	// NotifyRateLimitTelegramRPS is the max requests per second for Telegram channels
+	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS, default 30.0, citing Telegram Bot API limit of 30 msg/sec).
+	NotifyRateLimitTelegramRPS float64
+	// NotifyRateLimitPagerDutyRPS is the max requests per second for PagerDuty channels
+	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS, default 2.0, citing PagerDuty Events API v2 rate limit ~2 requests/sec).
+	NotifyRateLimitPagerDutyRPS float64
+	// NotifyRateLimitDefaultRPS is the default max requests per second for any other channel
+	// (NOTIFY_RATE_LIMIT_DEFAULT_RPS, default 5.0).
+	NotifyRateLimitDefaultRPS float64
 }
+
+// OTLPConfig is the tracing slice of the configuration. It is a struct so a
+// stage that needs the endpoint does not pull the whole Config in.
+type OTLPConfig struct {
+	// Endpoint is the OTLP/HTTP base URL (OTLP_ENDPOINT, e.g.
+	// http://localhost:4318). Empty disables tracing.
+	Endpoint string
+	// ServiceName is the service.name resource attribute
+	// (OTLP_SERVICE_NAME). Empty falls back to "sorobeacon".
+	ServiceName string
+	// SampleRate is the fraction of traces kept, in [0,1]
+	// (OTLP_SAMPLE_RATE). Defaults to 1 (keep everything).
+	SampleRate float64
+}
+
+// Enabled reports whether tracing is switched on. The single place the
+// "off unless OTLP_ENDPOINT is set" rule lives, so the wiring in main and
+// the tests cannot drift apart.
+func (o OTLPConfig) Enabled() bool { return o.Endpoint != "" }
+
+// GraphQLConfig is the GraphQL endpoint configuration.
+type GraphQLConfig struct {
+	// EnablePlayground serves the GraphQL playground at /graphql/playground.
+	// Default false for security.
+	EnablePlayground bool
+	// MaxDepth limits the maximum query depth. Default 10.
+	MaxDepth int
+	// MaxComplexity limits the maximum query complexity. Default 1000.
+	MaxComplexity int
+}
+
+// PlaygroundEnabled reports whether the interactive playground is served.
+// The endpoint itself is always available; this controls the playground only.
+func (g GraphQLConfig) PlaygroundEnabled() bool { return g.EnablePlayground }
 
 // Load reads configuration from the environment and, optionally, a YAML file
 // pointed to by CONFIG_FILE. Environment values win over the file, and the file
@@ -148,15 +276,20 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	net, err := ParseNetwork(func(key string) string {
+	nets, err := ParseNetworks(func(key string) string {
 		return lookupConfigValue(key, fileValues)
 	})
 	if err != nil {
 		return Config{}, err
 	}
+	// The primary network is the list's first entry. With NETWORKS unset that
+	// entry is exactly what ParseNetwork resolves from NETWORK, so every
+	// consumer of the single-network fields below behaves as it always did.
+	net := nets[0]
 
 	cfg := Config{
 		Network:            net,
+		Networks:           nets,
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
 		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
@@ -196,12 +329,24 @@ func Load() (Config, error) {
 	}
 
 	cfg.SourceMode = valueOrFallback("SOURCE_MODE", fileValues, "rpc")
-	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" {
-		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail)", cfg.SourceMode)
+	if cfg.SourceMode != "rpc" && cfg.SourceMode != "sorotrail" && cfg.SourceMode != "horizon" {
+		return cfg, fmt.Errorf("invalid SOURCE_MODE %q (want rpc|sorotrail|horizon)", cfg.SourceMode)
 	}
 	cfg.SoroTrailURL = lookupConfigValue("SOROTRAIL_URL", fileValues)
 	if cfg.SourceMode == "sorotrail" && cfg.SoroTrailURL == "" {
 		return cfg, fmt.Errorf("SOROTRAIL_URL is required when SOURCE_MODE=sorotrail")
+	}
+	cfg.HorizonURL = lookupConfigValue("HORIZON_URL", fileValues)
+	if cfg.SourceMode == "horizon" && cfg.HorizonURL == "" {
+		return cfg, fmt.Errorf("HORIZON_URL is required when SOURCE_MODE=horizon")
+	}
+	// The upstream source is one SoroTrail deployment reading one chain: it has
+	// no per-network request to make, so a second entry in NETWORKS would be
+	// polled by nobody. Fail here instead of starting a supervisor whose
+	// testnet unit never advances.
+	if cfg.SourceMode == "sorotrail" && len(cfg.Networks) > 1 {
+		return cfg, fmt.Errorf("NETWORKS=%s lists %d chains but SOURCE_MODE=sorotrail reads events from a single upstream deployment; use SOURCE_MODE=rpc to poll several networks",
+			strings.Join(NetworkNames(cfg.Networks), ","), len(cfg.Networks))
 	}
 
 	if v := lookupConfigValue("POLL_INTERVAL", fileValues); v != "" {
@@ -228,6 +373,27 @@ func Load() (Config, error) {
 		return cfg, err
 	}
 	cfg.APITokens = tokens
+
+	bound, err := parseWorkspaceTokens(lookupConfigValue("WORKSPACE_TOKENS", fileValues))
+	if err != nil {
+		return cfg, err
+	}
+	cfg.WorkspaceTokens = bound
+	// A token that names two workspaces is rejected at startup, not at the
+	// first request: resolution would otherwise depend on which configured
+	// entry the comparison happened to hit, which is the one failure mode
+	// tenancy cannot have.
+	if err := checkTokenWorkspaces(cfg.APITokens, cfg.WorkspaceTokens); err != nil {
+		return cfg, err
+	}
+
+	oidc, err := parseOIDC(func(key string) string {
+		return lookupConfigValue(key, fileValues)
+	})
+	if err != nil {
+		return cfg, err
+	}
+	cfg.OIDC = oidc
 
 	if v := lookupConfigValue("HTTP_MAX_BODY_BYTES", fileValues); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -272,6 +438,14 @@ func Load() (Config, error) {
 			cfg.RateLimitBurst = 1
 		}
 	}
+	if v := lookupConfigValue("CHANNEL_DISABLE_AFTER_FAILURES", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return cfg, fmt.Errorf("invalid CHANNEL_DISABLE_AFTER_FAILURES %q (want a non-negative integer)", v)
+		}
+		cfg.ChannelDisableAfterFailures = n
+	}
+
 	if v := lookupConfigValue("MONITOR_SILENT_AFTER", fileValues); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -319,6 +493,22 @@ func Load() (Config, error) {
 	cfg.DatabaseMinConns = minConns
 	cfg.DatabaseMaxConnLifetime = maxLifetime
 	cfg.DatabaseMaxConnIdleTime = maxIdle
+
+	// Read-replica routing is Postgres-only and off unless asked for. Both
+	// failures below are startup errors rather than warnings: an operator who
+	// sets REPLICA_DATABASE_URL believes reads are being routed, and a
+	// deployment that silently serves everything from the primary while
+	// claiming otherwise is worse than one that refuses to boot.
+	replicaURL := strings.TrimSpace(lookupConfigValue("REPLICA_DATABASE_URL", fileValues))
+	if sqliteBackend && replicaURL != "" {
+		return cfg, fmt.Errorf("REPLICA_DATABASE_URL has no effect on a sqlite DATABASE_URL: SQLite serves reads and writes from one file; unset it or use Postgres")
+	}
+	if replicaURL != "" {
+		if err := validateReplicaDatabaseURL(replicaURL, cfg.DatabaseURL); err != nil {
+			return cfg, err
+		}
+	}
+	cfg.ReplicaDatabaseURL = replicaURL
 	key, err := parseEncryptionKey(lookupConfigValue("CONFIG_ENCRYPTION_KEY", fileValues))
 	if err != nil {
 		return cfg, err
@@ -338,6 +528,23 @@ func Load() (Config, error) {
 		}
 		cfg.AlertRetention = d
 	}
+	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupConfigValue("ALERT_ENRICHMENT_URL", fileValues))
+	cfg.AlertEnrichmentTimeout = 2 * time.Second
+	cfg.AlertEnrichmentCacheTTL = 5 * time.Minute
+	if v := lookupConfigValue("ALERT_ENRICHMENT_TIMEOUT", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_TIMEOUT %q", v)
+		}
+		cfg.AlertEnrichmentTimeout = d
+	}
+	if v := lookupConfigValue("ALERT_ENRICHMENT_CACHE_TTL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid ALERT_ENRICHMENT_CACHE_TTL %q", v)
+		}
+		cfg.AlertEnrichmentCacheTTL = d
+	}
 	if v := lookupConfigValue("REORG_TRACKING_WINDOW", fileValues); v != "" {
 		n, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
@@ -354,7 +561,126 @@ func Load() (Config, error) {
 	}
 	cfg.ArchiveURL = strings.TrimSpace(lookupConfigValue("ARCHIVE_URL", fileValues))
 
+	// Tracing is off unless OTLP_ENDPOINT is set; see telemetry.Config.
+	cfg.OTLP.Endpoint = lookupConfigValue("OTLP_ENDPOINT", fileValues)
+	if cfg.OTLP.Endpoint != "" {
+		u, err := url.Parse(cfg.OTLP.Endpoint)
+		if err != nil || !u.IsAbs() || u.Host == "" ||
+			(u.Scheme != "http" && u.Scheme != "https") {
+			return cfg, fmt.Errorf(
+				"invalid OTLP_ENDPOINT %q: must be an absolute http or https URL",
+				cfg.OTLP.Endpoint,
+			)
+		}
+	}
+	cfg.OTLP.ServiceName = lookupConfigValue("OTLP_SERVICE_NAME", fileValues)
+	cfg.OTLP.SampleRate = DefaultOTLPSampleRate
+	if v := lookupConfigValue("OTLP_SAMPLE_RATE", fileValues); v != "" {
+		r, err := strconv.ParseFloat(v, 64)
+		if err != nil || r < 0 || r > 1 || math.IsNaN(r) || math.IsInf(r, 0) {
+			return cfg, fmt.Errorf("invalid OTLP_SAMPLE_RATE %q (want a number in [0, 1])", v)
+		}
+		cfg.OTLP.SampleRate = r
+	}
+	// GraphQL configuration. Read through lookupConfigValue like every other
+	// setting, so CONFIG_FILE can supply these too.
+	cfg.GraphQL.EnablePlayground = false
+	if v := lookupConfigValue("GRAPHQL_PLAYGROUND", fileValues); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			cfg.GraphQL.EnablePlayground = true
+		case "0", "false", "no", "off":
+			cfg.GraphQL.EnablePlayground = false
+		default:
+			return cfg, fmt.Errorf("invalid GRAPHQL_PLAYGROUND %q (want true|false)", v)
+		}
+	}
+	cfg.GraphQL.MaxDepth = DefaultGraphQLMaxDepth
+	if v := lookupConfigValue("GRAPHQL_MAX_DEPTH", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 50 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_DEPTH %q (want an integer between 1 and 50)", v)
+		}
+		cfg.GraphQL.MaxDepth = n
+	}
+	cfg.GraphQL.MaxComplexity = DefaultGraphQLMaxComplexity
+	if v := lookupConfigValue("GRAPHQL_MAX_COMPLEXITY", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return cfg, fmt.Errorf("invalid GRAPHQL_MAX_COMPLEXITY %q (want an integer between 1 and 10000)", v)
+		}
+		cfg.GraphQL.MaxComplexity = n
+	}
+
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_SLACK_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_SLACK_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitSlackRPS = rps
+	}
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_TELEGRAM_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitTelegramRPS = rps
+	}
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_PAGERDUTY_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitPagerDutyRPS = rps
+	}
+	if v := lookupConfigValue("NOTIFY_RATE_LIMIT_DEFAULT_RPS", fileValues); v != "" {
+		rps, err := strconv.ParseFloat(v, 64)
+		if err != nil || rps < 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+			return cfg, fmt.Errorf("invalid NOTIFY_RATE_LIMIT_DEFAULT_RPS %q (want a non-negative number)", v)
+		}
+		cfg.NotifyRateLimitDefaultRPS = rps
+	}
+
+	if err := loadSecrets(&cfg, fileValues); err != nil {
+		return cfg, err
+	}
+
 	return cfg, nil
+}
+
+// loadSecrets reads the external-secret provider configuration. The active
+// provider is validated here so a typo or a missing Vault address fails
+// startup rather than the first alert that references a secret.
+//
+// It takes fileValues so these settings resolve the same way as every other
+// one: environment first, config file as the fallback.
+func loadSecrets(cfg *Config, fileValues map[string]string) error {
+	cfg.SecretsProvider = strings.ToLower(strings.TrimSpace(lookupConfigValue("SECRETS_PROVIDER", fileValues)))
+	switch cfg.SecretsProvider {
+	case "", "env", "vault":
+	default:
+		return fmt.Errorf("invalid SECRETS_PROVIDER %q (want env|vault, or unset to disable external secrets)", cfg.SecretsProvider)
+	}
+
+	cfg.SecretsCacheTTL = secrets.DefaultTTL
+	if v := lookupConfigValue("SECRETS_CACHE_TTL", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SECRETS_CACHE_TTL %q: %w", v, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("SECRETS_CACHE_TTL %q is negative", v)
+		}
+		cfg.SecretsCacheTTL = d
+	}
+
+	cfg.VaultAddr = strings.TrimRight(strings.TrimSpace(lookupConfigValue("VAULT_ADDR", fileValues)), "/")
+	cfg.VaultToken = lookupConfigValue("VAULT_TOKEN", fileValues)
+	cfg.VaultNamespace = strings.TrimSpace(lookupConfigValue("VAULT_NAMESPACE", fileValues))
+	if cfg.SecretsProvider == "vault" && cfg.VaultAddr == "" {
+		return fmt.Errorf("VAULT_ADDR is required when SECRETS_PROVIDER=vault")
+	}
+	return nil
 }
 
 func valueOrFallback(key string, fileValues map[string]string, fallback string) string {
@@ -421,24 +747,45 @@ const redacted = "[redacted]"
 func (c Config) LogAttrs() []slog.Attr {
 	return []slog.Attr{
 		slog.String("database_url", redactDatabaseURL(c.DatabaseURL)),
+		// Redacted the same way: the replica URL carries its own credentials,
+		// and the redaction keeps only scheme, host and database name.
+		slog.String("replica_database_url", redactDatabaseURL(c.ReplicaDatabaseURL)),
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("source_mode", c.SourceMode),
 		slog.String("poll_interval", c.PollInterval.String()),
 		slog.String("log_level", strings.ToLower(c.LogLevel.String())),
 		slog.String("network", c.Network.Name),
-		slog.String("rpc_url", c.RPCURL),
+		slog.String("rpc_url", redactURLCredentials(c.RPCURL)),
 		// The count, not the list: it is how an operator confirms at a
 		// glance that the failover set was read, and the URLs themselves
 		// already appear (first one above) in the poller's own lines.
 		slog.Int("rpc_endpoint_count", len(c.RPCURLs)),
-		slog.String("sorotrail_url", c.SoroTrailURL),
+		slog.String("sorotrail_url", redactURLCredentials(c.SoroTrailURL)),
+		// Redacted for the same reason as the others: a Horizon endpoint
+		// behind basic auth carries the credential in the URL.
+		slog.String("horizon_url", redactURLCredentials(c.HorizonURL)),
 		slog.String("cors_allowed_origins", strings.Join(c.CORSAllowedOrigins, ",")),
 		slog.Bool("config_encryption_enabled", len(c.ConfigEncryptionKey) > 0),
+		// The provider name, never the token or any resolved value.
+		slog.String("secrets_provider", c.SecretsProvider),
+		slog.String("secrets_cache_ttl", c.SecretsCacheTTL.String()),
+		slog.Bool("vault_token_configured", c.VaultToken != ""),
 		slog.Uint64("reorg_tracking_window", uint64(c.ReorgTrackingWindow)),
 		slog.Uint64("reorg_confirmation_depth", uint64(c.ReorgConfirmationDepth)),
 		// The count, never the tokens themselves: LogAttrs is the one place
 		// configuration is printed, and an API token is a credential.
 		slog.Int("api_token_count", len(c.APITokens)),
+		// The workspace ids are safe to print and useful on a startup line; the
+		// tokens that select them are not, so only the ids appear.
+		slog.Any("workspaces", c.Workspaces()),
+		slog.Bool("sso_enabled", c.OIDC.Enabled()),
+		slog.Bool("otlp_tracing_enabled", c.OTLP.Endpoint != ""),
+		slog.String("otlp_service_name", c.OTLP.ServiceName),
+		slog.Float64("otlp_sample_rate", c.OTLP.SampleRate),
+		slog.Bool("graphql_playground_enabled", c.GraphQL.EnablePlayground),
+		slog.Int("graphql_max_depth", c.GraphQL.MaxDepth),
+		slog.Int("graphql_max_complexity", c.GraphQL.MaxComplexity),
+		slog.Int("channel_disable_after_failures", c.ChannelDisableAfterFailures),
 	}
 }
 
@@ -451,7 +798,17 @@ func redactDatabaseURL(raw string) string {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" {
+	if err != nil {
+		// A sqlite URL can carry a Windows drive path ("sqlite://C:\srv\x.db"),
+		// which url.Parse rejects because it reads "C:" as a host with a bad
+		// port. It holds no credentials, so the operator can still be shown
+		// which file the process opened.
+		if strings.HasPrefix(strings.ToLower(raw), "sqlite:") {
+			return raw
+		}
+		return redacted
+	}
+	if u.Scheme == "" {
 		return redacted
 	}
 	if strings.EqualFold(u.Scheme, "sqlite") {
@@ -461,6 +818,23 @@ func redactDatabaseURL(raw string) string {
 		return redacted
 	}
 	return u.Scheme + "://" + u.Host + u.Path
+}
+
+// redactURLCredentials drops userinfo from a URL so an API key supplied as
+// basic auth cannot reach a log line, while keeping the rest readable. Like
+// redactDatabaseURL it fails closed, because a valid password is enough to
+// defeat url.Parse — a "%", a space or a "[" in the userinfo each do it — and
+// that is precisely the input worth protecting.
+func redactURLCredentials(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return redacted
+	}
+	u.User = nil
+	return u.String()
 }
 
 // ParseRetention accepts Go durations (24h, 90m) plus a day suffix
@@ -552,6 +926,30 @@ func validateDatabaseURL(raw string) error {
 	default:
 		return fmt.Errorf("DATABASE_URL scheme %q (host %s) is not supported (%s)", u.Scheme, u.Host, supported)
 	}
+}
+
+// validateReplicaDatabaseURL checks REPLICA_DATABASE_URL. The replica must be
+// a Postgres URL — there is no replica concept for SQLite, which
+// Load rejects before calling this — and it must not be the primary itself.
+// Pointing both at the same string is almost always a half-finished edit, and
+// it is worth failing on: it looks like routing is on in every log line and
+// every metric label, while every "replica" read lands on the primary. An
+// operator who genuinely wants one database behind two pools should say so
+// with two URLs.
+func validateReplicaDatabaseURL(replicaURL, primaryURL string) error {
+	u, err := url.Parse(replicaURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("REPLICA_DATABASE_URL is not a parseable URL (want a postgres connection string, e.g. postgres://user:pass@replica-host:5432/sorobeacon)")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql":
+	default:
+		return fmt.Errorf("REPLICA_DATABASE_URL scheme %q is not supported: reads can only be routed to a Postgres replica", u.Scheme)
+	}
+	if replicaURL == primaryURL {
+		return fmt.Errorf("REPLICA_DATABASE_URL is identical to DATABASE_URL; unset it to read from the primary, or point it at the replica")
+	}
+	return nil
 }
 
 // isSQLiteURL reports whether raw selects the SQLite backend. It is a

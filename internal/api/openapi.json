@@ -19,6 +19,7 @@
   "paths": {
     "/monitors": {
       "post": {
+        "description": "Required role: editor",
         "summary": "Create a monitor",
         "requestBody": {
           "required": true,
@@ -41,6 +42,7 @@
         }
       },
       "get": {
+        "description": "Required role: viewer",
         "summary": "List monitors",
         "parameters": [
           {
@@ -60,6 +62,12 @@
             "in": "query",
             "schema": { "type": "string", "enum": ["name", "id", "created_at"], "default": "name" },
             "description": "Allowlisted order: name (default), id (newest first), created_at"
+          },
+          {
+            "name": "network",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Only monitors watching this Stellar chain. Omitted means every chain this instance polls."
           },
           {
             "name": "limit",
@@ -87,6 +95,7 @@
     },
     "/monitors/bulk": {
       "post": {
+        "description": "Required role: editor",
         "summary": "Bulk enable or disable monitors",
         "description": "Sets enabled on an explicit list of monitor IDs in one statement. Unknown IDs are returned and do not prevent the known ones from applying. There is no all-monitors shorthand.",
         "requestBody": {
@@ -195,6 +204,25 @@
         }
       }
     },
+    "/monitors/{id}/stats": {
+      "parameters": [ { "$ref": "#/components/parameters/ID" } ],
+      "get": {
+        "summary": "Per-monitor statistics",
+        "description": "Alert, delivery and per-rule counts for one monitor \u2014 the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
+        "responses": {
+          "200": {
+            "description": "MonitorStats",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MonitorStats" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/monitors/{id}/duplicate": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }
@@ -208,6 +236,113 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Monitor" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/{id}/escalation": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "get": {
+        "summary": "Get a monitor's escalation policy",
+        "description": "Returns the ordered escalation steps attached to the monitor. 404 when the monitor has no policy, in which case alerts fan out to every attached channel.",
+        "responses": {
+          "200": {
+            "description": "Escalation policy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EscalationPolicy" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "put": {
+        "summary": "Create or replace a monitor's escalation policy",
+        "description": "Replaces the whole policy atomically. Steps fire in order; a step's delay is relative to the alert for the first step and to the previous step thereafter. An unknown channel id is 400.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EscalationInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored policy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/EscalationPolicy" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a monitor's escalation policy",
+        "description": "Removes the policy so the monitor fans out flat again. 404 when the monitor has no policy.",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/monitors/{id}/rules/dry-run": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Dry-run a rule against historical events",
+        "description": "Evaluates a candidate rule against stored alert history. Nothing is persisted and nothing is delivered. Stored alerts are biased toward matched events, so results underrepresent the true event corpus.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": ["event_emitted", "value_threshold", "token_event"],
+                    "description": "Rule type to evaluate"
+                  },
+                  "params": {
+                    "type": "object",
+                    "description": "Type-specific rule parameters; validated against the rule type"
+                  },
+                  "window_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 90,
+                    "description": "Lookback window in days (clamped to 90)"
+                  },
+                  "max_samples": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000,
+                    "description": "Maximum historical alerts to evaluate"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dry-run results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DryRunResult" }
               }
             }
           },
@@ -372,6 +507,7 @@
       },
       "patch": {
         "summary": "Update a channel",
+        "description": "A partial update. Setting `enabled: true` on a channel that was off is the only way out of an auto-disable, and clears its failure counters in the same write so it does not immediately re-disable.",
         "requestBody": {
           "required": true,
           "content": {
@@ -400,6 +536,52 @@
         }
       }
     },
+    "/channels/bulk": {
+      "post": {
+        "summary": "Bulk enable or disable channels",
+        "description": "Sets enabled on an explicit list of channel IDs (at most 100) in one statement. Unknown IDs are returned and do not prevent the known ones from applying, exactly as for monitors. Disabling does not drop queued or in-flight deliveries. There is no all-channels shorthand.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BulkMonitorInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkMonitorResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/channels/{id}/duplicate": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Duplicate a channel",
+        "description": "Copies the channel under a unique name. The copy carries the source's config, including credentials, is created disabled so it cannot deliver before review, and has no monitor attachments.",
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Channel" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/channels/{id}/test": {
       "parameters": [
         { "$ref": "#/components/parameters/ID" }
@@ -410,6 +592,184 @@
           "200": { "description": "Test sent" },
           "404": { "$ref": "#/components/responses/Error" },
           "502": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/maintenance-windows": {
+      "post": {
+        "summary": "Create a maintenance window",
+        "description": "Time-bounded silence. Alerts raised inside the window are still persisted and visible but are not delivered.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List maintenance windows",
+        "parameters": [
+          {
+            "name": "active",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "Restrict to windows containing the current time"
+          },
+          {
+            "name": "upcoming",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "description": "Restrict to windows starting in the future"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Maintenance windows",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindowPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/maintenance-windows/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "get": {
+        "summary": "Fetch one maintenance window",
+        "responses": {
+          "200": {
+            "description": "Maintenance window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "patch": {
+        "summary": "Update a maintenance window",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a maintenance window",
+        "responses": {
+          "204": { "description": "Deleted" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/inhibitions": {
+      "post": {
+        "summary": "Create an inhibition rule",
+        "description": "While the source rule is firing (an alert within the pair's firing window, default 300s), deliveries for the target rule are suppressed. Alert rows are still stored.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/InhibitionInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Inhibition" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "get": {
+        "summary": "List inhibition rules",
+        "responses": {
+          "200": {
+            "description": "Inhibitions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "inhibitions": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Inhibition" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/inhibitions/{sourceID}/{targetID}": {
+      "delete": {
+        "summary": "Delete an inhibition rule",
+        "parameters": [
+          {
+            "name": "sourceID",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "targetID",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer", "format": "int64" }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Deleted" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -434,22 +794,28 @@
             "description": "Exact match on payload.contract_id"
           },
           {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
+          },
+          {
             "name": "sort",
             "in": "query",
             "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
             "description": "Keyset order; anything else is 400"
           },
           {
-            "name": "since",
+            "name": "from",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
-            "description": "RFC 3339 lower bound on alert creation"
+            "description": "RFC 3339 lower bound on alert creation, inclusive"
           },
           {
-            "name": "until",
+            "name": "to",
             "in": "query",
             "schema": { "type": "string", "format": "date-time" },
-            "description": "RFC 3339 upper bound on alert creation"
+            "description": "RFC 3339 upper bound on alert creation, exclusive"
           },
           {
             "name": "limit",
@@ -475,10 +841,35 @@
         }
       }
     },
+    "/alerts/stream": {
+      "get": {
+        "summary": "Stream alerts as they are created (Server-Sent Events)",
+        "description": "Opens a text/event-stream response that emits an `alert` event for every alert created after the connection opened. SSE rather than WebSockets: the traffic is one-directional and SSE reconnects on its own. An optional monitor_id filters server-side. Comment lines (keep-alives) are sent periodically so idle connections are not reaped by a proxy, and the stream advertises a 3000ms retry hint. A subscriber that cannot keep up loses its oldest queued events rather than blocking alert creation.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" },
+            "description": "Only stream alerts created by this monitor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream; each `alert` event's data is one alert object",
+            "content": {
+              "text/event-stream": {
+                "schema": { "$ref": "#/components/schemas/Alert" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/alerts.csv": {
       "get": {
         "summary": "Export alerts as CSV",
-        "description": "Streams every alert matching the same filters as GET /alerts as text/csv. Columns are fixed: id, monitor_name, rule_id, contract_id, event_name, event_id, ledger, created_at, payload. Values beginning with =, +, - or @ are prefixed with an apostrophe to prevent spreadsheet formula injection. When no limit is given the export is capped at 10000 rows.",
+        "description": "Streams every alert matching the same filters as GET /alerts as text/csv. Columns are fixed: id, monitor_name, rule_id, contract_id, event_name, event_id, ledger, created_at, payload, network. Column position is part of the contract, so a new column is always appended, never inserted. Values beginning with =, +, - or @ are prefixed with an apostrophe to prevent spreadsheet formula injection. When no limit is given the export is capped at 10000 rows.",
         "parameters": [
           {
             "name": "monitor_id",
@@ -495,6 +886,83 @@
             "in": "query",
             "schema": { "type": "string" },
             "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 lower bound on alert creation"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": { "type": "string", "format": "date-time" },
+            "description": "RFC 3339 upper bound on alert creation"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "description": "Keyset order; anything else is 400"
+          },
+          {
+            "name": "network",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Only alerts whose event came from this Stellar chain. Omitted means every chain."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "default": 10000, "maximum": 10000 },
+            "description": "Maximum rows to export; the endpoint caps at 10000"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Alerts as CSV",
+            "content": {
+              "text/csv": {
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/alerts/export": {
+      "get": {
+        "summary": "Export alerts as NDJSON",
+        "description": "Streams every alert matching the same filters as GET /alerts as application/x-ndjson. Each line is a JSON object with id, monitor_id, monitor_name, rule_id, event_id, event_name, contract_id, ledger, created_at, and payload. A repeatable-read snapshot keeps the export consistent; cancellation stops the query. When no limit is given the export is capped at 10000 rows.",
+        "parameters": [
+          {
+            "name": "monitor_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "rule_id",
+            "in": "query",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "contract_id",
+            "in": "query",
+            "schema": { "type": "string" },
+            "description": "Exact match on payload.contract_id"
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": { "type": "string", "maxLength": 256 },
+            "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
           },
           {
             "name": "from",
@@ -523,14 +991,34 @@
         ],
         "responses": {
           "200": {
-            "description": "Alerts as CSV",
+            "description": "Alerts as NDJSON stream",
             "content": {
-              "text/csv": {
+              "application/x-ndjson": {
                 "schema": { "type": "string" }
               }
             }
           },
           "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/alerts/{id}/acknowledge": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Acknowledge an alert",
+        "description": "Stamps the alert acknowledged and stops any escalation attached to it, so later steps do not fire. Idempotent; 404 for a missing alert.",
+        "responses": {
+          "200": {
+            "description": "The acknowledged alert",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Alert" }
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -589,6 +1077,45 @@
         }
       }
     },
+    "/dead-letters": {
+      "get": {
+        "summary": "List dead-letter queue records",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Dead letters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "dead_letters": { "type": "array", "items": { "type": "object" } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dead-letters/{id}/redrive": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ID" }
+      ],
+      "post": {
+        "summary": "Re-drive a dead-letter delivery",
+        "responses": {
+          "200": { "description": "Re-driven successfully" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
     "/ingest": {
       "post": {
         "summary": "Receive a federated alert from another SoroBeacon instance",
@@ -633,7 +1160,8 @@
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. Reports `leader` (whether this instance holds the poller lease), `leader_election` (whether a lease exists to hold at all; false for a single-node/ SQLite deployment) and `leader_since`. A follower is healthy: it serves the API and dashboard and returns 200.",
+        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. On an instance that polls several Stellar networks the body adds a `networks` array — per chain: source state, last processed ledger, chain tip, lag and last successful poll — and answers 503 `degraded` when any chain's source is failing. The top-level `rpc` field is only ever the primary chain's source, which is why the array exists.",
         "security": [],
         "responses": {
           "200": { "description": "Healthy" },
@@ -654,7 +1182,7 @@
     "/readyz": {
       "get": {
         "summary": "Readiness probe",
-        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
+        "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. On an instance that polls several Stellar networks each chain gets its own check (`rpc_testnet`, `rpc_mainnet`, ...) alongside the primary chain's `rpc`, so a node that is down on one chain cannot read as ready. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
         "security": [],
         "responses": {
           "200": { "description": "Ready" },
@@ -688,6 +1216,21 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Version" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rule-types": {
+      "get": {
+        "summary": "List rule types and parameter schemas",
+        "responses": {
+          "200": {
+            "description": "Registered rule types",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RuleTypesResponse" }
               }
             }
           }
@@ -739,6 +1282,51 @@
               }
             }
           }
+        }
+      }
+    },
+    "/audit": {
+      "get": {
+        "summary": "Audit log of configuration changes",
+        "description": "Append-only entries for monitor, rule and channel create, update and delete. diff records field names only, never values.",
+        "parameters": [
+          { "name": "target_type", "in": "query", "schema": { "type": "string", "enum": ["monitor", "rule", "channel"] } },
+          { "name": "target_id", "in": "query", "schema": { "type": "integer", "format": "int64" } },
+          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["entries"],
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["id", "actor", "action", "target_type", "target_id", "created_at"],
+                        "properties": {
+                          "id": { "type": "integer", "format": "int64" },
+                          "actor": { "type": "string" },
+                          "action": { "type": "string", "enum": ["create", "update", "delete"] },
+                          "target_type": { "type": "string", "enum": ["monitor", "rule", "channel"] },
+                          "target_id": { "type": "integer", "format": "int64" },
+                          "diff": { "type": "object" },
+                          "created_at": { "type": "string", "format": "date-time" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" }
         }
       }
     },
@@ -931,6 +1519,70 @@
           "400": { "$ref": "#/components/responses/Error" }
         }
       }
+    },
+    "/tokens": {
+      "post": {
+        "summary": "Mint a scoped API token",
+        "description": "Creates a database-backed credential: `sb_` followed by 32 random bytes, base64url-encoded. The response's `token` field is the only place the secret ever appears — the row stores a SHA-256 digest of it, so it cannot be read back, listed, logged or recovered. A client that loses the secret mints a new token and revokes the old one.\n\n`scopes` is required and non-empty: a token with no scope authenticates and can then call nothing. Every scope must come from the enumeration below. A request carrying a scoped token may only grant scopes it already holds, so `tokens:write` is not a road back to full control. `expires_in` is a Go duration string (`72h`, `168h`); omit it for a token that never expires.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TokenInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Minted. The only response in the API that contains a token secret.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreatedAPIToken" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+        }
+      },
+      "get": {
+        "summary": "List API tokens",
+        "description": "Lists the caller's workspace's tokens: name, display prefix, scopes and lifecycle timestamps. Never a secret and never the stored digest.",
+        "responses": {
+          "200": {
+            "description": "Tokens, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tokens": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/APIToken" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+        }
+      }
+    },
+    "/tokens/{id}/revoke": {
+      "post": {
+        "summary": "Revoke an API token",
+        "description": "Stops a token immediately: the next request with it authenticates as no credential at all. The row survives with its `revoked_at` set, so the audit trail (name, prefix, scopes, last use) outlives the credential. Revoking twice is idempotent and keeps the first `revoked_at`. A token can only be revoked by the workspace that owns it; another workspace's id and a nonexistent id get the same 404.",
+        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "responses": {
+          "204": { "description": "Revoked" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+        }
+      }
     }
   },
   "components": {
@@ -938,7 +1590,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "One of the static tokens from API_TOKEN (comma-separated to allow rotation). A dashboard session cookie from /login is accepted in the browser's own same-origin requests."
+        "description": "Any of three credentials. (1) A static token from API_TOKEN (comma-separated to allow rotation): full reach over the default workspace. (2) A scoped token minted by POST /tokens — it looks like `sb_…`, and carries a scope list, an optional expiry and a revocation. Each route names the scopes it requires; a route that has no mapping denies a scoped token with 403 rather than allowing it. (3) A dashboard session cookie from /login, accepted in the browser's own same-origin requests. A token from WORKSPACE_TOKENS (`workspace=token` pairs) is accepted the same way as (1) but additionally scopes the request: it sees and changes only that workspace's monitors, channels, rules, alerts, saved searches and templates. `API_TOKEN`'s tokens belong to the `default` workspace, as do rows created before workspaces existed. Scoped tokens are workspace-bound too: the workspace comes from the row that stores the token's digest, not from the request. There is deliberately no X-Workspace header or query parameter — the workspace is a property of the credential, so a client cannot ask for another tenant's data."
       }
     },
     "parameters": {
@@ -962,6 +1614,14 @@
       }
     },
     "responses": {
+      "TokenManagementDisabled": {
+        "description": "Token management is not configured on this instance: it needs a database-backed store, so an unset deployment answers this way rather than pretending to mint.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
       "Error": {
         "description": "Error envelope",
         "content": {
@@ -972,6 +1632,39 @@
       }
     },
     "schemas": {
+      "RuleTypesResponse": {
+        "type": "object",
+        "required": ["rule_types"],
+        "properties": {
+          "rule_types": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleType" }
+          }
+        }
+      },
+      "RuleType": {
+        "type": "object",
+        "required": ["type", "parameters"],
+        "properties": {
+          "type": { "type": "string" },
+          "parameters": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleParameter" }
+          }
+        }
+      },
+      "RuleParameter": {
+        "type": "object",
+        "required": ["name", "type", "required", "default", "description"],
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["string", "number", "object", "select"] },
+          "required": { "type": "boolean" },
+          "default": { "type": "string" },
+          "description": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" } }
+        }
+      },
       "Error": {
         "type": "object",
         "required": ["error"],
@@ -1020,10 +1713,39 @@
             "description": "Soroban contract strkeys (C...)"
           },
           "enabled": { "type": "boolean" },
+          "network": {
+            "type": "string",
+            "description": "Stellar chain this monitor watches. Empty on rows created before multi-network ingestion, which startup labels with the primary network."
+          },
           "channel_ids": {
             "type": "array",
             "items": { "type": "integer", "format": "int64" }
           }
+        }
+      },
+      "MonitorStats": {
+        "type": "object",
+        "properties": {
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "alerts": { "type": "integer", "format": "int64" },
+          "alerts_last_24h": { "type": "integer", "format": "int64" },
+          "alerts_last_7d": { "type": "integer", "format": "int64" },
+          "last_alert_at": { "type": "string", "format": "date-time", "description": "Absent when the monitor has never alerted" },
+          "deliveries_succeeded": { "type": "integer", "format": "int64" },
+          "deliveries_failed": { "type": "integer", "format": "int64" },
+          "rules": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RuleMatchCount" },
+            "description": "Every rule of the monitor, matched or not"
+          }
+        }
+      },
+      "RuleMatchCount": {
+        "type": "object",
+        "properties": {
+          "rule_id": { "type": "integer", "format": "int64" },
+          "type": { "type": "string" },
+          "alerts": { "type": "integer", "format": "int64" }
         }
       },
       "MonitorInput": {
@@ -1037,6 +1759,10 @@
             "items": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" }
           },
           "enabled": { "type": "boolean", "default": true },
+          "network": {
+            "type": "string",
+            "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards — a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label — so moving one means deleting and recreating it."
+          },
           "channel_ids": {
             "type": "array",
             "items": { "type": "integer", "format": "int64" }
@@ -1075,10 +1801,35 @@
           "monitor_id": { "type": "integer", "format": "int64" },
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window", "absence_of_event"]
           },
           "params": { "type": "object" },
           "enabled": { "type": "boolean" }
+        }
+      },
+      "Inhibition": {
+        "type": "object",
+        "properties": {
+          "source_rule_id": { "type": "integer", "format": "int64" },
+          "target_rule_id": { "type": "integer", "format": "int64" },
+          "firing_window_seconds": {
+            "type": "integer",
+            "description": "Source counts as firing with an alert inside this window"
+          },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "InhibitionInput": {
+        "type": "object",
+        "required": ["source_rule_id", "target_rule_id"],
+        "properties": {
+          "source_rule_id": { "type": "integer", "format": "int64" },
+          "target_rule_id": { "type": "integer", "format": "int64" },
+          "firing_window_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optional; defaults to 300 when absent or non-positive"
+          }
         }
       },
       "RuleInput": {
@@ -1087,7 +1838,7 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event"]
+            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window", "absence_of_event"]
           },
           "params": {
             "type": "object",
@@ -1103,10 +1854,43 @@
           "name": { "type": "string" },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook"]
+            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
           },
           "config": { "type": "object" },
-          "enabled": { "type": "boolean" }
+          "enabled": { "type": "boolean" },
+          "timeout": {
+            "type": "integer",
+            "description": "HTTP delivery timeout in seconds (default: 15, range 1-60)"
+          },
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Deliveries that have failed since the last success. One success resets it to 0."
+          },
+          "consecutive_permanent_failures": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Permanent failures (401/403/404) since the last success. This is what auto-disable counts; a transient 5xx or timeout neither increments nor clears it."
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Most recent failure message, empty once a delivery succeeds. Never contains channel config."
+          },
+          "last_error_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When last_error was recorded. Absent if there has been no failure since the last success."
+          },
+          "last_success_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Last delivery that succeeded. Absent until the first one."
+          },
+          "disabled_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Set when health tracking auto-disabled the channel, absent when it is on or an operator disabled it. Cleared only by explicitly re-enabling the channel."
+          }
         }
       },
       "ChannelInput": {
@@ -1116,13 +1900,29 @@
           "name": { "type": "string", "minLength": 1 },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook"]
+            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
           },
           "config": {
             "type": "object",
             "description": "Type-specific; the channel reference documents each"
           },
-          "enabled": { "type": "boolean", "default": true }
+          "enabled": { "type": "boolean", "default": true },
+          "digest_mode": {
+            "type": "string",
+            "enum": ["", "window"],
+            "default": "",
+            "description": "Empty delivers immediately; window batches into one summary per digest_window_seconds"
+          },
+          "digest_window_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Accumulation window when digest_mode is window; must be > 0 then"
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "HTTP delivery timeout in seconds (default: 15, range 1-60)"
+          }
         }
       },
       "MonitorPage": {
@@ -1174,7 +1974,47 @@
           "event_id": { "type": "string" },
           "event_name": { "type": "string" },
           "payload": { "type": "object" },
+          "network": {
+            "type": "string",
+            "description": "Stellar chain the matching event came from. Taken from the monitor, never from the caller: it is what a reorg on that chain may retract and no other chain's."
+          },
+          "created_at": { "type": "string", "format": "date-time" },
+          "suppressed": { "type": "boolean", "description": "True when a maintenance window silenced delivery" },
+          "suppression_reason": { "type": "string" }
+        }
+      },
+      "MaintenanceWindow": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "reason": { "type": "string" },
+          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "contract_id": { "type": "string" },
+          "start_at": { "type": "string", "format": "date-time" },
+          "end_at": { "type": "string", "format": "date-time" },
           "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MaintenanceWindowInput": {
+        "type": "object",
+        "required": ["reason", "scope", "start_at", "end_at"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1 },
+          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
+          "monitor_id": { "type": "integer", "format": "int64", "description": "Required when scope is monitor" },
+          "contract_id": { "type": "string", "description": "Required when scope is contract" },
+          "start_at": { "type": "string", "format": "date-time" },
+          "end_at": { "type": "string", "format": "date-time", "description": "Must be after start_at; open-ended windows are rejected" }
+        }
+      },
+      "MaintenanceWindowPage": {
+        "type": "object",
+        "properties": {
+          "maintenance_windows": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/MaintenanceWindow" }
+          }
         }
       },
       "DeliveryAttempt": {
@@ -1188,6 +2028,53 @@
           },
           "response_snippet": { "type": "string" },
           "attempted_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "EscalationStep": {
+        "type": "object",
+        "properties": {
+          "position": { "type": "integer", "description": "0-based place in the policy" },
+          "delay": { "type": "string", "description": "Go duration before this step fires, e.g. 5m" },
+          "channel_ids": {
+            "type": "array",
+            "items": { "type": "integer", "format": "int64" }
+          }
+        }
+      },
+      "EscalationPolicy": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "monitor_id": { "type": "integer", "format": "int64" },
+          "steps": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EscalationStep" }
+          },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "EscalationInput": {
+        "type": "object",
+        "required": ["steps"],
+        "properties": {
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Ordered escalation steps. The first fires immediately; each later step waits its delay after the previous one fired.",
+            "items": {
+              "type": "object",
+              "required": ["channel_ids"],
+              "properties": {
+                "delay": { "type": "string", "description": "Go duration, e.g. 5m. Omitted or empty fires immediately." },
+                "channel_ids": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "integer", "format": "int64" }
+                }
+              }
+            }
+          }
         }
       },
       "Version": {
@@ -1282,6 +2169,10 @@
           "parameters": {
             "type": "object",
             "additionalProperties": { "type": "string" }
+          },
+          "network": {
+            "type": "string",
+            "description": "Chain the instantiated monitor watches. A template is chain-agnostic text, so this defaults to the instance's primary network."
           }
         }
       },
@@ -1292,7 +2183,11 @@
           "name": { "type": "string", "description": "Monitor name prefix" },
           "contract_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 500 },
           "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
-          "enabled": { "type": "boolean", "default": true }
+          "enabled": { "type": "boolean", "default": true },
+          "network": {
+            "type": "string",
+            "description": "Chain every monitor in this batch watches. Omitted means the primary. The already-monitored check is per network: the same id on another chain is a different contract, and watching it there is normal."
+          }
         }
       },
       "ImportRowResult": {
@@ -1303,6 +2198,37 @@
           "monitor_id": { "type": "integer", "format": "int64" },
           "status": { "type": "string", "enum": ["created", "skipped", "error"] },
           "error": { "type": "string" }
+        }
+      },
+      "DryRunResult": {
+        "type": "object",
+        "required": ["count", "matches", "total_evaluated", "note"],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of historical events that matched the rule"
+          },
+          "matches": {
+            "type": "array",
+            "description": "Sample of matching events",
+            "items": {
+              "type": "object",
+              "properties": {
+                "event_id": { "type": "string" },
+                "contract_id": { "type": "string" },
+                "event_name": { "type": "string" },
+                "ledger": { "type": "integer", "format": "uint32" }
+              }
+            }
+          },
+          "total_evaluated": {
+            "type": "integer",
+            "description": "Total number of historical events evaluated"
+          },
+          "note": {
+            "type": "string",
+            "description": "Corpus bias and window documentation"
+          }
         }
       }
     }
