@@ -94,6 +94,32 @@ Complete, valid params document:
 }
 ```
 
+## numeric\_range
+
+Inclusive (or exclusive) band around the event's integer value. See the
+[rule page](numeric-range.md) for the `inclusive`/`outside` boundary table.
+
+| Param | JSON type | Required | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| `min` | string or integer | one of the two | unset (open) | Lower bound. Decimal integer string, or a JSON integer within the safe range. |
+| `max` | string or integer | one of the two | unset (open) | Upper bound. Same forms as `min`; `min` must not exceed `max`. |
+| `inclusive` | boolean | no | `true` | Whether a value equal to a bound counts as **inside** the band. |
+| `outside` | boolean | no | `false` | Invert the match: fire when the value is outside the band. |
+| `event_name` | string | no | unset (all events) | Only consider events with this name (first topic). |
+| `value_path` | string | no | unset (the value itself) | Dot path into the value, resolved against the SEP-0048 named fields first, then the raw positional value. |
+
+Complete, valid params document:
+
+```json
+{
+  "event_name": "transfer",
+  "value_path": "amount",
+  "min": "1000000",
+  "max": "10000000",
+  "outside": true
+}
+```
+
 ## token\_event
 
 SEP-41 token events, with the interface's topic layout built in.
