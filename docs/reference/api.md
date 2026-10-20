@@ -111,6 +111,34 @@ curl -s 'localhost:8080/api/v1/alerts?monitor_id=1&from=2026-07-01T00:00:00Z&lim
 # {"alerts": [...], "next_cursor": "42"}
 ```
 
+## Dead letters
+
+A delivery that exhausts its automatic retries is kept as a dead letter so
+it can be redriven after the destination is fixed. The operator procedure,
+retention rules and the difference between a retry and a redrive are in
+[Diagnosing failed alert deliveries](../operations/delivery-failures.md#dead-letter-queue-and-redrive).
+
+| Method & path | Description |
+| --- | --- |
+| `GET /dead-letters` | List the queue in id order. Query: `channel_id`, `alert_id`, `limit` (default 50), `after_id` (keyset cursor). Requires `alerts:read`. |
+| `POST /dead-letters/{id}/redrive` | Send the stored alert to the stored channel once. Requires `alerts:write`. |
+
+Each dead letter has `id`, `alert_id`, `channel_id`, `last_error` (sanitized),
+`attempt_count`, `last_status` (HTTP status, or `0` for a transport error) and
+`created_at`.
+
+Redrive is a single delivery attempt, not the automatic retry loop. A
+successful redrive returns `204`, records a successful delivery attempt and
+deletes the dead-letter row. A failed send returns `502` and leaves the row in
+the queue. An unknown dead letter, alert or channel is `404`; a malformed id
+is `400`. If the alert/channel pair already has a successful attempt the API
+returns `409` and keeps the row. A channel whose config cannot build a
+notifier returns `500`.
+
+The API path does not check whether the channel is enabled; the dashboard
+path does and returns `502` until the channel is re-enabled. That difference
+is documented in the [operations guide](../operations/delivery-failures.md#known-difference-between-the-api-and-dashboard-redrive-paths).
+
 ## Tokens
 
 Scoped credentials for the API itself: what to hand a CI job so it can create a
