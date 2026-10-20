@@ -4,6 +4,17 @@ All configuration is loaded in layers: `CONFIG_FILE` is read first, then the pro
 
 SoroBeacon reads YAML from `CONFIG_FILE` and accepts the same keys as the environment variables documented in [Environment variable reference](../configuration.md). The file format is intentionally simple: top-level keys map to the same variable names, for example `DATABASE_URL`, `HTTP_ADDR`, `POLL_INTERVAL`, and `API_TOKEN`.
 
+For example, save non-secret settings in `/etc/sorobeacon/config.yaml`:
+
+```yaml
+DATABASE_URL: sqlite:///var/lib/sorobeacon/sorobeacon.db
+NETWORK: testnet
+HTTP_ADDR: ":8080"
+POLL_INTERVAL: 5s
+```
+
+Point SoroBeacon at it with `CONFIG_FILE=/etc/sorobeacon/config.yaml`. Environment variables can override any value in the file.
+
 Precedence is explicit:
 
 1. environment variables
