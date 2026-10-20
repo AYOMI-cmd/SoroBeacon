@@ -213,7 +213,7 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -575,7 +575,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	}
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
