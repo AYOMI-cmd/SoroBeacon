@@ -25,6 +25,7 @@
 * [Params reference](rules/params.md)
 * [event_emitted](rules/event-emitted.md)
 * [value_threshold](rules/value-threshold.md)
+* [numeric_range](rules/numeric-range.md)
 * [token_event](rules/token-event.md)
 * [frequency_threshold](rules/frequency-threshold.md)
 * [Rule cooldown](rules/cooldown.md)

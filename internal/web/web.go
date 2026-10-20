@@ -1580,6 +1580,13 @@ func parseAlertDate(v string, end bool) (bound time.Time, display string, ok boo
 }
 
 func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
+	// An operator who saved a default search expects the alerts page to open
+	// with it applied. The helper only answers for a bare /alerts request, so
+	// an explicit filter is never overridden.
+	if target := s.defaultSearchRedirect(r); target != "" {
+		http.Redirect(w, r, target, http.StatusSeeOther)
+		return
+	}
 	q := r.URL.Query()
 	f := store.AlertFilter{Limit: 50}
 	var selected int64
