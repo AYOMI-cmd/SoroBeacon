@@ -191,12 +191,23 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 	if err != nil {
 		return err
 	}
-	return p.pool.QueryRow(ctx,
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
 		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
 		 RETURNING id, created_at`,
 		m.Name, ids, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt),
-	).Scan(&m.ID, &m.CreatedAt)
+	).Scan(&m.ID, &m.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
@@ -335,7 +346,21 @@ func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
 	if err != nil {
 		return err
 	}
-	tag, err := p.pool.Exec(ctx,
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	var network string
+	if err := tx.QueryRow(ctx,
+		`SELECT network FROM monitors WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		m.ID, workspaceID(ctx)).Scan(&network); err != nil {
+		return mapErr(err)
+	}
+	tag, err := tx.Exec(ctx,
 		`UPDATE monitors SET name = $3, contract_ids = $4, enabled = $5, priority = $6 WHERE id = $1 AND workspace_id = $2`,
 		m.ID, workspaceID(ctx), m.Name, ids, m.Enabled, m.Priority.Normalized())
 	if err != nil {
@@ -344,7 +369,10 @@ func (p *Postgres) UpdateMonitor(ctx context.Context, m *Monitor) error {
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	if err := cleanupUnusedContractCursors(ctx, tx, network); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func uniqueIDs(ids []int64) []int64 {
@@ -395,7 +423,27 @@ func (p *Postgres) SetMonitorsEnabled(ctx context.Context, ids []int64, enabled 
 }
 
 func (p *Postgres) DeleteMonitor(ctx context.Context, id int64) error {
-	return p.deleteByID(ctx, "monitors", id)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	var network string
+	if err := tx.QueryRow(ctx,
+		`SELECT network FROM monitors WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		id, workspaceID(ctx)).Scan(&network); err != nil {
+		return mapErr(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM monitors WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx)); err != nil {
+		return err
+	}
+	if err := cleanupUnusedContractCursors(ctx, tx, network); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, error) {
@@ -405,6 +453,9 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
 		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
@@ -1868,6 +1919,111 @@ func (p *Postgres) SetIngestState(ctx context.Context, network string, s IngestS
 		        updated_at  = EXCLUDED.updated_at`,
 		network, int64(s.LastLedger), s.LastCursor)
 	return err
+}
+
+const contractCursorRefsLock int64 = 0x534f524f435552
+
+func lockContractCursorRefs(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, contractCursorRefsLock)
+	return err
+}
+
+func cleanupUnusedContractCursors(ctx context.Context, tx pgx.Tx, network string) error {
+	_, err := tx.Exec(ctx, `
+		DELETE FROM contract_ingest_cursors c
+		 WHERE c.network = $1
+		   AND NOT EXISTS (
+			SELECT 1 FROM monitors m, jsonb_array_elements_text(m.contract_ids) AS ids(contract_id)
+			 WHERE m.network = c.network AND ids.contract_id = c.contract_id
+		   )`, network)
+	return err
+}
+
+func (p *Postgres) ListContractCursors(ctx context.Context, network string) ([]ContractCursor, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT network, contract_id, last_ledger, updated_at
+		   FROM contract_ingest_cursors WHERE network = $1 ORDER BY contract_id`, network)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ContractCursor, 0)
+	for rows.Next() {
+		var cursor ContractCursor
+		var lastLedger int64
+		if err := rows.Scan(&cursor.Network, &cursor.ContractID, &lastLedger, &cursor.UpdatedAt); err != nil {
+			return nil, err
+		}
+		cursor.LastLedger = uint32(lastLedger)
+		out = append(out, cursor)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) InitializeContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO contract_ingest_cursors (network, contract_id, last_ledger)
+		SELECT $1, $2, $3
+		 WHERE EXISTS (
+			SELECT 1 FROM monitors m, jsonb_array_elements_text(m.contract_ids) AS ids(contract_id)
+			 WHERE m.network = $1 AND ids.contract_id = $2
+		 )
+		ON CONFLICT (network, contract_id) DO NOTHING`, network, contractID, int64(lastLedger))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) AdvanceContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO contract_ingest_cursors (network, contract_id, last_ledger)
+		SELECT $1, $2, $3
+		 WHERE EXISTS (
+			SELECT 1 FROM monitors m, jsonb_array_elements_text(m.contract_ids) AS ids(contract_id)
+			 WHERE m.network = $1 AND ids.contract_id = $2
+		 )
+		ON CONFLICT (network, contract_id) DO UPDATE
+		   SET last_ledger = EXCLUDED.last_ledger, updated_at = now()
+		 WHERE contract_ingest_cursors.last_ledger < EXCLUDED.last_ledger`, network, contractID, int64(lastLedger))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) RewindContractCursors(ctx context.Context, network string, lastLedger uint32) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx,
+		`UPDATE contract_ingest_cursors SET last_ledger = $2, updated_at = now()
+		  WHERE network = $1 AND last_ledger > $2`, network, int64(lastLedger))
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // --- digest queue ---
