@@ -120,6 +120,46 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # -race needs cgo, which ubuntu-latest provides. It runs without
+  # TEST_DATABASE_URL: the detector is about this process's shared state, and
+  # the SQLite backend plus the library suites cover the concurrent paths that
+  # need no service container. The Postgres-backed suite already runs in
+  # test-db; doubling it here would pay the race detector's cost on the
+  # slowest job. The nested Terraform provider is out of scope: it does not
+  # start the poller, dispatcher or lease.
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Test (race detector)
+        run: make test-race
+
+  # A separate job from lint, so the pull request page distinguishes a code
+  # smell from a known vulnerability. `make vulncheck` is the same command a
+  # contributor runs locally; the tool version is pinned in the Makefile so an
+  # unrelated change does not turn red on the day the database updates.
+  #
+  # The Terraform provider is a separate module with its own dependency tree,
+  # so the root scan cannot see it: both modules are scanned explicitly.
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      - name: govulncheck (root and Terraform provider modules)
+        run: make vulncheck
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10

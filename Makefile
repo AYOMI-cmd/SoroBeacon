@@ -1,4 +1,4 @@
-.PHONY: build run test test-db cover lint fmt up down clean migrate-new bench
+.PHONY: build run test test-db test-race vulncheck cover lint fmt up down clean migrate-new bench
 
 MIGRATIONS_DIR := internal/store/migrations
 # SQLite keeps its own DDL at the same version numbers; migrate-new scaffolds
@@ -17,6 +17,29 @@ run: build
 
 test:
 	go test ./...
+
+# The race detector is roughly two to three times slower than a plain run, so
+# it is not part of `make test`. CI runs this target in its own job; run it
+# locally when touching anything the poller, dispatcher or HTTP servers share.
+test-race:
+	go test -race ./...
+
+# Pinned rather than tracking latest: an unpinned scanner turns an unrelated
+# pull request red on the day the vulnerability database updates. Run through
+# `go run` so the tool stays out of the module graph and does not cause
+# `go mod tidy` churn. The Terraform provider is a separate module, so a scan
+# of the root module alone would give false assurance.
+#
+# The scan runs on a patched toolchain even though the module's go directive
+# is the minimum the project builds with: the standard library is part of the
+# attack surface, and 1.26.0 carries advisories that 1.27.2 fixes. Builds and
+# tests stay on whatever `go-version-file: go.mod` installs; only the scanner
+# is pinned, so its answer does not change with the reviewer's local Go.
+VULNCHECK_VERSION ?= v1.9.0
+VULNCHECK_TOOLCHAIN ?= go1.27.2
+vulncheck:
+	GOTOOLCHAIN=$(VULNCHECK_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@$(VULNCHECK_VERSION) ./...
+	cd terraform-provider-sorobeacon && GOTOOLCHAIN=$(VULNCHECK_TOOLCHAIN) go run golang.org/x/vuln/cmd/govulncheck@$(VULNCHECK_VERSION) ./...
 
 # Rule-evaluation hot path. Does not run as part of `make test` / `go test ./...`.
 bench:
