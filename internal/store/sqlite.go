@@ -296,7 +296,7 @@ func (s *SQLite) CreateMonitor(ctx context.Context, m *Monitor) error {
 func (s *SQLite) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanSQLiteMonitor(s.db.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +335,7 @@ func (s *SQLite) monitorChannelIDs(ctx context.Context, monitorID int64, ws work
 // workspace's enabled monitors or a monitor in a second tenant would silently
 // stop being polled.
 func (s *SQLite) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE 1 = 1`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE 1 = 1 AND deleted_at IS NULL`
 	args := []any{}
 	if ws, scoped := tenantWorkspace(ctx); scoped {
 		q += ` AND workspace_id = ?`
@@ -367,7 +367,7 @@ func (s *SQLite) queryMonitors(ctx context.Context, q string, args ...any) ([]Mo
 
 func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
 	ws := workspaceID(ctx)
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE workspace_id = ?`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NULL`
 	args := []any{ws}
 	if f.Query != "" {
 		// instr + lower is a parameterized substring match without LIKE
@@ -394,10 +394,10 @@ func (s *SQLite) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor,
 		// probe that tenant's ordering.
 		switch sort {
 		case "name":
-			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ? AND workspace_id = ?)`
+			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL)`
 			args = append(args, f.AfterID, ws)
 		case "created_at":
-			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ? AND workspace_id = ?)`
+			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL)`
 			args = append(args, f.AfterID, ws)
 		default:
 			q += ` AND id < ?`
@@ -510,6 +510,114 @@ func (s *SQLite) DeleteMonitor(ctx context.Context, id int64) error {
 	return mapSQLiteErr(tx.Commit())
 }
 
+// SoftDeleteMonitor marks a monitor as deleted without removing it.
+// The monitor stops alerting immediately but can be restored within
+// the restore window.
+func (s *SQLite) SoftDeleteMonitor(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE monitors SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL`,
+		id, workspaceID(ctx))
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
+// if the monitor doesn't exist or isn't deleted.
+func (s *SQLite) RestoreMonitor(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE monitors SET deleted_at = NULL WHERE id = ? AND workspace_id = ? AND deleted_at IS NOT NULL`,
+		id, workspaceID(ctx))
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListDeletedMonitors returns soft-deleted monitors (the "trash").
+func (s *SQLite) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
+	ws := workspaceID(ctx)
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = ? AND deleted_at IS NOT NULL`
+	args := []any{ws}
+	if f.Query != "" {
+		q += ` AND instr(lower(name), lower(?)) > 0`
+		args = append(args, f.Query)
+	}
+	if f.Network != "" {
+		q += ` AND network = ?`
+		args = append(args, f.Network)
+	}
+	switch {
+	case f.Enabled != nil && *f.Enabled:
+		q += ` AND enabled = 1`
+	case f.Enabled != nil && !*f.Enabled:
+		q += ` AND enabled = 0`
+	case f.EnabledOnly:
+		q += ` AND enabled = 1`
+	}
+	sort := monitorSort(f.Sort)
+	if f.AfterID != 0 {
+		switch sort {
+		case "name":
+			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ? AND workspace_id = ? AND deleted_at IS NOT NULL)`
+			args = append(args, f.AfterID, ws)
+		case "created_at":
+			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ? AND workspace_id = ? AND deleted_at IS NOT NULL)`
+			args = append(args, f.AfterID, ws)
+		default:
+			q += ` AND id < ?`
+			args = append(args, f.AfterID)
+		}
+	}
+	switch sort {
+	case "name":
+		q += ` ORDER BY lower(name) ASC, id ASC`
+	case "created_at":
+		q += ` ORDER BY created_at DESC, id DESC`
+	default:
+		q += ` ORDER BY id DESC`
+	}
+	q += ` LIMIT ?`
+	args = append(args, pageLimit(f.Limit))
+	return s.queryMonitors(ctx, q, args...)
+}
+
+// HardDeleteMonitor permanently removes a monitor and its rules/attachments.
+func (s *SQLite) HardDeleteMonitor(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var network string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT network FROM monitors WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)).Scan(&network); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM monitors WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if err := cleanupUnusedSQLiteContractCursors(ctx, tx, network); err != nil {
+		return err
+	}
+	return mapSQLiteErr(tx.Commit())
+}
+
 // deleteByID removes one row by id from a workspace-bearing table. The table
 // name is not a parameter, so it is constrained to deletableTables rather than
 // taken from a caller; a row outside the caller's workspace reports 0 rows
@@ -592,7 +700,7 @@ func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, erro
 
 	ws := workspaceID(ctx)
 	src, err := scanSQLiteMonitor(tx.QueryRowContext(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = ? AND workspace_id = ?`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -711,16 +819,17 @@ type queryer interface {
 }
 
 // scanSQLiteMonitor reads one monitors row. Timestamps are scanned as text and
-// parsed; last_matched_at may be NULL, which stays a nil pointer rather than a
-// fabricated time.
+// parsed; last_matched_at and deleted_at may be NULL, which stay a nil pointer
+// rather than a fabricated time.
 func scanSQLiteMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids string
 	var enabled int64
 	var created string
 	var lastMatched sql.NullString
+	var deleted sql.NullString
 	var priority string
-	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched, &priority, &m.Network); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &ids, &enabled, &created, &lastMatched, &priority, &m.Network, &deleted); err != nil {
 		return nil, mapSQLiteErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
@@ -738,6 +847,13 @@ func scanSQLiteMonitor(r rowScanner) (*Monitor, error) {
 			return nil, err
 		}
 		m.LastMatchedAt = &t
+	}
+	if deleted.Valid && deleted.String != "" {
+		t, err := parseSQLiteTime(deleted.String)
+		if err != nil {
+			return nil, err
+		}
+		m.DeletedAt = &t
 	}
 	return &m, nil
 }

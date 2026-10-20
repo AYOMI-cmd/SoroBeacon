@@ -319,10 +319,24 @@ func (s *Server) bulkMonitors(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
+		s.log.Error("deleteMonitor: pathID error", "err", err)
 		writeErr(w, r, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := s.store.DeleteMonitor(r.Context(), id); err != nil {
+	s.log.Info("deleteMonitor called", "id", id, "method", r.Method, "permanent", r.URL.Query().Get("permanent"))
+	// Default DELETE is now soft-delete. Use ?permanent=true for hard delete.
+	permanent := r.URL.Query().Get("permanent")
+	if permanent == "true" {
+		if err := s.store.HardDeleteMonitor(r.Context(), id); err != nil {
+			s.log.Error("hard delete monitor", "id", id, "err", err)
+			s.fail(w, r, err)
+			return
+		}
+		writeNoContent(w)
+		return
+	}
+	if err := s.store.SoftDeleteMonitor(r.Context(), id); err != nil {
+		s.log.Error("soft delete monitor", "id", id, "err", err)
 		s.fail(w, r, err)
 		return
 	}

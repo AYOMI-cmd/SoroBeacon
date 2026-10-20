@@ -37,6 +37,9 @@ var routeScopes = map[string][]auth.Scope{
 	"PATCH /monitors/{id}/rules/{ruleID}":  {auth.ScopeMonitorsWrite},
 	"DELETE /monitors/{id}/rules/{ruleID}": {auth.ScopeMonitorsWrite},
 	"POST /monitors/import":                {auth.ScopeMonitorsWrite},
+	"GET /monitors/trash":                {auth.ScopeMonitorsRead},
+	"POST /monitors/{id}/soft-delete":    {auth.ScopeMonitorsWrite},
+	"POST /monitors/{id}/restore":        {auth.ScopeMonitorsWrite},
 
 	"POST /channels":        {auth.ScopeChannelsWrite},
 	"GET /channels":         {auth.ScopeChannelsRead},

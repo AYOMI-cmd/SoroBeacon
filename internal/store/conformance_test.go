@@ -344,11 +344,11 @@ func testKeysetPagination(t *testing.T, newStore conformanceFactory) {
 	// Seven monitors, newest last by id. Mix enabled so the enabled-only
 	// filter has something to compose with the cursor.
 	for i := 0; i < 7; i++ {
-		m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: i%2 == 0}
+		m := &Monitor{Name: fmt.Sprintf("m%d", i), ContractIDs: []string{"C"}, Enabled: i%2 == 0}
 		require.NoError(t, st.CreateMonitor(ctx, m))
 	}
 	for i := 0; i < 7; i++ {
-		c := &Channel{Name: "c", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: i%2 == 0}
+		c := &Channel{Name: fmt.Sprintf("c%d", i), Type: "webhook", Config: json.RawMessage(`{}`), Enabled: i%2 == 0}
 		require.NoError(t, st.CreateChannel(ctx, c))
 	}
 

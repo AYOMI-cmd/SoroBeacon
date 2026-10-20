@@ -213,7 +213,7 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 func (p *Postgres) GetMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	m, err := scanMonitor(p.pool.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +238,7 @@ func (p *Postgres) monitorChannelIDs(ctx context.Context, monitorID int64) ([]in
 // workspace's enabled monitors or monitors in a second tenant would silently
 // stop being polled.
 func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE TRUE`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE deleted_at IS NULL`
 	args := []any{}
 	ws, scoped := tenantWorkspace(ctx)
 	if scoped {
@@ -266,7 +266,7 @@ func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monito
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE workspace_id = $1`
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NULL`
 	args := []any{workspaceID(ctx)}
 	n := 1
 	arg := func(v any) string {
@@ -298,9 +298,9 @@ func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monito
 		ws := workspaceID(ctx)
 		switch sort {
 		case "name":
-			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + `)`
+			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NULL)`
 		case "created_at":
-			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + `)`
+			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NULL)`
 		default:
 			q += ` AND id < ` + arg(f.AfterID)
 		}
@@ -446,6 +446,123 @@ func (p *Postgres) DeleteMonitor(ctx context.Context, id int64) error {
 	return tx.Commit(ctx)
 }
 
+// SoftDeleteMonitor marks a monitor as deleted without removing it.
+// The monitor stops alerting immediately but can be restored within
+// the restore window.
+func (p *Postgres) SoftDeleteMonitor(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE monitors SET deleted_at = now() WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL`,
+		id, workspaceID(ctx))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
+// if the monitor doesn't exist or isn't deleted.
+func (p *Postgres) RestoreMonitor(ctx context.Context, id int64) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE monitors SET deleted_at = NULL WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NOT NULL`,
+		id, workspaceID(ctx))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListDeletedMonitors returns soft-deleted monitors (the "trash").
+func (p *Postgres) ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error) {
+	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE workspace_id = $1 AND deleted_at IS NOT NULL`
+	args := []any{workspaceID(ctx)}
+	n := 1
+	arg := func(v any) string {
+		n++
+		args = append(args, v)
+		return fmt.Sprintf("$%d", n)
+	}
+	if f.Query != "" {
+		q += ` AND strpos(lower(name), lower(` + arg(f.Query) + `)) > 0`
+	}
+	if f.Network != "" {
+		q += ` AND network = ` + arg(f.Network)
+	}
+	switch {
+	case f.Enabled != nil && *f.Enabled:
+		q += ` AND enabled`
+	case f.Enabled != nil && !*f.Enabled:
+		q += ` AND NOT enabled`
+	case f.EnabledOnly:
+		q += ` AND enabled`
+	}
+	sort := monitorSort(f.Sort)
+	if f.AfterID != 0 {
+		ws := workspaceID(ctx)
+		switch sort {
+		case "name":
+			q += ` AND (lower(name), id) > (SELECT lower(name), id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NOT NULL)`
+		case "created_at":
+			q += ` AND (created_at, id) < (SELECT created_at, id FROM monitors WHERE id = ` + arg(f.AfterID) + ` AND workspace_id = ` + arg(ws) + ` AND deleted_at IS NOT NULL)`
+		default:
+			q += ` AND id < ` + arg(f.AfterID)
+		}
+	}
+	switch sort {
+	case "name":
+		q += ` ORDER BY lower(name) ASC, id ASC`
+	case "created_at":
+		q += ` ORDER BY created_at DESC, id DESC`
+	default:
+		q += ` ORDER BY id DESC`
+	}
+	q += ` LIMIT ` + arg(pageLimit(f.Limit))
+	rows, err := p.queryRows(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Monitor
+	for rows.Next() {
+		m, err := scanMonitor(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// HardDeleteMonitor permanently removes a monitor and its rules/attachments.
+func (p *Postgres) HardDeleteMonitor(ctx context.Context, id int64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	var network string
+	if err := tx.QueryRow(ctx,
+		`SELECT network FROM monitors WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		id, workspaceID(ctx)).Scan(&network); err != nil {
+		return mapErr(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM monitors WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx)); err != nil {
+		return err
+	}
+	if err := cleanupUnusedContractCursors(ctx, tx, network); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, error) {
 	ws := workspaceID(ctx)
 	tx, err := p.pool.Begin(ctx)
@@ -458,7 +575,7 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	}
 
 	src, err := scanMonitor(tx.QueryRow(ctx,
-		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
+		`SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE id = $1 AND workspace_id = $2`, id, ws))
 	if err != nil {
 		return nil, err
 	}
@@ -598,10 +715,12 @@ func scanMonitor(r rowScanner) (*Monitor, error) {
 	var m Monitor
 	var ids []byte
 	var priority string
-	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network); err != nil {
+	var deletedAt *time.Time
+	if err := r.Scan(&m.ID, &m.Name, &ids, &m.Enabled, &m.CreatedAt, &m.LastMatchedAt, &priority, &m.Network, &deletedAt); err != nil {
 		return nil, mapErr(err)
 	}
 	m.Priority = Priority(priority).Normalized()
+	m.DeletedAt = deletedAt
 	if err := json.Unmarshal(ids, &m.ContractIDs); err != nil {
 		return nil, fmt.Errorf("monitor %d: bad contract_ids: %w", m.ID, err)
 	}
