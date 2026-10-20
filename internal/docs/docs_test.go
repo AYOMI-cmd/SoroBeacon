@@ -27,6 +27,10 @@ var pagesAddedHere = []string{
 	"docs/guides/escalation.md",
 	"docs/reference/authorization.md",
 	"docs/rules/numeric-range.md",
+	"docs/rules/contract-allowlist.md",
+	"docs/rules/event-name-glob.md",
+	"docs/operations/backup-restore.md",
+	"docs/channels/email.md",
 }
 
 // markdownLink matches [text](target) links in prose. Code fences and inline
