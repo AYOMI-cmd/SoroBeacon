@@ -13,6 +13,7 @@
 
 * [Monitors & alerts](guides/monitors-and-alerts.md)
 * [The life of an alert](guides/alert-lifecycle.md)
+* [Alert enrichment](guides/alert-enrichment.md)
 * [Escalation policies](guides/escalation.md)
 * [Maintenance windows](guides/maintenance-windows.md)
 * [The dashboard](guides/dashboard.md)
@@ -24,6 +25,7 @@
 * [Params reference](rules/params.md)
 * [event_emitted](rules/event-emitted.md)
 * [value_threshold](rules/value-threshold.md)
+* [numeric_range](rules/numeric-range.md)
 * [token_event](rules/token-event.md)
 * [frequency_threshold](rules/frequency-threshold.md)
 * [Rule cooldown](rules/cooldown.md)
@@ -65,6 +67,7 @@
 * [Architecture](reference/architecture.md)
 * [Authorization](reference/authorization.md)
 * [HTTP API](reference/api.md)
+* [gRPC API](reference/grpc.md)
 * [CLI flags (environment variables)](reference/cli.md)
 
 ## 🔌 Contributing

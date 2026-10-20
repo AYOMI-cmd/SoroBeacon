@@ -26,6 +26,7 @@ var pagesAddedHere = []string{
 	"docs/contributing/testing.md",
 	"docs/guides/escalation.md",
 	"docs/reference/authorization.md",
+	"docs/rules/numeric-range.md",
 }
 
 // markdownLink matches [text](target) links in prose. Code fences and inline
@@ -92,8 +93,8 @@ func TestSummaryLinksEveryNewPage(t *testing.T) {
 	}
 }
 
-// TestNewPagesLinksResolve walks every relative link in the four new pages
-// and fails for a target that does not exist, or a #fragment that matches no
+// TestNewPagesLinksResolve walks every relative link in the new pages and
+// fails for a target that does not exist, or a #fragment that matches no
 // heading in the target document. Dead cross-references between the guides
 // and the reference pages they deliberately link out to would otherwise go
 // unnoticed until a reader hit them.

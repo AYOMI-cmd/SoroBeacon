@@ -231,7 +231,7 @@ func New(st store.Store, reg *rules.Registry, f *notify.Factory, log *slog.Logge
 	// Every page the dashboard can render. A page missing from this list is a
 	// nil template at request time, which is a panic rather than a 500, so the
 	// list and the templates directory have to agree.
-	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "tokens", "deadletters"} {
+	for _, page := range []string{"index", "monitors", "monitor", "channels", "channel-edit", "channel-delete", "alerts", "alert", "maintenance", "login", "error", "rulebuilder", "searches", "tokens", "deadletters"} {
 		t, err := template.New("layout.html").Funcs(templateFuncs).ParseFS(templatesFS, "templates/layout.html", "templates/shortcuts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, fmt.Errorf("parse template %s: %w", page, err)
@@ -372,6 +372,8 @@ func (s *Server) Routes() chi.Router {
 
 	r.Get("/channels", s.channels)
 	r.Post("/channels", s.createChannel)
+	r.Get("/channels/{id}/edit", s.editChannelPage)
+	r.Post("/channels/{id}", s.updateChannel)
 	r.Post("/channels/{id}/delete", s.deleteChannel)
 	r.Post("/channels/{id}/test", s.testChannel)
 	r.Post("/channels/{id}/toggle", s.toggleChannel)
@@ -1170,6 +1172,66 @@ func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/channels", http.StatusSeeOther)
 }
 
+func (s *Server) editChannelPage(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.render(w, r, "channel-edit", map[string]any{
+		"Title": "Edit channel", "Channel": ch, "Name": ch.Name,
+	})
+}
+
+func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	ch, err := s.store.GetChannel(r.Context(), id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		s.renderStatus(w, r, http.StatusBadRequest, "channel-edit", map[string]any{
+			"Title": "Edit channel", "Channel": ch, "Name": name, "Error": "name is required",
+		})
+		return
+	}
+	if submittedType := r.FormValue("type"); submittedType != "" && submittedType != ch.Type {
+		s.renderStatus(w, r, http.StatusBadRequest, "channel-edit", map[string]any{
+			"Title": "Edit channel", "Channel": ch, "Name": name, "Error": "channel type cannot be changed",
+		})
+		return
+	}
+	updated := *ch
+	updated.Name = name
+	if config := r.FormValue("config"); strings.TrimSpace(config) != "" {
+		updated.Config = []byte(config)
+	}
+	if _, err := s.factory.New(updated.Type, updated.Config); err != nil {
+		s.renderStatus(w, r, http.StatusBadRequest, "channel-edit", map[string]any{
+			"Title": "Edit channel", "Channel": ch, "Name": name, "Error": err.Error(),
+		})
+		return
+	}
+	if err := s.store.UpdateChannel(r.Context(), &updated); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.factory.InvalidateSecretCache()
+	s.audit(r, store.AuditActionUpdate, "channel", id, "name", "config")
+	http.Redirect(w, r, "/channels", http.StatusSeeOther)
+}
+
 func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -1518,6 +1580,13 @@ func parseAlertDate(v string, end bool) (bound time.Time, display string, ok boo
 }
 
 func (s *Server) alerts(w http.ResponseWriter, r *http.Request) {
+	// An operator who saved a default search expects the alerts page to open
+	// with it applied. The helper only answers for a bare /alerts request, so
+	// an explicit filter is never overridden.
+	if target := s.defaultSearchRedirect(r); target != "" {
+		http.Redirect(w, r, target, http.StatusSeeOther)
+		return
+	}
 	q := r.URL.Query()
 	f := store.AlertFilter{Limit: 50}
 	var selected int64
