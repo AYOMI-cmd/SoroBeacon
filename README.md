@@ -72,8 +72,9 @@ See [capacity and scaling](docs/operations/scaling.md).
 
 ## Configuration
 
-All configuration comes from environment variables. The complete
-operator reference — every variable `internal/config` reads, grouped by
+Configuration comes from environment variables and, optionally, a YAML file
+selected by `CONFIG_FILE`. The complete operator reference — every variable
+`internal/config` reads, grouped by
 database / RPC / HTTP / polling / logging, with types, defaults, required
 vs optional, secrets, and `SOURCE_MODE`-only notes — is
 [docs/configuration.md](docs/configuration.md).
@@ -99,6 +100,9 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `CORS_ALLOWED_ORIGINS` | _(empty, CORS off)_             | Comma-separated browser Origins; empty disables CORS |
 | `MONITOR_SILENT_AFTER` | `24h`                            | Mark monitors silent on the dashboard after this much time since last match |
 | `ALERT_RETENTION` | _(unset, keep forever)_             | How long to keep alerts; `90d`, `24h`. Postgres drops whole expired partitions |
+| `ALERT_ENRICHMENT_URL` | _(unset, off)_                  | HTTP JSON endpoint called on every alert to attach operator context; see the [enrichment guide](docs/guides/alert-enrichment.md) |
+| `ALERT_ENRICHMENT_TIMEOUT` | `2s`                        | Budget for one enrichment call; slow service costs the enrichment, not the alert |
+| `ALERT_ENRICHMENT_CACHE_TTL` | `5m`                     | How long an enrichment response is reused per contract (in-memory) |
 | `ARCHIVE_URL`   | _(unset, off)_                         | Archive expired alerts before deletion (directory or `s3://bucket/prefix`) |
 | `REORG_TRACKING_WINDOW` | `128`                        | Recent ledger hashes tracked for reorg detection; `0` disables |
 | `REORG_CONFIRMATION_DEPTH` | `0`                       | Ledgers an event must be buried before it may alert |
@@ -341,6 +345,8 @@ built in. `event` is one of `transfer`, `mint`, `burn`, `clawback`,
 `set_admin`, or `*` for any of them; `from`/`to` match the semantic address
 slots (from is the holder on burn/clawback, the sender on transfer), and
 `min_amount`/`max_amount` are inclusive i128 bounds as decimal strings:
+See the [token_event rule reference](docs/rules/token_event.md) for topic
+positions, decimals, validation, and more examples.
 
 ```sh
 curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
