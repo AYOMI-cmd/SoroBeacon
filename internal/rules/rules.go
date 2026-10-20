@@ -274,6 +274,51 @@ func (r *Registry) Validate(ruleType string, params json.RawMessage) error {
 	return err
 }
 
+// Explain returns a detailed explanation of why an event matched or didn't
+// match a rule. If the rule type doesn't implement RuleExplainer, a basic
+// explanation is returned based on the match result.
+func (r *Registry) Explain(ctx context.Context, ruleType string, ev *stellar.DecodedEvent, params json.RawMessage) (*RuleExplanation, error) {
+	e, ok := r.evaluators[ruleType]
+	if !ok {
+		if _, isAbsence := r.absences[ruleType]; isAbsence {
+			return &RuleExplanation{
+				Matched:    false,
+				Conditions: []ConditionExplanation{{Name: "absence_rule", Expected: "timer-based evaluation", Actual: "event-driven evaluation", Passed: false, Reason: "absence rules are evaluated on a timer, not per event"}},
+			}, nil
+		}
+		return nil, fmt.Errorf("unknown rule type %q", ruleType)
+	}
+
+	explainer, ok := e.(RuleExplainer)
+	if !ok {
+		// Fall back to basic evaluation
+		matched, err := e.Evaluate(ctx, ev, params)
+		if err != nil {
+			return &RuleExplanation{Error: err.Error()}, err
+		}
+		return &RuleExplanation{
+			Matched: matched,
+			Conditions: []ConditionExplanation{{
+				Name:     "rule_match",
+				Expected: "match",
+				Actual:   ternary(matched, "matched", "no match"),
+				Passed:   matched,
+				Reason:   ternary(matched, "rule matched", "rule did not match"),
+			}},
+		}, nil
+	}
+
+	return explainer.Explain(ctx, ev, params)
+}
+
+// ternary is a helper for inline conditional strings.
+func ternary[T any](cond bool, yes, no T) T {
+	if cond {
+		return yes
+	}
+	return no
+}
+
 // DryRunResult is the result of evaluating a rule against historical events.
 type DryRunResult struct {
 	Matches []*stellar.DecodedEvent
