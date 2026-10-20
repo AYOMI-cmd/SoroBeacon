@@ -72,8 +72,9 @@ See [capacity and scaling](docs/operations/scaling.md).
 
 ## Configuration
 
-All configuration comes from environment variables. The complete
-operator reference — every variable `internal/config` reads, grouped by
+Configuration comes from environment variables and, optionally, a YAML file
+selected by `CONFIG_FILE`. The complete operator reference — every variable
+`internal/config` reads, grouped by
 database / RPC / HTTP / polling / logging, with types, defaults, required
 vs optional, secrets, and `SOURCE_MODE`-only notes — is
 [docs/configuration.md](docs/configuration.md).
@@ -344,6 +345,8 @@ built in. `event` is one of `transfer`, `mint`, `burn`, `clawback`,
 `set_admin`, or `*` for any of them; `from`/`to` match the semantic address
 slots (from is the holder on burn/clawback, the sender on transfer), and
 `min_amount`/`max_amount` are inclusive i128 bounds as decimal strings:
+See the [token_event rule reference](docs/rules/token_event.md) for topic
+positions, decimals, validation, and more examples.
 
 ```sh
 curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{

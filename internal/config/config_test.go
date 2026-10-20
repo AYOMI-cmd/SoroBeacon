@@ -18,6 +18,7 @@ import (
 func TestLoadDefaults(t *testing.T) {
 	// Pin every documented default. Clear optional vars so a leaked
 	// environment cannot masquerade as the unset path.
+	t.Setenv("CONFIG_FILE", "")
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("RPC_URL", "")
 	t.Setenv("RPC_URLS", "")
