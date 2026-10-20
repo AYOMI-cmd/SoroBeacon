@@ -345,6 +345,8 @@ built in. `event` is one of `transfer`, `mint`, `burn`, `clawback`,
 `set_admin`, or `*` for any of them; `from`/`to` match the semantic address
 slots (from is the holder on burn/clawback, the sender on transfer), and
 `min_amount`/`max_amount` are inclusive i128 bounds as decimal strings:
+See the [token_event rule reference](docs/rules/token_event.md) for topic
+positions, decimals, validation, and more examples.
 
 ```sh
 curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
