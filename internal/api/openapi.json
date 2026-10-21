@@ -1570,7 +1570,7 @@
     "/ingest": {
       "post": {
         "summary": "Receive a federated alert from another SoroBeacon instance",
-        "description": "Stores an alert forwarded by another instance without re-evaluating rules. The alert is stamped with its origin and hop count for loop prevention. Requires authentication.",
+        "description": "Stores an alert forwarded by another instance without re-evaluating rules. The monitor and rule ids in the payload belong to the sending instance: they are kept as the alert's source ids, and the stored alert is attached to no local monitor and no local rule. It lands in the workspace of the credential that delivered it. The alert is stamped with its origin and hop count for loop prevention. Requires authentication.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1632,6 +1632,9 @@
             "$ref": "#/components/responses/Error"
           },
           "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -3069,6 +3072,24 @@
           },
           "suppression_reason": {
             "type": "string"
+          },
+          "federated": {
+            "type": "boolean",
+            "description": "True when another SoroBeacon instance forwarded this alert. A federated alert belongs to no local monitor and no local rule, so its monitor_id and rule_id are zero."
+          },
+          "federation_origin": {
+            "type": "string",
+            "description": "The instance that forwarded the alert. Empty for a local one."
+          },
+          "source_monitor_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The monitor id on the sending instance. Never a local key."
+          },
+          "source_rule_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The rule id on the sending instance. Never a local key."
           }
         }
       },

@@ -103,6 +103,10 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	// to say so in the same typed way: the API answers 422 on the strength of
 	// it.
 	t.Run("ConstraintViolationsAreTyped", func(t *testing.T) { testConstraintViolationsAreTyped(t, newStore) })
+	// An alert another instance forwarded belongs to no local monitor and no
+	// local rule, and both backends have to store it that way.
+	t.Run("FederatedAlerts", func(t *testing.T) { testFederatedAlerts(t, newStore) })
+	t.Run("FederatedAlertsFollowTheDeliveringWorkspace", func(t *testing.T) { testFederatedAlertFollowsTheDeliveringWorkspace(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending

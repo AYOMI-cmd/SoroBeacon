@@ -1288,6 +1288,10 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
+	if a.Federated {
+		return p.createFederatedAlert(ctx, tx, a)
+	}
+
 	// The rule and the monitor are separate foreign keys, so the database
 	// alone cannot stop an alert that names this tenant's monitor and another
 	// tenant's rule. The join is the check, and it runs inside the same
@@ -1364,7 +1368,7 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	var reserved int
 	err = tx.QueryRow(ctx,
 		`INSERT INTO alert_dedup (rule_id, event_id, alert_created_at) VALUES ($1, $2, now())
-		 ON CONFLICT (rule_id, event_id) DO NOTHING
+		 ON CONFLICT DO NOTHING
 		 RETURNING 1`,
 		a.RuleID, a.EventID).Scan(&reserved)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1426,6 +1430,57 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	return AlertCreated, nil
 }
 
+// createFederatedAlert stores an alert another SoroBeacon instance
+// forwarded.
+//
+// None of the local machinery applies to it: there is no local monitor and
+// no local rule behind it, so the tenant join would look for a rule that
+// cannot exist, the cooldown belongs to a rule that is not ours, and the
+// dedup key cannot be the rule id. The key is the origin plus the event id
+// instead — the same event forwarded twice by the same peer is one alert,
+// and the same event id from two peers is two.
+//
+// The alert lands in the workspace of the credential that delivered it, which
+// is the caller's context and never anything the payload says.
+func (p *Postgres) createFederatedAlert(ctx context.Context, tx pgx.Tx, a *Alert) (AlertOutcome, error) {
+	var reserved int
+	err := tx.QueryRow(ctx,
+		`INSERT INTO alert_dedup (rule_id, event_id, federation_origin, alert_created_at)
+		 VALUES (NULL, $1, $2, now())
+		 ON CONFLICT DO NOTHING
+		 RETURNING 1`,
+		a.EventID, a.FederationOrigin).Scan(&reserved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AlertDuplicate, nil
+	}
+	if err != nil {
+		return "", mapErr(err)
+	}
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id)
+		 VALUES (NULL, NULL, $1, $2, $3, $4, $5, '', $6, TRUE, $7, $8, $9)
+		 RETURNING id, created_at`,
+		a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
+		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID,
+	).Scan(&a.ID, &a.CreatedAt); err != nil {
+		return "", mapErr(err)
+	}
+
+	// Link the reserved key to the row it produced, and carry the alert's
+	// created_at so retention can drop dedup rows by time.
+	if _, err := tx.Exec(ctx,
+		`UPDATE alert_dedup SET alert_id = $1, alert_created_at = $2 WHERE federation_origin = $3 AND event_id = $4`,
+		a.ID, a.CreatedAt, a.FederationOrigin, a.EventID); err != nil {
+		return "", mapErr(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", mapErr(err)
+	}
+	return AlertCreated, nil
+}
+
 // CreateAlertGroup creates or increments the alert group identified
 // by key and windowStart. On conflict it increments the count; on
 // first insertion it initializes count to 1. Returns the new count.
@@ -1459,14 +1514,32 @@ func (p *Postgres) GroupAlerts(ctx context.Context, key string, windowStart time
 func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	var ledger int64
+	var monitorID, ruleID *int64
+	var origin *string
+	var sourceMonitorID, sourceRuleID *int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network, federated, federation_origin, source_monitor_id, source_rule_id
 		   FROM alerts WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network)
+	).Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	a.Ledger = uint32(ledger)
+	if monitorID != nil {
+		a.MonitorID = *monitorID
+	}
+	if ruleID != nil {
+		a.RuleID = *ruleID
+	}
+	if origin != nil {
+		a.FederationOrigin = *origin
+	}
+	if sourceMonitorID != nil {
+		a.SourceMonitorID = *sourceMonitorID
+	}
+	if sourceRuleID != nil {
+		a.SourceRuleID = *sourceRuleID
+	}
 	return &a, nil
 }
 
@@ -1591,7 +1664,7 @@ func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.
 func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network, federated, federation_origin, source_monitor_id, source_rule_id
 		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -1661,11 +1734,34 @@ func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
 // iterates; a true streaming implementation would use a cursor.
 // scanAlert reads one alerts row. It is shared by ListAlerts and ExpiredAlerts
 // so the column order and the ledger/retracted_at mapping cannot drift.
+//
+// The monitor and rule ids are nullable: a federated alert belongs to no
+// local monitor and no local rule, and a NULL is how that is spelled. Zero is
+// not a valid id, so a NULL reads back as zero and the row is not attached to
+// anything local.
 func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	var a Alert
 	var ledger int64
-	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network)
+	var monitorID, ruleID *int64
+	var origin *string
+	var sourceMonitorID, sourceRuleID *int64
+	err := row.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
 	a.Ledger = uint32(ledger)
+	if monitorID != nil {
+		a.MonitorID = *monitorID
+	}
+	if ruleID != nil {
+		a.RuleID = *ruleID
+	}
+	if origin != nil {
+		a.FederationOrigin = *origin
+	}
+	if sourceMonitorID != nil {
+		a.SourceMonitorID = *sourceMonitorID
+	}
+	if sourceRuleID != nil {
+		a.SourceRuleID = *sourceRuleID
+	}
 	return a, err
 }
 
@@ -1679,7 +1775,7 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 		limit = DefaultPruneBatch
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network, federated, federation_origin, source_monitor_id, source_rule_id
 		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
 		cutoff, limit)
 	if err != nil {

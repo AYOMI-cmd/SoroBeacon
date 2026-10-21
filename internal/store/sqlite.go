@@ -1472,6 +1472,10 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
+	if a.Federated {
+		return s.createFederatedAlert(ctx, tx, a)
+	}
+
 	// The rule and the monitor are separate foreign keys, so the database alone
 	// cannot stop an alert that names this tenant's monitor and another
 	// tenant's rule. The join is the check, and it runs inside the same
@@ -1603,6 +1607,47 @@ func (s *SQLite) CreateAlert(ctx context.Context, a *Alert) (AlertOutcome, error
 	return AlertCreated, nil
 }
 
+// createFederatedAlert stores an alert another SoroBeacon instance
+// forwarded.
+//
+// None of the local machinery applies to it: there is no local monitor and
+// no local rule behind it, so the tenant join would look for a rule that
+// cannot exist, the cooldown belongs to a rule that is not ours, and the
+// dedup key cannot be the rule id. The key is the origin plus the event id
+// instead — the same event forwarded twice by the same peer is one alert,
+// and the same event id from two peers is two.
+//
+// The alert lands in the workspace of the credential that delivered it, which
+// is the caller's context and never anything the payload says.
+func (s *SQLite) createFederatedAlert(ctx context.Context, tx *sql.Tx, a *Alert) (AlertOutcome, error) {
+	var id int64
+	var created string
+	err := tx.QueryRowContext(ctx,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id)
+		 VALUES (NULL, NULL, ?, ?, ?, ?, ?, '', ?, 1, ?, ?, ?)
+		 ON CONFLICT DO NOTHING
+		 RETURNING id, created_at`,
+		a.EventID, string(jsonOrEmpty(a.Payload)), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
+		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID,
+	).Scan(&id, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The dedup index swallowed the insert: this event has already been
+		// stored for this origin.
+		return AlertDuplicate, nil
+	}
+	if err != nil {
+		return "", mapSQLiteErr(err)
+	}
+	a.ID = id
+	if a.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return AlertCreated, nil
+}
+
 // CreateAlertGroup creates or increments the alert group identified
 // by key and windowStart. On conflict it increments the count; on
 // first insertion it initializes count to 1. Returns the new count.
@@ -1635,7 +1680,7 @@ func (s *SQLite) GroupAlerts(ctx context.Context, key string, windowStart time.T
 
 func (s *SQLite) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	a, err := scanSQLiteAlert(s.db.QueryRowContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, network FROM alerts WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, network, federated, federation_origin, source_monitor_id, source_rule_id FROM alerts WHERE id = ? AND workspace_id = ?`, id, workspaceID(ctx)))
 	if err != nil {
 		return nil, err
 	}
@@ -1747,7 +1792,7 @@ func (s *SQLite) DeleteDeadLetter(ctx context.Context, id int64) error {
 }
 
 func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, network FROM alerts WHERE 1 = 1`
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, network, federated, federation_origin, source_monitor_id, source_rule_id FROM alerts WHERE 1 = 1`
 	args := []any{}
 	// Conditional because ListAlerts serves two callers with different scopes:
 	// the API listing (one workspace) and the frequency rule's match-log
@@ -1832,6 +1877,10 @@ func (s *SQLite) ListAlerts(ctx context.Context, f AlertFilter) ([]Alert, error)
 
 // ListAlertsStream streams alerts matching the filter to the callback.
 // It is used for large exports where loading all rows into memory is not feasible.
+// scanSQLiteAlert reads one alerts row. The monitor and rule ids are
+// nullable: a federated alert belongs to no local monitor and no local rule,
+// and a NULL is how that is spelled. Zero is not a valid id, so a NULL reads
+// back as zero and the row is not attached to anything local.
 func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var a Alert
 	var payload string
@@ -1842,8 +1891,26 @@ func scanSQLiteAlert(r rowScanner) (Alert, error) {
 	var inhibited sql.NullInt64
 	var suppressed int64
 	var suppressionReason string
-	if err := r.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited, &suppressed, &suppressionReason, &a.Network); err != nil {
+	var monitorID, ruleID sql.NullInt64
+	var origin sql.NullString
+	var sourceMonitorID, sourceRuleID sql.NullInt64
+	if err := r.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &payload, &enrichment, &created, &ledger, &retracted, &inhibited, &suppressed, &suppressionReason, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID); err != nil {
 		return a, mapSQLiteErr(err)
+	}
+	if monitorID.Valid {
+		a.MonitorID = monitorID.Int64
+	}
+	if ruleID.Valid {
+		a.RuleID = ruleID.Int64
+	}
+	if origin.Valid {
+		a.FederationOrigin = origin.String
+	}
+	if sourceMonitorID.Valid {
+		a.SourceMonitorID = sourceMonitorID.Int64
+	}
+	if sourceRuleID.Valid {
+		a.SourceRuleID = sourceRuleID.Int64
 	}
 	if inhibited.Valid {
 		v := inhibited.Int64
@@ -1962,7 +2029,7 @@ func (s *SQLite) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit int)
 		limit = DefaultPruneBatch
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, inhibited_by_rule_id, suppressed, suppression_reason, network, federated, federation_origin, source_monitor_id, source_rule_id
 		   FROM alerts WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?`,
 		sqliteTimeString(cutoff), limit)
 	if err != nil {
