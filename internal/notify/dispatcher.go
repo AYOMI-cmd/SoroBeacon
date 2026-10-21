@@ -714,6 +714,10 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 		Enrichment: alert.Enrichment,
 		Severity:   string(alert.Severity),
 		CreatedAt:  alert.CreatedAt,
+		// A federated alert has no local rule, so the channels that key on
+		// the rule need the instance it came from to tell two peers' alerts
+		// apart.
+		FederationOrigin: alert.FederationOrigin,
 	}
 
 	err = notifier.Send(attemptCtx, alertObj)

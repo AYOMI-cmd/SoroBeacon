@@ -1952,6 +1952,10 @@ func (s *Server) retryDelivery(w http.ResponseWriter, r *http.Request) {
 		Payload:   alert.Payload,
 		CreatedAt: alert.CreatedAt,
 		Severity:  string(alert.Severity),
+		// A federated alert has no local rule, so the channels that key on
+		// the rule need the instance it came from to tell two peers' alerts
+		// apart.
+		FederationOrigin: alert.FederationOrigin,
 	}
 	if m, merr := s.store.GetMonitor(r.Context(), alert.MonitorID); merr == nil && m != nil {
 		na.MonitorName = m.Name

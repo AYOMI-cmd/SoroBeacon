@@ -190,3 +190,24 @@ Three behaviours worth knowing before you script against this:
 | `GET /stats` | Counts (monitors, rules, channels, alerts, alerts last 24h), last ingested ledger, last poll time. |
 | `GET /stats/alerts-daily` | Daily alert counts for the last 30 UTC calendar days. Quiet days are explicit zeroes. `{"timezone":"UTC","days":[{"day":"2026-09-01","count":0}, ...]}`. |
 | `GET /audit` | Append-only log of monitor, rule and channel changes, newest first. Query: `target_type` (`monitor`\|`rule`\|`channel`), `target_id`, `from`/`to` (RFC 3339), `limit` (≤500, default 50). Each entry has `actor` (the request ID), `action` (`create`\|`update`\|`delete`), `target_type`, `target_id`, `diff` and `created_at`. `diff` records the *names* of the fields that were sent, never their values — a channel's config holds webhook URLs and tokens and is never stored. There is no endpoint to update or delete entries. |
+
+## Federation
+
+| Method & path | Description |
+| --- | --- |
+| `POST /ingest` | Receives an alert forwarded by another SoroBeacon instance and stores it without re-evaluating rules: the sending instance already decided, and re-evaluating would duplicate alerts. Needs the `alerts:write` scope, or a static token or session. |
+
+The monitor and rule ids in the payload belong to the **sending** instance.
+They are kept as the stored alert's `source_monitor_id` and `source_rule_id`,
+and the alert itself is attached to no local monitor and no local rule — its
+own `monitor_id` and `rule_id` are zero, and `federated` is true. It lands in
+the workspace of the credential that delivered it, never in one the payload
+names. A payload that names ids this instance happens to have does not
+attach itself to them.
+
+* `201` — the alert was stored (`outcome` is `created` or `duplicate`).
+* `400` — the payload is malformed: no `event_id`, no `origin`, a severity
+  outside the vocabulary, or a hop count at the limit.
+* `422` — the payload cannot be stored here: it violates a database
+  constraint. It is a client error, and the sender must not retry it.
+* `500` — the receiver's own fault. The sender may retry.
