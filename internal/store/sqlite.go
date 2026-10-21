@@ -1238,6 +1238,54 @@ func parseSQLiteTimePtr(ns sql.NullString) (*time.Time, error) {
 	return &t, nil
 }
 
+// GetChannelDeliveryStats mirrors the Postgres backend statement for
+// statement: the same existence probe riding along in the same row, the same
+// filtered counts and conditional maxes, the same ErrNotFound and nil-when-
+// empty timestamps. The window cutoff arrives from the caller as an absolute
+// time and is bound as the canonical fixed-width UTC TEXT string, so the
+// comparison stays chronological exactly like every other time filter here.
+//
+// sum(CASE ...) over an empty set is NULL rather than 0 as on Postgres, so it
+// is wrapped in COALESCE; max(...) yielding NULL is the desired "no such
+// attempt" and is read through the nullable-timestamp helper.
+func (s *SQLite) GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error) {
+	cs := ChannelDeliveryStats{ChannelID: channelID}
+	var exists int64
+	var lastOK, lastFail sql.NullString
+	ws := workspaceID(ctx)
+	cut := sqliteTimeString(since)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = ? AND workspace_id = ?),
+			count(*),
+			COALESCE(sum(CASE WHEN da.status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(sum(CASE WHEN da.status = ? THEN 1 ELSE 0 END), 0),
+			max(CASE WHEN da.status = ? THEN da.attempted_at END),
+			max(CASE WHEN da.status = ? THEN da.attempted_at END)
+		FROM delivery_attempts da
+		WHERE da.channel_id = ? AND da.attempted_at >= ?`,
+		channelID, ws,
+		DeliveryStatusSuccess, DeliveryStatusFailed,
+		DeliveryStatusSuccess, DeliveryStatusFailed,
+		channelID, cut).
+		Scan(&exists, &cs.Total, &cs.Succeeded, &cs.Failed, &lastOK, &lastFail)
+	if err != nil {
+		return cs, mapSQLiteErr(err)
+	}
+	if exists == 0 {
+		return cs, ErrNotFound
+	}
+	var err2 error
+	if cs.LastSuccessAt, err2 = parseSQLiteTimePtr(lastOK); err2 != nil {
+		return cs, err2
+	}
+	if cs.LastFailureAt, err2 = parseSQLiteTimePtr(lastFail); err2 != nil {
+		return cs, err2
+	}
+	cs.deriveSuccessRate()
+	return cs, nil
+}
+
 // UpdateChannel mirrors the Postgres implementation, including the health
 // reset. Turning a channel back on clears the state auto-disable left behind,
 // in the same statement, so a channel cannot re-disable on its next failure

@@ -23,6 +23,9 @@ type conformanceStore interface {
 	resetConformance(ctx context.Context) error
 	// setAlertCreatedAt backdates one alert row.
 	setAlertCreatedAt(ctx context.Context, id int64, at time.Time) error
+	// setDeliveryAttemptAt backdates one delivery attempt's attempted_at, so
+	// window-filtering tests do not have to sleep or mock the clock.
+	setDeliveryAttemptAt(ctx context.Context, id int64, at time.Time) error
 	// backdateRuleLastAlert moves a rule's cooldown window into the past,
 	// so cooldown-expiry tests do not have to sleep.
 	backdateRuleLastAlert(ctx context.Context, id int64, d time.Duration) error
@@ -67,6 +70,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("AbsenceStateRoundTrip", func(t *testing.T) { testAbsenceState(t, newStore) })
 	t.Run("GetStats", func(t *testing.T) { testGetStats(t, newStore) })
 	t.Run("GetMonitorStats", func(t *testing.T) { testGetMonitorStats(t, newStore) })
+	t.Run("ChannelDeliveryStatsAggregation", func(t *testing.T) { testChannelDeliveryStats(t, newStore) })
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })
 	t.Run("DuplicateMonitorCopiesRulesChannelsDisabledUniqueName", func(t *testing.T) { testDuplicateMonitor(t, newStore) })
 	t.Run("LedgerHashesAndAlertRetraction", func(t *testing.T) { testLedgerHashesAndRetraction(t, newStore) })
