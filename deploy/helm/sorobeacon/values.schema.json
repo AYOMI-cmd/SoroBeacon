@@ -428,6 +428,10 @@
           "type": "string",
           "description": "OIDC_WORKSPACE_CLAIM: claim naming the user's workspace."
         },
+        "roleClaim": {
+          "type": "string",
+          "description": "OIDC_ROLE_CLAIM: claim naming the user's role."
+        },
         "loginStateTTL": {
           "type": "string",
           "pattern": "^[0-9]+(ms|s|m|h)$",

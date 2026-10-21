@@ -305,5 +305,8 @@ oidc:
   # Claim naming the user's workspace, for an issuer that carries one. Empty
   # puts every SSO user in oidc.workspace.
   workspaceClaim: ""
+  # Claim naming the user's role (viewer, editor or admin), for an issuer that
+  # carries one. Empty makes every SSO user an admin.
+  roleClaim: ""
   # How long a started login may take to come back.
   loginStateTTL: "10m"

@@ -172,6 +172,36 @@ The `.down.sql` files exist for development, not for operators.**
   rollback done, and report the regression as an issue rather than staying
   on an unsupported version pair.
 
+## Roles are enforced now
+
+Roles (`viewer`, `editor`, `admin`) used to be defined and never checked:
+every credential that could sign in could also change the instance. They are
+now enforced on the REST API and on the dashboard, from a route table per
+surface.
+
+What this changes for an existing deployment:
+
+* **A static token without a role suffix is still an admin.** The default is
+  unchanged, so a deployment that never wrote a suffix sees no difference.
+* **A token that carried a `:viewer` suffix now really is a viewer** and can
+  no longer create, change or delete anything. If anybody relied on such a
+  token to make changes, give it `:editor` or `:admin` instead. The suffix
+  selects the role; the client still presents the token without it.
+* **A token that carried an `:editor` suffix can no longer mint API tokens or
+  read the audit log.** Those are administrator's work.
+* **A dashboard session inherits the role of the credential that signed in.**
+  A session minted from a token with no suffix is an admin, as before.
+* **An OIDC deployment can map roles** with `OIDC_ROLE_CLAIM`, naming a claim
+  in the verified ID token. Without it, every identity that signs in is an
+  admin — which is what it was before.
+* **A route with no entry in the role table is refused to every credential.**
+  The tables are checked against the routers by a test, so a new endpoint
+  cannot ship without a role decision, but an endpoint added to a router
+  outside the test's reach would be closed rather than open.
+
+The full mapping is in the
+[authorization reference](../reference/authorization.md#roles).
+
 ## See also
 
 * [Backing up and restoring the database](backup-restore.md) — the restore
