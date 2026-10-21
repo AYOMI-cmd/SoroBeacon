@@ -635,28 +635,32 @@ func TestDispatchDisableAfterFailuresThreshold(t *testing.T) {
 	// whether the store's auto-disable logic triggers after N permanent failures.
 	assert.Equal(t, 4, updates[0].DisableAfter, "DisableAfter is set to the configured threshold")
 
-	// Second dispatch: health overwritten with DisableAfter=4 again
+	// A 404 is not retried — the receiver rejected the request itself, and
+	// sending it again unchanged fails the same way — so a delivery is one
+	// attempt and the circuit breaker counts one failure per delivery. The
+	// second and third dispatches still reach the channel.
 	d.Dispatch(context.Background(), Alert{ID: 35, MonitorID: 2})
 	updates = healthFor(st, 1)
-	require.Len(t, updates, 1)
-	assert.Equal(t, 4, updates[0].DisableAfter, "DisableAfter remains at threshold value")
+	require.Len(t, updates, 2)
+	assert.Equal(t, 4, updates[1].DisableAfter, "DisableAfter remains at threshold value")
 
 	// Third dispatch
 	d.Dispatch(context.Background(), Alert{ID: 36, MonitorID: 2})
 	updates = healthFor(st, 1)
-	require.Len(t, updates, 1)
-	assert.Equal(t, 4, updates[0].DisableAfter, "DisableAfter remains at threshold value")
+	require.Len(t, updates, 3)
+	assert.Equal(t, 4, updates[2].DisableAfter, "DisableAfter remains at threshold value")
 
-	// Fourth dispatch
+	// Fourth dispatch: the breaker is open by now, so the channel is skipped
+	// and the health is left alone.
 	d.Dispatch(context.Background(), Alert{ID: 37, MonitorID: 2})
 	updates = healthFor(st, 1)
-	require.Len(t, updates, 1)
-	assert.Equal(t, 4, updates[0].DisableAfter, "DisableAfter remains at threshold value")
+	require.Len(t, updates, 3)
+	assert.Equal(t, 4, updates[2].DisableAfter, "DisableAfter remains at threshold value")
 
 	// Fifth dispatch
 	d.Dispatch(context.Background(), Alert{ID: 38, MonitorID: 2})
 	updates = healthFor(st, 1)
-	require.Len(t, updates, 1)
+	require.Len(t, updates, 3)
 	assert.Equal(t, 4, updates[0].DisableAfter, "DisableAfter remains at threshold value")
 }
 
