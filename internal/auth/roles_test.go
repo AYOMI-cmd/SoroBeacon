@@ -48,26 +48,34 @@ func TestRoleHierarchy(t *testing.T) {
 	assert.False(t, RoleUnknown.HasPermission(RoleViewer))
 }
 
-func TestRoleMiddlewareFailClosedAndUnassigned(t *testing.T) {
-	a := New([]string{"token-admin:admin"}, 0)
-	re := NewRoleEnforcer(a)
-	re.RegisterRoute("GET", "/api/v1/safe", RoleViewer)
+// TestRoleForRequestUsesConfiguredTokens pins the only source of a role: the
+// authenticator's configured token table. The removed RoleEnforcer treated the
+// literal strings "admin" and "token-admin" as admin without consulting that
+// table, so the legacy names must not authenticate at all.
+func TestRoleForRequestUsesConfiguredTokens(t *testing.T) {
+	a := New([]string{
+		"configured-admin:admin",
+		"configured-editor:editor",
+		"configured-viewer:viewer",
+	}, 0)
 
-	handler := RoleMiddleware(re, RoleViewer)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+	for token, want := range map[string]Role{
+		"configured-admin":  RoleAdmin,
+		"configured-editor": RoleEditor,
+		"configured-viewer": RoleViewer,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		role, ok := a.RoleForRequest(req)
+		assert.True(t, ok, "configured token %q must authenticate", token)
+		assert.Equal(t, want, role, "configured token %q", token)
+	}
 
-	// Unassigned route should fail closed (403) by default
-	reqUnassigned := httptest.NewRequest("GET", "/api/v1/unknown-route", nil)
-	reqUnassigned.Header.Set("Authorization", "Bearer token-admin")
-	recUnassigned := httptest.NewRecorder()
-	handler.ServeHTTP(recUnassigned, reqUnassigned)
-	assert.Equal(t, http.StatusForbidden, recUnassigned.Code)
-
-	// Assigned route with proper role should succeed
-	reqAssigned := httptest.NewRequest("GET", "/api/v1/safe", nil)
-	reqAssigned.Header.Set("Authorization", "Bearer token-admin")
-	recAssigned := httptest.NewRecorder()
-	handler.ServeHTTP(recAssigned, reqAssigned)
-	assert.Equal(t, http.StatusOK, recAssigned.Code)
+	for _, token := range []string{"admin", "token-admin", "editor", "token-editor", "viewer", "token-viewer"} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		role, ok := a.RoleForRequest(req)
+		assert.False(t, ok, "literal token %q must not authenticate", token)
+		assert.Equal(t, RoleUnknown, role, "literal token %q", token)
+	}
 }
