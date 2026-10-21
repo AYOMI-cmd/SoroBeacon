@@ -1317,6 +1317,51 @@ func (p *Postgres) scanChannel(row pgx.CollectableRow) (Channel, error) {
 	return c, nil
 }
 
+// GetChannelDeliveryStats aggregates one channel's delivery attempts over a
+// window entirely in SQL — one statement, whatever the window holds — rather
+// than loading attempts into Go and counting them there. Routable read, for
+// the same reason as GetStats: every number is a count over append-only
+// history, and nothing is written back from it.
+//
+// The shape mirrors GetMonitorStats. The channel-existence probe rides along
+// as the first column so a channel deleted a moment ago reports ErrNotFound
+// instead of a body of zeroes that reads as "quiet but healthy"; the probe is
+// workspace-scoped because channels are a tenant table, while the aggregate
+// itself needs no join for tenancy: delivery_attempts rows are keyed by their
+// channel, and the probe has already proven this caller may see that channel.
+//
+// Both maxes are filtered aggregates, so a window with no successful (or no
+// failed) attempts scans fine and yields NULL, which the *time.Time targets
+// read as a nil pointer — never a zero time. count(*) FILTER over an empty
+// set is 0, and the success rate is derived once in Go by deriveSuccessRate,
+// which keeps division by zero and the nil-when-empty rule out of SQL entirely.
+func (p *Postgres) GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error) {
+	cs := ChannelDeliveryStats{ChannelID: channelID}
+	var exists bool
+	err := p.queryRowFallback(ctx, func(row pgx.Row) error {
+		return row.Scan(&exists, &cs.Total, &cs.Succeeded, &cs.Failed,
+			&cs.LastSuccessAt, &cs.LastFailureAt)
+	}, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = $1 AND workspace_id = $5) > 0,
+			count(*),
+			count(*) FILTER (WHERE da.status = $2),
+			count(*) FILTER (WHERE da.status = $3),
+			max(da.attempted_at) FILTER (WHERE da.status = $2),
+			max(da.attempted_at) FILTER (WHERE da.status = $3)
+		FROM delivery_attempts da
+		WHERE da.channel_id = $1 AND da.attempted_at >= $4`,
+		channelID, DeliveryStatusSuccess, DeliveryStatusFailed, since.UTC(), workspaceID(ctx))
+	if err != nil {
+		return cs, err
+	}
+	if !exists {
+		return cs, ErrNotFound
+	}
+	cs.deriveSuccessRate()
+	return cs, nil
+}
+
 // --- alerts ---
 
 // CreateAlert wraps the transaction with the store.create_alert span, so

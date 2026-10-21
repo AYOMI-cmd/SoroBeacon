@@ -37,15 +37,19 @@ var routeScopes = map[string][]auth.Scope{
 	"PATCH /monitors/{id}/rules/{ruleID}":  {auth.ScopeMonitorsWrite},
 	"DELETE /monitors/{id}/rules/{ruleID}": {auth.ScopeMonitorsWrite},
 	"POST /monitors/import":                {auth.ScopeMonitorsWrite},
-	"GET /monitors/trash":                {auth.ScopeMonitorsRead},
-	"POST /monitors/{id}/soft-delete":    {auth.ScopeMonitorsWrite},
-	"POST /monitors/{id}/restore":        {auth.ScopeMonitorsWrite},
+	"GET /monitors/trash":                  {auth.ScopeMonitorsRead},
+	"POST /monitors/{id}/soft-delete":      {auth.ScopeMonitorsWrite},
+	"POST /monitors/{id}/restore":          {auth.ScopeMonitorsWrite},
 
-	"POST /channels":        {auth.ScopeChannelsWrite},
-	"GET /channels":         {auth.ScopeChannelsRead},
-	"GET /channels/{id}":    {auth.ScopeChannelsRead},
-	"PATCH /channels/{id}":  {auth.ScopeChannelsWrite},
-	"DELETE /channels/{id}": {auth.ScopeChannelsWrite},
+	"POST /channels":     {auth.ScopeChannelsWrite},
+	"GET /channels":      {auth.ScopeChannelsRead},
+	"GET /channels/{id}": {auth.ScopeChannelsRead},
+	// Delivery statistics read the same history GET /monitors/{id}/stats
+	// reads, so they ask for the same stats scope: a token that may see the
+	// instance's numbers may see one channel's.
+	"GET /channels/{id}/stats": {auth.ScopeStatsRead},
+	"PATCH /channels/{id}":     {auth.ScopeChannelsWrite},
+	"DELETE /channels/{id}":    {auth.ScopeChannelsWrite},
 	// Testing a channel sends a real notification through it, which is a write
 	// even though nothing is stored.
 	"POST /channels/{id}/test":      {auth.ScopeChannelsWrite},

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -516,6 +517,66 @@ type DeliveryAttempt struct {
 	AttemptedAt     time.Time `json:"attempted_at"`
 }
 
+// ChannelDeliveryStats is one channel's delivery outcomes aggregated over a
+// time window, answering "is this channel delivering?" without shipping the
+// attempts themselves. The aggregation happens in the database (see
+// GetChannelDeliveryStats); this type only carries the result.
+//
+// Every delivery_attempts row is terminal by construction: the dispatcher
+// writes one row per finished try, with status success or failed, and a retry
+// writes another row. So Total is every try in the window — including several
+// tries of the same alert — and Succeeded + Failed == Total for any data this
+// store has ever written. Attempts older than the window are simply not
+// counted; a pending or queued alert is not an attempt until it is tried.
+//
+// SuccessRate is succeeded/total as a ratio in [0, 1], and is nil — never 0 or
+// 1 — when there were no attempts in the window: an undefined rate must not be
+// rendered as a percentage by a client that cannot tell "no data" from "all
+// failed".
+type ChannelDeliveryStats struct {
+	ChannelID   int64    `json:"channel_id"`
+	Total       int64    `json:"total"`
+	Succeeded   int64    `json:"succeeded"`
+	Failed      int64    `json:"failed"`
+	SuccessRate *float64 `json:"success_rate,omitempty"`
+	// LastSuccessAt is the newest attempted_at among the window's successful
+	// attempts, nil when the window holds none — including when the channel
+	// succeeded before the window and has not since.
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	// LastFailureAt likewise, for failed attempts.
+	LastFailureAt *time.Time `json:"last_failure_at,omitempty"`
+}
+
+// deriveSuccessRate fills SuccessRate from the scanned counts. It is called by
+// both backends so the ratio — and the nil-when-empty rule — has exactly one
+// definition; the division is float64 on purpose so an integer percentage can
+// never lose precision on the way through.
+func (c *ChannelDeliveryStats) deriveSuccessRate() {
+	if c.Total == 0 {
+		c.SuccessRate = nil
+		return
+	}
+	rate := float64(c.Succeeded) / float64(c.Total)
+	c.SuccessRate = &rate
+}
+
+// HasAttempts reports whether the window held any delivery attempts at all.
+// The dashboard needs it to show "no attempts" rather than 0% for a channel
+// that has never been used (or simply was not used inside the window).
+func (c ChannelDeliveryStats) HasAttempts() bool { return c.Total > 0 }
+
+// SuccessPercent renders the rate as a 0–100 number rounded to one decimal,
+// which is the display form the dashboard and any client should use so the
+// same counts always show the same number. Undefined (no attempts) is -1, a
+// sentinel outside the valid range: a caller must check HasAttempts first, and
+// -1 cannot be mistaken for a real 0%.
+func (c ChannelDeliveryStats) SuccessPercent() float64 {
+	if c.SuccessRate == nil {
+		return -1
+	}
+	return math.Round(*c.SuccessRate*1000) / 10
+}
+
 // AbsenceState is the last time a rule saw the event it is waiting for.
 // Absence-of-event rules are driven by a periodic sweep rather than by event
 // arrival, so the sweep needs one of these per (rule, awaited pattern); there
@@ -938,6 +999,14 @@ type Channels interface {
 	// ListChannelsByIDs returns the enabled channels among ids, ordered by id,
 	// so an escalation step can notify its channel set in one query.
 	ListChannelsByIDs(ctx context.Context, ids []int64) ([]Channel, error)
+	// GetChannelDeliveryStats aggregates one channel's delivery attempts with
+	// attempted_at at or after since, or ErrNotFound when the channel does
+	// not exist in the caller's workspace. since is an absolute UTC cutoff
+	// computed once by the caller so the window's start cannot disagree
+	// between SQL and Go; the aggregation itself runs in the database and a
+	// channel with no attempts in the window returns explicit zero counts and
+	// nil timestamps (see ChannelDeliveryStats).
+	GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error)
 }
 
 // Alerts persists alerts and delivery attempts.

@@ -264,6 +264,9 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/bulk", s.bulkChannels)
 		r.Post("/{id}/duplicate", s.duplicateChannel)
 		r.Get("/{id}", s.getChannel)
+		// Registered under the channel's own id rather than under /stats:
+		// the statistics are one channel's, not the instance's.
+		r.Get("/{id}/stats", s.channelStats)
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
