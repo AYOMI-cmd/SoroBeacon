@@ -99,6 +99,10 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("WorkspaceIsolation", func(t *testing.T) { testWorkspaceIsolation(t, newStore) })
 	t.Run("DeleteByIDAllowlist", func(t *testing.T) { testDeleteByIDAllowlist(t, newStore) })
 	t.Run("APITokens", func(t *testing.T) { testAPITokens(t, newStore) })
+	// A constraint violation is the request's fault, and both backends have
+	// to say so in the same typed way: the API answers 422 on the strength of
+	// it.
+	t.Run("ConstraintViolationsAreTyped", func(t *testing.T) { testConstraintViolationsAreTyped(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending

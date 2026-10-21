@@ -58,6 +58,8 @@ type fakeDispatchStore struct {
 	channels []store.Channel
 	attempts []store.DeliveryAttempt
 	health   []channelHealthCall
+	// deadLetters records the dead letters the dispatcher wrote.
+	deadLetters []store.DeadLetter
 	// window, when set, is returned by ActiveMaintenanceWindow.
 	window *store.MaintenanceWindow
 	// suppressed records the alert ID and reason of each suppression.
@@ -82,7 +84,8 @@ func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.De
 	return nil
 }
 
-func (f *fakeDispatchStore) CreateDeadLetter(_ context.Context, _ *store.DeadLetter) error {
+func (f *fakeDispatchStore) CreateDeadLetter(_ context.Context, d *store.DeadLetter) error {
+	f.deadLetters = append(f.deadLetters, *d)
 	return nil
 }
 

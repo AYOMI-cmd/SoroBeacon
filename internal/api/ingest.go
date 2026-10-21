@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/sorotrail/sorobeacon/internal/notify"
@@ -63,7 +64,7 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 
 	outcome, err := s.store.CreateAlert(r.Context(), alert)
 	if err != nil {
-		s.fail(w, r, err)
+		s.failIngest(w, r, err)
 		return
 	}
 
@@ -72,4 +73,25 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		"alert_id": alert.ID,
 		"origin":   fa.Origin,
 	})
+}
+
+// failIngest answers a store failure on /ingest.
+//
+// Every failure here is about the payload: the alert names a monitor or a rule
+// this instance does not have, or a value the database refuses. None of them
+// is the receiver's fault, and none of them gets better by being sent again,
+// so they are 422 rather than 500. A 500 reads as transient on the sending
+// side, which retries three times and then dead-letters a request that can
+// never succeed.
+func (s *Server) failIngest(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrConstraint) {
+		writeErr(w, r, http.StatusUnprocessableEntity, constraintMessage(err))
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, r, http.StatusUnprocessableEntity,
+			"the alert references a monitor or rule that does not exist on this instance")
+		return
+	}
+	s.fail(w, r, err)
 }

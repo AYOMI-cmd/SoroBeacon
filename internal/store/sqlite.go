@@ -30,10 +30,16 @@ const sqliteDriver = "sqlite"
 // matches SQLite's strftime('%Y-%m-%dT%H:%M:%fZ', 'now').
 const sqliteTimeLayout = "2006-01-02T15:04:05.000Z"
 
-// sqliteConstraintForeignKey is sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
-// (SQLITE_CONSTRAINT | 3<<8). It is spelled out rather than imported from
-// modernc.org/sqlite/lib so the low-level package stays out of the store.
-const sqliteConstraintForeignKey = 19 | (3 << 8)
+// SQLite reports a constraint violation as an extended result code. The three
+// that matter here are the ones a request can cause: a foreign key naming a
+// row that does not exist, a CHECK the value fails and a unique index the
+// value collides with.
+const (
+	sqliteConstraintForeignKey = 19 | (3 << 8) // SQLITE_CONSTRAINT_FOREIGNKEY
+	sqliteConstraintCheck      = 19 | (1 << 8) // SQLITE_CONSTRAINT_CHECK
+	sqliteConstraintUnique     = 19 | (8 << 8) // SQLITE_CONSTRAINT_UNIQUE
+	sqliteConstraintPrimaryKey = 19 | (6 << 8) // SQLITE_CONSTRAINT_PRIMARYKEY
+)
 
 // SQLite implements Store on a single SQLite database file through
 // database/sql and modernc.org/sqlite. It exists for the one-contract-on-a-
@@ -240,8 +246,9 @@ func placeholders(n int) string {
 }
 
 // mapSQLiteErr converts driver sentinels into store-level errors. database/sql
-// reports a missing row as sql.ErrNoRows; a foreign-key violation is mapped to
-// ErrNotFound for parity with the Postgres backend, which does the same.
+// reports a missing row as sql.ErrNoRows; a constraint violation becomes the
+// typed store error, so both backends answer a request that named a row which
+// does not exist the same way.
 func mapSQLiteErr(err error) error {
 	if err == nil {
 		return nil
@@ -250,8 +257,20 @@ func mapSQLiteErr(err error) error {
 		return ErrNotFound
 	}
 	var se *sqlite.Error
-	if errors.As(err, &se) && se.Code() == sqliteConstraintForeignKey {
-		return fmt.Errorf("%w: foreign key constraint", ErrNotFound)
+	if errors.As(err, &se) {
+		switch se.Code() {
+		case sqliteConstraintForeignKey:
+			// The row the request named does not exist, so this is a missing
+			// row as well as a constraint violation: a caller that only knows
+			// ErrNotFound keeps the answer it has always had, and a caller
+			// that knows ErrConstraint can tell the caller it was the
+			// request's fault rather than the server's.
+			return fmt.Errorf("%w: %w", ErrNotFound, &ConstraintError{Kind: ConstraintForeignKey})
+		case sqliteConstraintCheck:
+			return &ConstraintError{Kind: ConstraintCheck}
+		case sqliteConstraintUnique, sqliteConstraintPrimaryKey:
+			return &ConstraintError{Kind: ConstraintUnique}
+		}
 	}
 	return err
 }
@@ -2859,7 +2878,7 @@ func (s *SQLite) CreateSavedSearch(ctx context.Context, ss *SavedSearch) error {
 		// methods below.
 		if _, err := s.db.ExecContext(ctx,
 			`UPDATE saved_searches SET is_default = 0 WHERE is_default = 1 AND workspace_id = ?`, ws); err != nil {
-			return err
+			return mapSQLiteErr(err)
 		}
 	}
 	var created string

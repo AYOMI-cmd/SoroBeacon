@@ -205,7 +205,10 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 		 RETURNING id, created_at`,
 		m.Name, ids, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt),
 	).Scan(&m.ID, &m.CreatedAt); err != nil {
-		return err
+		// A name already taken in this workspace violates the unique index, and
+		// that is the request's fault rather than the server's: mapErr turns
+		// it into the typed constraint error the API answers 422 with.
+		return mapErr(err)
 	}
 	return tx.Commit(ctx)
 }
@@ -1368,7 +1371,11 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 		return AlertDuplicate, nil // duplicate (rule_id, event_id): deduped
 	}
 	if err != nil {
-		return "", err
+		// mapErr, not the raw driver error: this insert references the rule,
+		// so a rule that does not exist is a foreign-key violation and has to
+		// reach the caller as one. A raw *pgconn.PgError here is what turned a
+		// bad payload into an unexplained 500.
+		return "", mapErr(err)
 	}
 
 	err = tx.QueryRow(ctx,
@@ -1941,11 +1948,14 @@ func (p *Postgres) CreateInhibition(ctx context.Context, in *Inhibition) error {
 	if in.FiringWindowSeconds <= 0 {
 		in.FiringWindowSeconds = DefaultInhibitionWindowSeconds
 	}
-	return p.pool.QueryRow(ctx,
+	// mapErr, not the raw driver error: the pair names two rules, and a rule
+	// that does not exist is a foreign-key violation the caller has to be
+	// told about, not an unexplained server fault.
+	return mapErr(p.pool.QueryRow(ctx,
 		`INSERT INTO alert_inhibitions (source_rule_id, target_rule_id, firing_window_seconds)
 		 VALUES ($1, $2, $3) RETURNING created_at`,
 		in.SourceRuleID, in.TargetRuleID, in.FiringWindowSeconds,
-	).Scan(&in.CreatedAt)
+	).Scan(&in.CreatedAt))
 }
 
 func (p *Postgres) scanInhibition(row pgx.CollectableRow) (Inhibition, error) {
@@ -2519,7 +2529,9 @@ func (p *Postgres) SetDefaultSearch(ctx context.Context, id int64) error {
 	_, _ = tx.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE AND workspace_id = $1`, ws)
 	tag, err := tx.Exec(ctx, `UPDATE saved_searches SET is_default = TRUE WHERE id = $1 AND workspace_id = $2`, id, ws)
 	if err != nil {
-		return err
+		// The partial unique index allows one default per workspace, and a
+		// second one is the request's fault rather than the server's.
+		return mapErr(err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
@@ -2806,14 +2818,40 @@ func WithSuppressed(payload json.RawMessage, n int64) json.RawMessage {
 	return merged
 }
 
-// mapErr converts pgx sentinel and FK errors into store-level errors.
+// Postgres reports a constraint violation as an SQLSTATE code on the driver's
+// error. The three that matter here are the ones a request can cause: a
+// foreign key naming a row that does not exist, a CHECK the value fails and a
+// unique index the value collides with.
+const (
+	pgForeignKeyViolation = "23503"
+	pgCheckViolation      = "23514"
+	pgUniqueViolation     = "23505"
+)
+
+// mapErr converts pgx sentinel and constraint errors into store-level errors.
 func mapErr(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
-		return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	switch pgErr.Code {
+	case pgForeignKeyViolation:
+		// The row the request named does not exist, so this is a missing row
+		// as well as a constraint violation: a caller that only knows
+		// ErrNotFound keeps the answer it has always had, and a caller that
+		// knows ErrConstraint can tell the caller it was the request's fault
+		// rather than the server's.
+		return fmt.Errorf("%w: %w", ErrNotFound, &ConstraintError{
+			Kind:       ConstraintForeignKey,
+			Constraint: pgErr.ConstraintName,
+		})
+	case pgCheckViolation:
+		return &ConstraintError{Kind: ConstraintCheck, Constraint: pgErr.ConstraintName}
+	case pgUniqueViolation:
+		return &ConstraintError{Kind: ConstraintUnique, Constraint: pgErr.ConstraintName}
 	}
 	return err
 }

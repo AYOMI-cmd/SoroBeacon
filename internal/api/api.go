@@ -522,12 +522,41 @@ func allowHeader(r *http.Request) string {
 
 // fail maps store errors to HTTP responses.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	// A constraint violation is the request's fault, not the server's: it
+	// named a record that does not exist, or a value the database refuses.
+	// Answering 500 would tell the sender the failure is transient, and a
+	// federated sender retries a request that cannot succeed — three times,
+	// and then into the dead-letter queue.
+	if errors.Is(err, store.ErrConstraint) {
+		writeErr(w, r, http.StatusUnprocessableEntity, constraintMessage(err))
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, r, http.StatusNotFound, "not found")
 		return
 	}
 	s.log.Error("api error", "request_id", reqid.From(r), "err", err)
 	writeErr(w, r, http.StatusInternalServerError, "internal error")
+}
+
+// constraintMessage describes a constraint violation in the caller's terms.
+// It never quotes the statement that failed or the constraint's name: the
+// caller needs to know what to change, not what the database said about it.
+func constraintMessage(err error) string {
+	kind, ok := store.ConstraintKindOf(err)
+	if !ok {
+		return "the request violates a database constraint"
+	}
+	switch kind {
+	case store.ConstraintForeignKey:
+		return "the request references a record that does not exist"
+	case store.ConstraintCheck:
+		return "the request contains a value the database refuses"
+	case store.ConstraintUnique:
+		return "the request conflicts with an existing record"
+	default:
+		return "the request violates a database constraint"
+	}
 }
 
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
