@@ -77,23 +77,15 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 
 `token_event` can match individual `mint` or `burn` events, but cannot express "any supply change above N" in one rule — you would need two separate rules (one for mint, one for burn). `token_supply_change` combines both directions into a single rule and makes the `direction` available for the alert payload, so you can distinguish mint vs burn alerts in your notification handler.
 
-Also unlike `token_event`, `token_supply_change` does **not** fire on `clawback` events, which move tokens back to the issuer without changing total supply.
-
-## Validation
+Also unlike `token_event`, `token_supply_change` does **not** fire on `clawback` events, which move tokens back to the issuer without changing total supply.## Validation
 
 Rules that can never match are rejected at create time:
 
 - `min_amount` that isn't a decimal integer
 - unknown `direction` values
 
-## Entry in params.md
+## See also
 
-See the params reference in `docs/rules/params.md` for the shared parameter conventions.
-
-## Entry in SUMMARY.md
-
-Add `token_supply_change` to the rule reference table in `docs/SUMMARY.md`.
-
-## Link from guides/monitoring-a-token.md
-
-Add a link to this rule from `docs/guides/monitoring-a-token.md` under the rule types section.
+- [params reference](params.md) — shared parameter conventions
+- [token_event](token-event.md) — match individual SEP-41 events by name
+- [End-to-end: monitoring a token contract](../guides/monitoring-a-token.md)
