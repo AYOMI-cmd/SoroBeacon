@@ -955,6 +955,17 @@ type Monitors interface {
 	ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error)
 	// HardDeleteMonitor permanently removes a monitor and its rules/attachments.
 	HardDeleteMonitor(ctx context.Context, id int64) error
+	// CreateMonitorWithRules creates a monitor, its rules and its channel
+	// attachments in one transaction: either all of it is written, or none
+	// of it is. A monitor that exists without the rules it was supposed to
+	// have is a monitor that watches a contract and never says anything, and
+	// nothing else in the system would report the gap — so a caller that
+	// cannot write all three must not write any of them.
+	//
+	// The rules are attached to the new monitor, so their MonitorID is set
+	// here; the channel ids must all belong to the caller's workspace, and
+	// an unknown one fails the whole call with ErrNotFound.
+	CreateMonitorWithRules(ctx context.Context, m *Monitor, rules []*Rule, channelIDs []int64) error
 	SetMonitorChannels(ctx context.Context, monitorID int64, channelIDs []int64) error
 	// SetMonitorsEnabled sets enabled on every existing id in one statement.
 	// Unknown IDs are returned rather than treated as an error so a mixed

@@ -2052,6 +2052,7 @@
       ],
       "post": {
         "summary": "Create a monitor from a template",
+        "description": "The template's rules are checked after the request's parameters are substituted, and its channel ids are checked against the caller's channels, before anything is written. The monitor, its rules and its channel links are then created in one transaction, so a monitor that exists has every rule it was supposed to have.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2078,6 +2079,9 @@
           },
           "404": {
             "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
           }
         }
       }
@@ -2090,6 +2094,7 @@
       ],
       "post": {
         "summary": "Bulk create monitors from a template",
+        "description": "Every instance is validated before any of them is written, so a request with one bad instance creates nothing. Each instance is then written in its own transaction, so an instance is never half written. The request as a whole is not one transaction: if an instance fails, the ones before it stay and the response names the instance that failed.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2145,6 +2150,9 @@
           },
           "404": {
             "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
           }
         }
       }
@@ -2433,6 +2441,16 @@
       },
       "Error": {
         "description": "Error envelope",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "The request was understood but cannot be turned into a valid result. The details array lists every problem, keyed by the field, the rule index or the parameter it belongs to, so a caller can see all of them at once.",
         "content": {
           "application/json": {
             "schema": {
