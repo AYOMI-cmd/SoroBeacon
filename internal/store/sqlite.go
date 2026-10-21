@@ -641,6 +641,49 @@ func (s *SQLite) deleteByID(ctx context.Context, table string, id int64) error {
 	return nil
 }
 
+// CreateMonitorWithRules creates a monitor, its rules and its channel
+// attachments in one transaction. The three land together or not at all: a
+// monitor whose rules went missing is a monitor that watches a contract and
+// never says anything, and nothing outside this call would report the gap.
+func (s *SQLite) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules []*Rule, channelIDs []int64) error {
+	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	ids, err := json.Marshal(m.ContractIDs)
+	if err != nil {
+		return err
+	}
+	var created string
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+		 RETURNING id, created_at`,
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), ws, m.Network, sqliteCreatedAt(m.CreatedAt),
+	).Scan(&m.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if m.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return err
+	}
+	for _, r := range rules {
+		r.MonitorID = m.ID
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
+			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
+		).Scan(&r.ID); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	if err := s.setMonitorChannels(ctx, tx, m.ID, channelIDs, ws); err != nil {
+		return err
+	}
+	return mapSQLiteErr(tx.Commit())
+}
+
 // SetMonitorChannels replaces one monitor's notification targets. Both sides
 // must belong to the caller's workspace: the monitor check is what stops one
 // tenant re-pointing another's monitor, and the channel check is what stops a
@@ -654,6 +697,16 @@ func (s *SQLite) SetMonitorChannels(ctx context.Context, monitorID int64, channe
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
+	if err := s.setMonitorChannels(ctx, tx, monitorID, channelIDs, ws); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// setMonitorChannels replaces one monitor's notification targets inside an
+// open transaction, so a caller that is already writing a monitor does not
+// have to open a second one.
+func (s *SQLite) setMonitorChannels(ctx context.Context, tx *sql.Tx, monitorID int64, channelIDs []int64, ws workspace.ID) error {
 	if err := s.requireMonitorWorkspace(ctx, tx, monitorID, ws); err != nil {
 		return err
 	}
@@ -688,7 +741,7 @@ func (s *SQLite) SetMonitorChannels(ctx context.Context, monitorID int64, channe
 			return mapSQLiteErr(err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, error) {

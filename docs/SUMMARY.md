@@ -44,6 +44,7 @@
 * [ntfy](channels/ntfy.md)
 * [Email (SMTP)](channels/email.md)
 * [Generic webhook](channels/webhook.md)
+* [Federation](channels/federation.md)
 * [Matrix](channels/matrix.md)
 * [PagerDuty](channels/pagerduty.md)
 * [Mattermost](channels/mattermost.md)

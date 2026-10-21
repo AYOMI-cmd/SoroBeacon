@@ -106,6 +106,53 @@ curl -s -X PATCH localhost:8080/api/v1/monitors/1 -d '{"enabled": false}'
 
 Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md), [`token_event`](../rules/token-event.md), [`self_transfer`](../rules/self-transfer.md), [`time_window`](../rules/time-window.md), [`absence_of_event`](../rules/absence-of-event.md). Invalid params are rejected with `400` at create/update time.
 
+## Monitor templates
+
+A template is a reusable monitor shape: a name, a list of rules whose params may
+hold `{{parameter}}` placeholders, the channels to attach, and the parameters
+the placeholders take.
+
+| Method & path | Description |
+| --- | --- |
+| `POST /templates` | Create. Body: `name`, optional `description`, `rules`, `channel_ids`, `parameters`. |
+| `GET /templates` / `GET /templates/{id}` | List / get. |
+| `PATCH /templates/{id}` | Partial update; the rules are re-validated. |
+| `DELETE /templates/{id}` | Delete. Monitors already created from it are unaffected. |
+| `POST /templates/{id}/instantiate` | Create one monitor from the template. |
+| `POST /templates/{id}/instantiate/bulk` | Create up to 100 monitors from the template. |
+
+A template is checked when it is written: every rule's type must be one the
+instance knows, and the parts of a rule's params that do not depend on
+substitution are validated. A `400` names the rule by index
+(`rules[0].type`, `rules[0].params.comparison`).
+
+Instantiation is checked before anything is written, and the monitor, its
+rules and its channel links are then created in **one transaction**: a monitor
+that exists has every rule it was supposed to have. A problem with the
+template, the parameters or the channel ids is a `422`, and the `details`
+array names each one:
+
+* `rules[1].params.threshold` — a rule whose params do not validate once the
+  parameters are substituted;
+* `parameters.amount` — a required parameter with no value, a parameter the
+  request names that the template does not declare, or a placeholder the
+  template uses that it does not declare;
+* `channel_ids[0]` — a channel that does not exist in the caller's workspace.
+
+The bulk endpoint validates every instance before it writes any of them, so a
+request with one bad instance creates nothing. Each instance is then written
+in its own transaction, so an instance is never half written; the request as a
+whole is not one transaction, and a failure part-way through leaves the
+instances already created in place and names the instance that failed.
+
+```sh
+curl -s -X POST localhost:8080/api/v1/templates/1/instantiate -d '{
+  "name": "My token",
+  "contract_ids": ["CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"],
+  "parameters": {"threshold": "1000"}
+}'
+```
+
 ## Channels
 
 | Method & path | Description |

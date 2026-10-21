@@ -900,32 +900,44 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
+	data, err := s.monitorPage(r, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.notFound(w, r)
+			return
+		}
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "monitor", data)
+}
+
+// monitorPage assembles the monitor detail page's data. The rule builder
+// re-renders this same page when it rejects a malformed form, so the two
+// share one assembly: a page that has to show the monitor's rules must not
+// be built in two places that can drift apart.
+func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) {
 	m, err := s.store.GetMonitor(r.Context(), id)
 	if err != nil {
-		s.notFound(w, r)
-		return
+		return nil, err
 	}
 	ruleList, err := s.store.ListRules(r.Context(), id, false)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	channels, err := s.store.ListChannels(r.Context(), false)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	recent, err := s.store.ListAlerts(r.Context(), store.AlertFilter{
 		MonitorID: id, Limit: recentAlertsPanelSize,
 	})
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	stats, err := s.store.GetMonitorStats(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	attached := map[int64]bool{}
 	for _, cid := range m.ChannelIDs {
@@ -936,7 +948,7 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 	// monitorRow the list pages use. Two readings of "when did this fire" on
 	// one page would be the disagreement the issue asks not to create.
 	row := s.monitorRow(*m, tz, time.Now())
-	s.render(w, r, "monitor", map[string]any{
+	return map[string]any{
 		"Title": m.Name, "Monitor": row, "Rules": ruleList,
 		"Channels": channels, "Attached": attached, "RuleTypes": s.registry.Types(),
 		"RecentAlerts": recent,
@@ -945,7 +957,14 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		"AlertsHref": template.URL("/alerts?monitor_id=" + strconv.FormatInt(id, 10)),
 		"Stats":      stats,
 		"LastAlert":  formatStatTime(stats.LastAlertAt, tz),
-	})
+		// The rule builder's own state. The page is also rendered after the
+		// builder rejects a malformed form, which fills these in with what
+		// the user typed; the defaults are the empty form.
+		"BuilderType":      "",
+		"BuilderFields":    "",
+		"BuilderRawParams": defaultBuilderParams,
+		"BuilderErrors":    []string{},
+	}, nil
 }
 
 // formatStatTime renders the nullable most-recent-alert timestamp from

@@ -51,6 +51,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ListMonitorsPageSearchFilterSort", func(t *testing.T) { testListMonitorsPage(t, newStore) })
 	t.Run("RuleCRUDAndCascade", func(t *testing.T) { testRuleCRUD(t, newStore) })
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
+	t.Run("CreateMonitorWithRulesIsAtomic", func(t *testing.T) { testCreateMonitorWithRules(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
 	t.Run("ListChannelsByIDs", func(t *testing.T) { testListChannelsByIDs(t, newStore) })
 	t.Run("ListChannelsTypeAndEnabledFilters", func(t *testing.T) { testListChannelsFilters(t, newStore) })
@@ -531,6 +532,51 @@ func testCreateRulesAtomic(t *testing.T, newStore conformanceFactory) {
 	list, err = st.ListRules(ctx, m.ID, false)
 	require.NoError(t, err)
 	require.Len(t, list, 2, "failed batch must not insert a prefix of the rules")
+}
+
+// testCreateMonitorWithRules covers the write a template instantiation
+// needs: a monitor, its rules and its channel attachments land together. A
+// failure in any part of it must leave nothing behind — a monitor without
+// its rules is a monitor that watches a contract and never says anything.
+func testCreateMonitorWithRules(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	ch := &Channel{Name: "c1", Type: "webhook", Config: json.RawMessage(`{"url":"u","secret":"s"}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+
+	m := &Monitor{Name: "from template", ContractIDs: []string{"C1", "C2"}, Enabled: true}
+	rules := []*Rule{
+		{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`), Enabled: true},
+		{Type: "token_event", Params: json.RawMessage(`{"event":"mint"}`), Enabled: true},
+	}
+	require.NoError(t, st.CreateMonitorWithRules(ctx, m, rules, []int64{ch.ID}))
+	require.NotZero(t, m.ID)
+	require.NotZero(t, rules[0].ID)
+
+	got, err := st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"C1", "C2"}, got.ContractIDs)
+	assert.Equal(t, []int64{ch.ID}, got.ChannelIDs)
+
+	list, err := st.ListRules(ctx, m.ID, false)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "event_emitted", list[0].Type)
+	assert.Equal(t, "token_event", list[1].Type)
+
+	// A channel that does not exist fails the whole call, and the monitor
+	// that was created alongside it is not left in the table.
+	bad := &Monitor{Name: "half written", ContractIDs: []string{"C3"}, Enabled: true}
+	badRules := []*Rule{{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"burn"}`), Enabled: true}}
+	err = st.CreateMonitorWithRules(ctx, bad, badRules, []int64{ch.ID + 999})
+	require.Error(t, err)
+
+	monitors, err := st.ListMonitors(ctx, false)
+	require.NoError(t, err)
+	require.Len(t, monitors, 1, "a failed write must not leave a monitor behind")
+	_, err = st.GetMonitor(ctx, bad.ID)
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func testChannelsAndAttachments(t *testing.T, newStore conformanceFactory) {

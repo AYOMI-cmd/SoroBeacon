@@ -666,6 +666,47 @@ func (p *Postgres) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, er
 	return &copy, nil
 }
 
+// CreateMonitorWithRules creates a monitor, its rules and its channel
+// attachments in one transaction. The three land together or not at all: a
+// monitor whose rules went missing is a monitor that watches a contract and
+// never says anything, and nothing outside this call would report the gap.
+func (p *Postgres) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules []*Rule, channelIDs []int64) error {
+	ws := workspaceID(ctx)
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if err := lockContractCursorRefs(ctx, tx); err != nil {
+		return err
+	}
+	ids, err := json.Marshal(m.ContractIDs)
+	if err != nil {
+		return err
+	}
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+		 RETURNING id, created_at`,
+		m.Name, ids, m.Enabled, m.Priority.Normalized(), ws, m.Network, pgCreatedAt(m.CreatedAt),
+	).Scan(&m.ID, &m.CreatedAt); err != nil {
+		return err
+	}
+	for _, r := range rules {
+		r.MonitorID = m.ID
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES ($1, $2, $3, $4) RETURNING id`,
+			r.MonitorID, r.Type, jsonOrEmpty(r.Params), r.Enabled,
+		).Scan(&r.ID); err != nil {
+			return mapErr(err)
+		}
+	}
+	if err := p.setMonitorChannels(ctx, tx, m.ID, channelIDs, ws); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (p *Postgres) SetMonitorChannels(ctx context.Context, monitorID int64, channelIDs []int64) error {
 	ws := workspaceID(ctx)
 	tx, err := p.pool.Begin(ctx)
@@ -674,10 +715,21 @@ func (p *Postgres) SetMonitorChannels(ctx context.Context, monitorID int64, chan
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
-	// Both sides must belong to the caller's workspace: the monitor check is
-	// what stops one tenant re-pointing another's monitor, and the channel check
-	// is what stops a tenant attaching a channel it cannot see, which would
-	// route this workspace's alerts to a webhook owned by someone else.
+	if err := p.setMonitorChannels(ctx, tx, monitorID, channelIDs, ws); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// setMonitorChannels replaces one monitor's notification targets inside an
+// open transaction, so a caller that is already writing a monitor does not
+// have to open a second one.
+//
+// Both sides must belong to the caller's workspace: the monitor check is
+// what stops one tenant re-pointing another's monitor, and the channel check
+// is what stops a tenant attaching a channel it cannot see, which would
+// route this workspace's alerts to a webhook owned by someone else.
+func (p *Postgres) setMonitorChannels(ctx context.Context, tx pgx.Tx, monitorID int64, channelIDs []int64, ws workspace.ID) error {
 	if err := p.requireMonitorWorkspace(ctx, tx, monitorID, ws); err != nil {
 		return err
 	}
@@ -706,7 +758,7 @@ func (p *Postgres) SetMonitorChannels(ctx context.Context, monitorID int64, chan
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 type rowScanner interface{ Scan(dest ...any) error }
