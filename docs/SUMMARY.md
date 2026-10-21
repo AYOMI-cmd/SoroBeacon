@@ -27,6 +27,7 @@
 * [value_threshold](rules/value-threshold.md)
 * [numeric_range](rules/numeric-range.md)
 * [token_event](rules/token-event.md)
+* [token_supply_change](rules/token-supply-change.md)
 * [frequency_threshold](rules/frequency-threshold.md)
 * [event_name_glob](rules/event-name-glob.md)
 * [contract_allowlist](rules/contract-allowlist.md)

@@ -29,6 +29,7 @@ var pagesAddedHere = []string{
 	"docs/rules/numeric-range.md",
 	"docs/rules/contract-allowlist.md",
 	"docs/rules/event-name-glob.md",
+	"docs/rules/token-supply-change.md",
 	"docs/operations/backup-restore.md",
 	"docs/channels/email.md",
 	"docs/channels/federation.md",
