@@ -68,6 +68,8 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 
 **What this does:** Alert on any `transfer` event where the amount is >= 1,000,000
 stroops (≈ 0.1 XLM, since XLM has 7 decimal places). Adjust `min_amount` up
+
+**Alternative for supply changes:** Use the `token_supply_change` rule to monitor any mint or burn event (and optionally filter by `min_amount`). The `direction` field in the alert payload will indicate whether it was a mint or burn.
 or down to match your threshold.
 
 ## Step 4: Create a delivery channel
