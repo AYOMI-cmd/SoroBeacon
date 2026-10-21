@@ -31,6 +31,7 @@ var pagesAddedHere = []string{
 	"docs/rules/event-name-glob.md",
 	"docs/rules/token-supply-change.md",
 	"docs/operations/backup-restore.md",
+	"docs/operations/retention.md",
 	"docs/channels/email.md",
 	"docs/channels/federation.md",
 }
