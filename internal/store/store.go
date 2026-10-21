@@ -153,6 +153,11 @@ type Monitor struct {
 	// instance's primary network at startup; a newly created monitor always
 	// carries the network it was created for.
 	Network string `json:"network"`
+	// DeletedAt is set when the monitor is soft-deleted. Nil means active.
+	// A soft-deleted monitor stops alerting immediately but can be restored
+	// within the restore window. When set, the monitor is excluded from
+	// evaluation and regular listings.
+	DeletedAt *time.Time `json:"deleted_at,omitempty"`
 }
 
 // Rule is one condition evaluated against every event of its monitor's
@@ -534,6 +539,15 @@ type IngestState struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+// ContractCursor is the inclusive ledger boundary durably processed for one
+// contract. Events within that ledger are replayed together after a crash.
+type ContractCursor struct {
+	Network    string    `json:"network"`
+	ContractID string    `json:"contract_id"`
+	LastLedger uint32    `json:"last_ledger"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
 // Backfill is the persisted progress of a historical replay for one monitor.
 // A monitor has at most one row: an interrupted run resumes from
 // NextLedger/Cursor instead of starting over. Complete marks a finished run,
@@ -840,6 +854,17 @@ type Monitors interface {
 	ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error)
 	UpdateMonitor(ctx context.Context, m *Monitor) error
 	DeleteMonitor(ctx context.Context, id int64) error
+	// SoftDeleteMonitor marks a monitor as deleted without removing it.
+	// The monitor stops alerting immediately but can be restored within
+	// the restore window.
+	SoftDeleteMonitor(ctx context.Context, id int64) error
+	// RestoreMonitor restores a soft-deleted monitor. Returns ErrNotFound
+	// if the monitor doesn't exist or isn't deleted.
+	RestoreMonitor(ctx context.Context, id int64) error
+	// ListDeletedMonitors returns soft-deleted monitors (the "trash").
+	ListDeletedMonitors(ctx context.Context, f ListFilter) ([]Monitor, error)
+	// HardDeleteMonitor permanently removes a monitor and its rules/attachments.
+	HardDeleteMonitor(ctx context.Context, id int64) error
 	SetMonitorChannels(ctx context.Context, monitorID int64, channelIDs []int64) error
 	// SetMonitorsEnabled sets enabled on every existing id in one statement.
 	// Unknown IDs are returned rather than treated as an error so a mixed
@@ -998,6 +1023,19 @@ type MaintenanceWindows interface {
 type Ingest interface {
 	GetIngestState(ctx context.Context, network string) (IngestState, error)
 	SetIngestState(ctx context.Context, network string, s IngestState) error
+}
+
+// ContractIngest persists independently advancing contract ledger boundaries.
+type ContractIngest interface {
+	ListContractCursors(ctx context.Context, network string) ([]ContractCursor, error)
+	// InitializeContractCursor inserts the baseline only when absent; a cursor
+	// created by another poller is never reset to an older starting position.
+	InitializeContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error
+	// AdvanceContractCursor moves a watched contract forward and ignores stale
+	// writes. An unreferenced contract is not recreated after monitor cleanup.
+	AdvanceContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error
+	// RewindContractCursors is reserved for a detected chain reorganisation.
+	RewindContractCursors(ctx context.Context, network string, lastLedger uint32) error
 }
 
 // Absence persists the last-seen clocks that absence-of-event rules measure
@@ -1262,6 +1300,7 @@ type Store interface {
 	DeadLetters
 	Inhibitions
 	Ingest
+	ContractIngest
 	Absence
 	Backfills
 	Ledgers

@@ -361,9 +361,12 @@ func (s *Server) Routes() chi.Router {
 	r.Get("/monitors", s.monitors)
 	r.Post("/monitors", s.createMonitor)
 	r.Post("/monitors/bulk", s.bulkMonitors)
+	r.Get("/monitors/trash", s.listTrash)
 	r.Get("/monitors/{id}", s.monitorDetail)
 	r.Post("/monitors/{id}/toggle", s.toggleMonitor)
 	r.Post("/monitors/{id}/delete", s.deleteMonitor)
+	r.Post("/monitors/{id}/soft-delete", s.deleteMonitor) // alias for soft-delete
+	r.Post("/monitors/{id}/restore", s.restoreMonitor)
 	r.Post("/monitors/{id}/duplicate", s.duplicateMonitor)
 	r.Post("/monitors/{id}/rules", s.createRuleFromBuilder)
 	r.Post("/monitors/{id}/rules/{ruleID}/toggle", s.toggleRule)
@@ -1034,12 +1037,94 @@ func (s *Server) deleteMonitor(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err := s.store.DeleteMonitor(r.Context(), id); err != nil {
+	if err := s.store.SoftDeleteMonitor(r.Context(), id); err != nil {
 		s.fail(w, err)
 		return
 	}
 	s.audit(r, store.AuditActionDelete, "monitor", id)
 	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
+}
+
+func (s *Server) restoreMonitor(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.store.RestoreMonitor(r.Context(), id); err != nil {
+		s.fail(w, err)
+		return
+	}
+	s.audit(r, store.AuditActionUpdate, "monitor", id, "restored")
+	http.Redirect(w, r, "/monitors", http.StatusSeeOther)
+}
+
+func (s *Server) listTrash(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := store.ListFilter{Limit: 50, Query: strings.TrimSpace(q.Get("q"))}
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
+	switch q.Get("enabled") {
+	case "true":
+		t := true
+		f.Enabled = &t
+		f.EnabledOnly = true
+	case "false":
+		t := false
+		f.Enabled = &t
+	}
+	switch q.Get("sort") {
+	case "id", "created_at", "name":
+		f.Sort = q.Get("sort")
+	}
+	if v := q.Get("cursor"); v != "" {
+		f.AfterID, _ = strconv.ParseInt(v, 10, 64)
+	}
+	monitors, err := s.store.ListDeletedMonitors(r.Context(), f)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	next := ""
+	if len(monitors) == f.Limit {
+		next = strconv.FormatInt(monitors[len(monitors)-1].ID, 10)
+	}
+	enabled := q.Get("enabled")
+	sort := f.Sort
+	if sort == "" {
+		sort = "name"
+	}
+	data := map[string]any{
+		"Title":      "Trash",
+		"Monitors":   s.monitorRows(monitors, tzFromRequest(r), time.Now()),
+		"NextCursor": next,
+		"Query":      f.Query,
+		"Enabled":    enabled,
+		"Sort":       sort,
+		"Network":    f.Network,
+		"Networks":   s.networkNames,
+	}
+	if next != "" {
+		v := url.Values{}
+		if f.Query != "" {
+			v.Set("q", f.Query)
+		}
+		if f.Network != "" {
+			v.Set("network", f.Network)
+		}
+		if enabled == "true" || enabled == "false" {
+			v.Set("enabled", enabled)
+		}
+		if sort != "" && sort != "name" {
+			v.Set("sort", sort)
+		}
+		enc := v.Encode()
+		if enc != "" {
+			data["OlderHref"] = template.URL("/monitors/trash?" + enc + "cursor=" + next)
+		} else {
+			data["OlderHref"] = template.URL("/monitors/trash?cursor=" + next)
+		}
+	}
+	s.render(w, r, "trash", data)
 }
 
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {

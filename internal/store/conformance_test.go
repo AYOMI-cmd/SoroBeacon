@@ -63,6 +63,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("DeleteExpiredAlertsKeepsRecentAndCascades", func(t *testing.T) { testDeleteExpiredAlertsCascade(t, newStore) })
 	t.Run("DeleteExpiredAlertsBatches", func(t *testing.T) { testDeleteExpiredAlertsBatches(t, newStore) })
 	t.Run("IngestStateRoundTrip", func(t *testing.T) { testIngestState(t, newStore) })
+	t.Run("ContractIngestCursors", func(t *testing.T) { testContractIngestCursors(t, newStore) })
 	t.Run("AbsenceStateRoundTrip", func(t *testing.T) { testAbsenceState(t, newStore) })
 	t.Run("GetStats", func(t *testing.T) { testGetStats(t, newStore) })
 	t.Run("GetMonitorStats", func(t *testing.T) { testGetMonitorStats(t, newStore) })
@@ -343,11 +344,11 @@ func testKeysetPagination(t *testing.T, newStore conformanceFactory) {
 	// Seven monitors, newest last by id. Mix enabled so the enabled-only
 	// filter has something to compose with the cursor.
 	for i := 0; i < 7; i++ {
-		m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: i%2 == 0}
+		m := &Monitor{Name: fmt.Sprintf("m%d", i), ContractIDs: []string{"C"}, Enabled: i%2 == 0}
 		require.NoError(t, st.CreateMonitor(ctx, m))
 	}
 	for i := 0; i < 7; i++ {
-		c := &Channel{Name: "c", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: i%2 == 0}
+		c := &Channel{Name: fmt.Sprintf("c%d", i), Type: "webhook", Config: json.RawMessage(`{}`), Enabled: i%2 == 0}
 		require.NoError(t, st.CreateChannel(ctx, c))
 	}
 
@@ -1144,6 +1145,58 @@ func testIngestState(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, err)
 	assert.Equal(t, uint32(123456), got.LastLedger)
 	assert.Equal(t, "0000001-0000000", got.LastCursor)
+}
+
+func testContractIngestCursors(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+	first := &Monitor{Name: "first", ContractIDs: []string{"CA", "CB"}, Enabled: true, Network: "testnet"}
+	second := &Monitor{Name: "second", ContractIDs: []string{"CB"}, Enabled: false, Network: "testnet"}
+	require.NoError(t, st.CreateMonitor(ctx, first))
+	require.NoError(t, st.CreateMonitor(ctx, second))
+
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CA", 100))
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CB", 100))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "testnet", "CA", 120))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "testnet", "CB", 130))
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CA", 5))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "testnet", "CA", 110))
+
+	cursors, err := st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	require.Len(t, cursors, 2)
+	assert.Equal(t, uint32(120), cursors[0].LastLedger)
+	assert.Equal(t, uint32(130), cursors[1].LastLedger)
+	require.NoError(t, st.RewindContractCursors(ctx, "testnet", 115))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Equal(t, uint32(115), cursors[0].LastLedger)
+	assert.Equal(t, uint32(115), cursors[1].LastLedger)
+
+	first.ContractIDs = []string{"CA"}
+	require.NoError(t, st.UpdateMonitor(ctx, first))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Len(t, cursors, 2, "a disabled monitor still retains its referenced contract cursor")
+
+	require.NoError(t, st.DeleteMonitor(ctx, second.ID))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	require.Len(t, cursors, 1)
+	assert.Equal(t, "CA", cursors[0].ContractID)
+
+	require.NoError(t, st.DeleteMonitor(ctx, first.ID))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Empty(t, cursors, "the final monitor reference removes its cursor")
+
+	readded := &Monitor{Name: "readded", ContractIDs: []string{"CA"}, Enabled: true, Network: "testnet"}
+	require.NoError(t, st.CreateMonitor(ctx, readded))
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CA", 140))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	require.Len(t, cursors, 1)
+	assert.Equal(t, uint32(140), cursors[0].LastLedger, "re-add uses the new global fallback baseline")
 }
 
 func testGetStats(t *testing.T, newStore conformanceFactory) {

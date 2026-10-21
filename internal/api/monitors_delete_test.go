@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -35,10 +34,10 @@ func seedMonitorWithRule(t *testing.T, st store.Store) (*store.Monitor, *store.R
 	return m, r
 }
 
-// TestDeleteMonitorCascadesAndAudits covers the happy path over the real
-// router and a real store: 204 on success, then nothing left — the
-// id-addressed read answers 404 and the monitor's rules went with it — and
-// exactly one audit row saying what was deleted and who deleted it.
+// TestDeleteMonitorCascadesAndAudits covers the soft-delete path over the real
+// router and a real store: 204 on success, the monitor is marked as deleted
+// (but not removed), its rules remain, and exactly one audit row saying what
+// was deleted and who deleted it.
 func TestDeleteMonitorCascadesAndAudits(t *testing.T) {
 	srv, st, _ := sqliteAPI(t)
 	m, rule := seedMonitorWithRule(t, st)
@@ -50,20 +49,32 @@ func TestDeleteMonitorCascadesAndAudits(t *testing.T) {
 		t.Fatalf("DELETE = %d, want 204", res.StatusCode)
 	}
 
+	// After soft-delete, the monitor still exists but is marked as deleted.
+	// It is excluded from normal listings but can be retrieved by ID.
 	gone, _ := do(t, http.MethodGet, item, "", nil)
-	if gone.StatusCode != http.StatusNotFound {
-		t.Fatalf("GET after delete = %d, want 404", gone.StatusCode)
+	if gone.StatusCode != http.StatusOK {
+		t.Fatalf("GET after soft-delete = %d, want 200", gone.StatusCode)
 	}
 
-	if _, err := st.GetRule(ctx, rule.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("rule after delete: err = %v, want ErrNotFound", err)
+	// The rule is NOT deleted on soft-delete; it comes back on restore.
+	if _, err := st.GetRule(ctx, rule.ID); err != nil {
+		t.Fatalf("rule after soft-delete: err = %v, want nil", err)
 	}
 	rules, err := st.ListRules(ctx, m.ID, false)
 	if err != nil {
 		t.Fatalf("list rules: %v", err)
 	}
-	if len(rules) != 0 {
-		t.Fatalf("monitor still has %d rules after delete", len(rules))
+	if len(rules) != 1 {
+		t.Fatalf("monitor still has %d rules after soft-delete, want 1", len(rules))
+	}
+
+	// The monitor should have DeletedAt set.
+	mAfter, err := st.GetMonitor(ctx, m.ID)
+	if err != nil {
+		t.Fatalf("get monitor after soft-delete: %v", err)
+	}
+	if mAfter.DeletedAt == nil {
+		t.Fatal("monitor DeletedAt should be set after soft-delete")
 	}
 
 	entries, err := st.ListAuditEntries(ctx, store.AuditFilter{
@@ -89,10 +100,11 @@ func TestDeleteMonitorCascadesAndAudits(t *testing.T) {
 // changes that happened, and a phantom delete entry would send an operator
 // hunting for a removal that never occurred.
 func TestDeleteMonitorUnknownID(t *testing.T) {
-	srv, st, _ := sqliteAPI(t)
+	srv, st, logBuf := sqliteAPI(t)
 
 	res, _ := do(t, http.MethodDelete, srv.URL+"/monitors/999999", "", nil)
 	if res.StatusCode != http.StatusNotFound {
+		t.Logf("Log output: %s", logBuf.String())
 		t.Fatalf("DELETE unknown id = %d, want 404", res.StatusCode)
 	}
 
