@@ -147,7 +147,10 @@ given keys"; add the companion timestamp and a composite foreign key.
 
 `alert_dedup` is separate because `(rule_id, event_id)` must stay globally
 unique and cannot include the partition key. Retention clears a deleted alert's
-dedup key with the alert, so the key cannot block that event forever.
+dedup key with the alert, so the key cannot block that event forever. A
+federated alert — one another instance forwarded — has no local rule, so its
+key is `(federation_origin, event_id)` instead, and the table carries both
+keys as partial unique indexes.
 
 ## Backups and archiving
 

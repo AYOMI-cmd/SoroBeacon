@@ -124,6 +124,7 @@ OIDC_SCOPES: {{ .Values.oidc.scopes | quote }}
 OIDC_ALLOWED_DOMAINS: {{ .Values.oidc.allowedDomains | quote }}
 OIDC_WORKSPACE: {{ .Values.oidc.workspace | quote }}
 OIDC_WORKSPACE_CLAIM: {{ .Values.oidc.workspaceClaim | quote }}
+OIDC_ROLE_CLAIM: {{ .Values.oidc.roleClaim | quote }}
 OIDC_LOGIN_STATE_TTL: {{ .Values.oidc.loginStateTTL | quote }}
 RATE_LIMIT_RPS: {{ .Values.config.rateLimitRps | quote }}
 RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | int64 | quote }}

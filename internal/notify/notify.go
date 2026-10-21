@@ -66,6 +66,11 @@ type Alert struct {
 	// ledger, no transaction and no matching event — reporting those as empty
 	// fields reads like a broken alert rather than a contract gone quiet.
 	Silence time.Duration `json:"silence,omitempty"`
+	// FederationOrigin names the instance an alert was forwarded from. It is
+	// empty for a local alert, and it is what tells a forwarded alert apart
+	// from a local one in the channels that key on the alert's identity: a
+	// forwarded alert has no local rule id to key on.
+	FederationOrigin string `json:"federation_origin,omitempty"`
 }
 
 // Notifier sends one alert to one destination. Implementations should
