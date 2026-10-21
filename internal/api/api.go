@@ -446,6 +446,18 @@ func writeValidation(w http.ResponseWriter, r *http.Request, details []FieldErro
 	writeErr(w, r, http.StatusBadRequest, msg, details...)
 }
 
+// writeUnprocessable reports problems that make a well-formed request
+// impossible to satisfy: the request was understood, and what it carries
+// cannot be turned into a valid result. The details list every problem,
+// keyed by the field, rule index or parameter it belongs to, so a caller can
+// see all of them at once instead of fixing one per round trip.
+func writeUnprocessable(w http.ResponseWriter, r *http.Request, details []FieldError) {
+	if len(details) == 0 {
+		return
+	}
+	writeErr(w, r, http.StatusUnprocessableEntity, "validation failed", details...)
+}
+
 // detailsFromErr turns a Validate / constructor error into envelope
 // details. FieldErrors from the rules registry keep their paths, prefixed
 // so nested params show up as params.min_amount rather than a flattened
