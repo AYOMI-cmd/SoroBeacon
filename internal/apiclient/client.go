@@ -111,6 +111,7 @@ type Channel struct {
 	Type      string    `json:"type"`
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
+	Timeout   int       `json:"timeout,omitempty"`
 }
 
 // MonitorCreate is the body of POST /monitors.
@@ -145,6 +146,7 @@ type ChannelCreate struct {
 	Type    string          `json:"type"`
 	Config  json.RawMessage `json:"config,omitempty"`
 	Enabled *bool           `json:"enabled,omitempty"`
+	Timeout *int            `json:"timeout,omitempty"`
 }
 
 // ListOptions filters a listing request. The zero value lists everything the

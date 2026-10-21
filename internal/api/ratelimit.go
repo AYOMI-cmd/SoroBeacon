@@ -86,6 +86,17 @@ func (l *RateLimiter) sweepLocked(now time.Time) {
 	}
 }
 
+func isProbePath(path string) bool {
+	switch {
+	case strings.HasSuffix(path, "/health") ||
+		strings.HasSuffix(path, "/livez") ||
+		strings.HasSuffix(path, "/readyz"):
+		return true
+	default:
+		return false
+	}
+}
+
 func clientKey(r *http.Request, trustForwarded bool) string {
 	if trustForwarded {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {

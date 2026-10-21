@@ -15,6 +15,11 @@ explains what actually happens, straight from the code.
 | "Did a number in the event's data cross a threshold?" | [`value_threshold`](../rules/value-threshold.md) |
 | "Did a SEP-41 token do something (transfer/mint/burn/…, optionally to/from/amount)?" | [`token_event`](../rules/token-event.md) |
 | "Is it happening *too often*?" | [`frequency_threshold`](../rules/frequency-threshold.md) |
+| "Did any event in a *family* happen (a pattern, not one exact name)?" | [`topic_regex`](../rules/topic-regex.md) |
+| "Did an event whose *name* fits a glob happen (`swap_*`)?" | [`event_name_glob`](../rules/event-name-glob.md) |
+| "Does the topic at position N equal exactly this value (a pool ID, a market symbol)?" | [`topic_position`](../rules/topic-position.md) |
+| "Did any of *these addresses* move anything?" | [`address_watchlist`](../rules/address-watchlist.md) |
+| "Did this come from *this contract* (of the ones my monitor watches)?" | [`contract_allowlist`](../rules/contract-allowlist.md) |
 
 More precisely:
 
@@ -41,6 +46,31 @@ More precisely:
   event. It fires once per crossing, stays quiet one full window, and
   rebuilds its window from the alerts table after a restart — see its
   [reference page](../rules/frequency-threshold.md) for the re-arm details.
+* **`topic_regex` is for event families** and unknown topic conventions:
+  when a DEX emits `swap_exact_in`, `swap_exact_out`, `pool_deposit`, …, one
+  `^swap_`-style pattern covers the family instead of one `event_emitted`
+  rule per name. Patterns are unanchored RE2 matched against a topic's
+  string value; non-string topics never match. See its
+  [reference page](../rules/topic-regex.md).
+* **`address_watchlist` is for a set of addresses**: one rule replaces what
+  would otherwise be one `token_event` rule per address, watching the from
+  and/or to slot of any SEP-41 event against a list that can run to hundreds
+  of addresses. See its [reference page](../rules/address-watchlist.md).
+* **`event_name_glob` is for event families whose names carry the shape**:
+  `swap_*`, `pool_*`, `*_deposit`. It matches the event *name* only, with a
+  glob anchored at both ends — the counterpart to `topic_regex`, which
+  matches any topic with an unanchored regular expression. See its
+  [reference page](../rules/event-name-glob.md).
+* **`contract_allowlist` is for telling apart the contracts one monitor
+  watches**: a monitor can follow a whole protocol while a rule narrows it
+  to one contract, usually inside a `composite` AND-combined with a rule
+  that looks at the payload. See its
+  [reference page](../rules/contract-allowlist.md).
+* **`topic_position` is for custom contracts' positioned topics**: a pool
+  ID, market symbol or account at a known index, compared by exact equality
+  against the topic's decoded string form — the question neither
+  `event_emitted` (first topic only) nor `topic_regex` (fuzzy, unanchored)
+  asks directly. See its [reference page](../rules/topic-position.md).
 
 Any rule type can carry a `cooldown` — see [rule cooldown](../rules/cooldown.md).
 
@@ -198,4 +228,9 @@ here is the second user topic. Verified: `201`.
 * [`value_threshold`](../rules/value-threshold.md)
 * [`token_event`](../rules/token-event.md)
 * [`frequency_threshold`](../rules/frequency-threshold.md)
+* [`topic_regex`](../rules/topic-regex.md)
+* [`event_name_glob`](../rules/event-name-glob.md)
+* [`topic_position`](../rules/topic-position.md)
+* [`address_watchlist`](../rules/address-watchlist.md)
+* [`contract_allowlist`](../rules/contract-allowlist.md)
 * [`cooldown` (cross-cutting)](../rules/cooldown.md)

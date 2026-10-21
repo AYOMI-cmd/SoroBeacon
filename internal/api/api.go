@@ -15,7 +15,9 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/broadcast"
 	"github.com/sorotrail/sorobeacon/internal/buildinfo"
+	"github.com/sorotrail/sorobeacon/internal/lease"
 	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/poller"
 	"github.com/sorotrail/sorobeacon/internal/reqid"
@@ -38,29 +40,69 @@ type PositionReader interface {
 	Position() poller.Position
 }
 
+// NetworkStatusReader is the multi-network supervisor's per-chain view.
+// Optional, and supplied by the same object as PositionReader: an instance
+// that polls one network has nothing to break out.
+type NetworkStatusReader interface {
+	Statuses(ctx context.Context) []poller.NetworkStatus
+}
+
+// LeaderReader reports this instance's leader-election status. Only the
+// instance holding the lease polls, so /health exposes it: that is how an
+// operator tells a standby replica from one that has stopped working.
+type LeaderReader interface {
+	Status() lease.Status
+}
+
 // DefaultMaxBodyBytes is 1 MiB, matching config.DefaultHTTPMaxBodyBytes.
 // Used when New is not followed by WithMaxBodyBytes.
 const DefaultMaxBodyBytes int64 = 1 << 20
 
 type Server struct {
-	store              store.Store
-	registry           *rules.Registry
-	factory            *notify.Factory
-	rpc                HealthChecker
-	log                *slog.Logger
-	poller             PositionReader
+	store        store.Store
+	registry     *rules.Registry
+	factory      *notify.Factory
+	rpc          HealthChecker
+	log          *slog.Logger
+	poller       PositionReader
+	leader       LeaderReader
+	networkState NetworkStatusReader
+	// networkNames are the chains this instance polls, primary first, from
+	// NETWORKS/NETWORK. Empty (the New default, and every test that never
+	// calls WithNetworks) means no network may be named on a monitor, so
+	// monitors stay in the pre-multi-network '' state that single-poller
+	// deployments already use.
+	networkNames       []string
 	readyzLagThreshold uint32
 	rateLimit          RateLimitConfig
 	maxBodyBytes       int64
+	// broadcaster fans newly created alerts out to live SSE subscribers on
+	// GET /alerts/stream. main hands it the same instance the poller
+	// publishes into; the New default is an empty one so the endpoint works
+	// (and simply stays quiet) even when nothing drives it.
+	broadcaster *broadcast.Broadcaster
+	// streamHeartbeat is the SSE keep-alive interval, see stream.go.
+	streamHeartbeat time.Duration
 	// auth verifies bearer tokens and dashboard sessions. Nil (the New
 	// default until WithAuth is called, or when no API_TOKEN is set) means
 	// every request is allowed.
+	a    *auth.Authenticator
 	auth *auth.Authenticator
+	// tokens mints and resolves scoped API tokens. Nil leaves the /tokens
+	// endpoints off and only static credentials authenticating.
+	tokens *auth.Manager
+	roles  *auth.RoleEnforcer
 }
 
-// New wires an API server. Rate limiting stays off until WithRateLimit.
+// New wires an API server. Rate limiting stays off until WithRateLimit, and
+// live alerts stay quiet until WithBroadcaster shares the poller's fan-out.
 func New(st store.Store, reg *rules.Registry, f *notify.Factory, rpc HealthChecker, log *slog.Logger) *Server {
-	return &Server{store: st, registry: reg, factory: f, rpc: rpc, log: log, maxBodyBytes: DefaultMaxBodyBytes}
+	return &Server{
+		store: st, registry: reg, factory: f, rpc: rpc, log: log,
+		maxBodyBytes:    DefaultMaxBodyBytes,
+		broadcaster:     broadcast.New(broadcast.DefaultBuffer),
+		streamHeartbeat: defaultStreamHeartbeat,
+	}
 }
 
 // WithMaxBodyBytes sets the write-endpoint body limit applied by
@@ -74,8 +116,43 @@ func (s *Server) WithMaxBodyBytes(n int64) *Server {
 }
 
 // WithPoller attaches the ingest-position source used by /health and /readyz.
+// A poller that also reports per-network status — the multi-network
+// supervisor, which is the only thing that can — is wired for that in the
+// same call, so main does not have to know which shape it is holding.
 func (s *Server) WithPoller(p PositionReader) *Server {
 	s.poller = p
+	if ns, ok := p.(NetworkStatusReader); ok {
+		s.networkState = ns
+	}
+	return s
+}
+
+// WithNetworks declares the chains this instance polls, primary first, so
+// monitor writes can validate a requested network instead of accepting a name
+// nothing will ever ingest. Passing config.NetworkNames(cfg.Networks) is the
+// wire-up; an instance that polls one network still passes it, because "is
+// mainnet a legal network here?" is a question with a per-instance answer.
+func (s *Server) WithNetworks(names []string) *Server {
+	s.networkNames = names
+	return s
+}
+
+// defaultNetwork is the chain a monitor lands on when the request does not
+// name one: the primary, which is the only chain a single-network instance
+// polls. Empty when the server has no configured list, which leaves a monitor
+// unlabelled exactly as it was before networks existed.
+func (s *Server) defaultNetwork() string {
+	if len(s.networkNames) == 0 {
+		return ""
+	}
+	return s.networkNames[0]
+}
+
+// WithLeadership attaches the leader-election status reported by /health. Not
+// wiring it leaves the leadership fields out, exactly as an older deployment
+// behaved.
+func (s *Server) WithLeadership(r LeaderReader) *Server {
+	s.leader = r
 	return s
 }
 
@@ -99,8 +176,38 @@ func (s *Server) WithRateLimit(cfg RateLimitConfig) *Server {
 // open — the behaviour an unconfigured deployment had before authentication
 // existed. main builds one authenticator and shares it with the dashboard,
 // so a session minted at /login also satisfies this middleware.
+//
+// It also carries over a manager set earlier, because an authenticator that
+// does not know about the token table rejects every scoped token it is
+// offered: /tokens would mint credentials that cannot authenticate.
 func (s *Server) WithAuth(a *auth.Authenticator) *Server {
+	s.a = a
 	s.auth = a
+	if a != nil && s.tokens != nil {
+		a.WithTokens(s.tokens)
+	}
+	return s
+}
+
+// WithTokens enables scoped API tokens: the /tokens endpoints, and with them
+// the ability to hand out a credential that can create a monitor and nothing
+// else. The same *auth.Manager the dashboard is given, so both mint through
+// one set of rules about what a token may hold.
+//
+// The authenticator is told as well, in whichever order the two setters are
+// called: minting a token and then refusing to authenticate it is a broken
+// feature that looks like a wrong scope list.
+func (s *Server) WithTokens(m *auth.Manager) *Server {
+	s.tokens = m
+	if s.auth != nil {
+		s.auth.WithTokens(m)
+	}
+	return s
+}
+
+// WithRoles attaches role enforcement to the API router.
+func (s *Server) WithRoles(re *auth.RoleEnforcer) *Server {
+	s.roles = re
 	return s
 }
 
@@ -113,8 +220,12 @@ func (s *Server) WithAuth(a *auth.Authenticator) *Server {
 func (s *Server) Routes() chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
-	r.Use(AuthMiddleware(s.auth))
+	r.Use(AuthMiddleware(s.auth, s.log))
+	r.Use(auth.RoleMiddleware(s.roles, auth.RoleViewer))
 	r.Use(RateLimitMiddleware(s.rateLimit))
+	// Innermost, so only authenticated, rate-limited requests are audited
+	// and an audit failure never blocks the request.
+	r.Use(AuditMiddleware(s.store, s.log))
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
 	// 404/405. The dashboard mux is a different router and is untouched.
@@ -123,28 +234,55 @@ func (s *Server) Routes() chi.Router {
 
 	r.Route("/monitors", func(r chi.Router) {
 		r.Post("/", s.createMonitor)
-		r.Get("/", s.listMonitors)
+		r.With(conditionalGET).Get("/", s.listMonitors)
 		r.Post("/bulk", s.bulkMonitors)
+		r.Get("/trash", s.listDeletedMonitors)
 		r.Route("/{id}", func(r chi.Router) {
 			r.Get("/", s.getMonitor)
+			r.Get("/stats", s.monitorStats)
 			r.Patch("/", s.updateMonitor)
 			r.Delete("/", s.deleteMonitor)
+			r.Post("/soft-delete", s.softDeleteMonitor)
+			r.Post("/restore", s.restoreMonitor)
 			r.Post("/duplicate", s.duplicateMonitor)
+			r.Post("/rules/dry-run", s.dryRun)
 			r.Post("/rules", s.createRule)
 			r.Get("/rules", s.listRules)
 			r.Post("/rules/bulk", s.createRulesBulk)
 			r.Patch("/rules/{ruleID}", s.updateRule)
 			r.Delete("/rules/{ruleID}", s.deleteRule)
+			r.Get("/escalation", s.getMonitorEscalation)
+			r.Put("/escalation", s.putMonitorEscalation)
+			r.Delete("/escalation", s.deleteMonitorEscalation)
 		})
 	})
 
 	r.Route("/channels", func(r chi.Router) {
 		r.Post("/", s.createChannel)
-		r.Get("/", s.listChannels)
+		r.With(conditionalGET).Get("/", s.listChannels)
+		r.Post("/bulk", s.bulkChannels)
+		r.Post("/{id}/duplicate", s.duplicateChannel)
 		r.Get("/{id}", s.getChannel)
+		// Registered under the channel's own id rather than under /stats:
+		// the statistics are one channel's, not the instance's.
+		r.Get("/{id}/stats", s.channelStats)
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
+	})
+
+	r.Route("/maintenance-windows", func(r chi.Router) {
+		r.Post("/", s.createMaintenanceWindow)
+		r.Get("/", s.listMaintenanceWindows)
+		r.Get("/{id}", s.getMaintenanceWindow)
+		r.Patch("/{id}", s.updateMaintenanceWindow)
+		r.Delete("/{id}", s.deleteMaintenanceWindow)
+	})
+
+	r.Route("/inhibitions", func(r chi.Router) {
+		r.Post("/", s.createInhibition)
+		r.Get("/", s.listInhibitions)
+		r.Delete("/{sourceID}/{targetID}", s.deleteInhibition)
 	})
 
 	r.Route("/templates", func(r chi.Router) {
@@ -160,17 +298,34 @@ func (s *Server) Routes() chi.Router {
 	})
 
 	r.Post("/monitors/import", s.importContracts)
+	r.Post("/ingest", s.ingest)
+
+	r.Route("/tokens", func(r chi.Router) {
+		r.Post("/", s.createToken)
+		r.Get("/", s.listTokens)
+		r.Post("/{id}/revoke", s.revokeToken)
+	})
 
 	r.Get("/alerts", s.listAlerts)
+	// Registered before /alerts.csv and the /alerts/{id}/... routes for
+	// readability; chi matches the static segment either way.
+	r.Get("/alerts/stream", s.streamAlerts)
 	r.Get("/alerts.csv", s.exportAlertsCSV)
+	r.Get("/alerts/export", s.exportAlertsNDJSON)
 	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
 	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	r.Get("/dead-letters", s.listDeadLetters)
+	r.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
+	r.Post("/alerts/{id}/acknowledge", s.acknowledgeAlert)
 	r.Get("/health", s.health)
 	r.Get("/livez", s.livez)
 	r.Get("/readyz", s.readyz)
+	r.Get("/poller", s.pollerStatus)
 	r.Get("/version", s.version)
+	r.Get("/rule-types", s.listRuleTypes)
 	r.Get("/stats", s.stats)
 	r.Get("/stats/alerts-daily", s.alertsDaily)
+	r.Get("/audit", s.listAudit)
 
 	return r
 }
@@ -193,6 +348,9 @@ func parseListFilter(w http.ResponseWriter, r *http.Request) (store.ListFilter, 
 	}
 	f.Query = strings.TrimSpace(q.Get("q"))
 	f.Type = strings.TrimSpace(q.Get("type"))
+	// Network narrows a list to one chain. Unset means every network an
+	// instance polls, which is what a caller that predates multi-network sees.
+	f.Network = strings.ToLower(strings.TrimSpace(q.Get("network")))
 	if v := q.Get("sort"); v != "" {
 		switch v {
 		case "name", "id", "created_at":
@@ -407,8 +565,39 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out["rpc_latest_ledger"] = h.LatestLedger
 	}
+	// Per-network detail. `rpc` above is the primary chain's source only, so
+	// without this an instance polling mainnet and testnet would report
+	// itself healthy while one of the two is unreachable and silently
+	// missing alerts. A single-network instance has no supervisor and adds
+	// nothing — the `rpc` field already answers the question.
+	if s.networkState != nil {
+		statuses := s.networkState.Statuses(ctx)
+		out["networks"] = statuses
+		for _, ns := range statuses {
+			if ns.Source != "ok" {
+				out["status"], status = "degraded", http.StatusServiceUnavailable
+			}
+		}
+	}
 	s.attachPoller(out)
+	s.attachLeadership(out)
 	writeJSON(w, status, out)
+}
+
+// attachLeadership adds whether this instance holds the poller lease. A
+// follower is healthy — it serves the API and the dashboard normally — so this
+// only reports the role; it never changes the status code. Absent when no
+// lease is wired.
+func (s *Server) attachLeadership(out map[string]any) {
+	if s.leader == nil {
+		return
+	}
+	st := s.leader.Status()
+	out["leader"] = st.Leader
+	out["leader_election"] = st.Enabled
+	if st.Leader && !st.Since.IsZero() {
+		out["leader_since"] = st.Since.UTC().Format(time.RFC3339)
+	}
 }
 
 // attachPoller adds last processed / chain ledger / lag / last poll time

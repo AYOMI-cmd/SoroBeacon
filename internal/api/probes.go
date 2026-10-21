@@ -20,6 +20,26 @@ func (s *Server) livez(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "alive"})
 }
 
+// pollerStatus reports the last successful ingest position without exposing
+// the RPC or any other configuration held by the process.
+func (s *Server) pollerStatus(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"status": "waiting"}
+	if s.poller == nil {
+		writeJSON(w, http.StatusServiceUnavailable, out)
+		return
+	}
+	pos := s.poller.Position()
+	if pos.Ready() {
+		out["status"] = "ok"
+		out["last_processed_ledger"] = pos.LastProcessedLedger
+		out["latest_chain_ledger"] = pos.LatestChainLedger
+		out["ledger_lag"] = pos.Lag()
+		out["last_successful_poll"] = pos.LastSuccessfulPoll.UTC().Format(time.RFC3339)
+	}
+	out["backing_off"] = pos.BackingOff
+	writeJSON(w, http.StatusOK, out)
+}
+
 // readyz answers "can this instance do useful work right now". It checks
 // the two things every request path depends on — the database and the RPC
 // endpoint — concurrently and with per-dependency detail, so a failure
@@ -62,6 +82,27 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 		c.detail = "latest ledger " + strconv.FormatInt(int64(h.LatestLedger), 10)
 	}()
 	wg.Wait()
+
+	// Per-network detail, primary first. "rpc" above is only the primary
+	// chain's source, so on a multi-network instance it would read "healthy"
+	// while a second chain's node was unreachable and its alerts missing.
+	// Each network gets its own check, and the aggregate status below already
+	// fails on the first unhealthy one.
+	if s.networkState != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), probeTimeout)
+		defer cancel()
+		for _, ns := range s.networkState.Statuses(ctx) {
+			c := check{name: "rpc_" + ns.Network}
+			if ns.Source != "ok" {
+				c.detail = ns.Source
+			} else {
+				c.healthy = true
+				c.detail = "latest ledger " + strconv.FormatUint(uint64(ns.LatestChainLedger), 10) +
+					", lag " + strconv.FormatInt(ns.LedgerLag, 10)
+			}
+			checks = append(checks, c)
+		}
+	}
 
 	if s.readyzLagThreshold > 0 && s.poller != nil {
 		pos := s.poller.Position()

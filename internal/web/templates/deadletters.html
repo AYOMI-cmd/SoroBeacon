@@ -1,0 +1,40 @@
+{{define "content"}}
+<h1>Dead-Letter Queue</h1>
+<p class="muted">Permanently failed deliveries after exhausted retries.</p>
+{{if .DeadLetters}}
+<table>
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Alert ID</th>
+      <th>Channel</th>
+      <th>Attempts</th>
+      <th>Last Status</th>
+      <th>Last Error</th>
+      <th>Created At</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .DeadLetters}}
+    <tr>
+      <td>{{.ID}}</td>
+      <td><a href="/alerts/{{.AlertID}}">{{.AlertID}}</a></td>
+      <td>{{.ChannelName}}</td>
+      <td>{{.AttemptCount}}</td>
+      <td>{{.LastStatus}}</td>
+      <td><code>{{.LastError}}</code></td>
+      <td>{{.CreatedAt}}</td>
+      <td>
+        <form method="post" action="/dead-letters/{{.ID}}/redrive" style="display:inline;">
+          <button class="btn-sm">Re-drive</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<p>No dead-lettered deliveries.</p>
+{{end}}
+{{end}}
