@@ -127,12 +127,12 @@ may carry a role suffix (`token:admin`, `token:editor`, `token:viewer`).
 `auth.RoleForRequest` parses it. However, **the shipped server does not
 enforce roles**:
 
-* `cmd/sorobeacon/main.go` never constructs a `RoleEnforcer` and never calls
-  `WithRoles` on the API or dashboard servers. Both routers apply
-  `auth.RoleMiddleware` with a nil enforcer, which is a pass-through.
+* `auth.RoleEnforcer` and `auth.RoleMiddleware` were removed. They matched the
+  literal strings `admin` and `token-admin` without consulting the configured
+  tokens, so the first caller to wire them up would have shipped a backdoor.
 * `api.RoleMiddleware` and `api.RequireRole` are not mounted at all.
-* The role parsed from a static token is never consulted on a request path;
-  only unscoped tests call `RoleForRequest`.
+* The role parsed from a static token is never consulted on a request path.
+  `RoleForRequest` resolves configured tokens only.
 
 Consequences, stated plainly:
 
@@ -144,7 +144,7 @@ Consequences, stated plainly:
   `secret:viewer` is stored as the digest of `secret`, so clients must present
   `secret`, not `secret:viewer`. Since the role is never checked, the suffix is
   configuration noise with a credential-matching side effect.
-* The route-by-route role maps in `internal/api/auth.go` are dead code. New
+* The remaining role helpers in `internal/api/auth.go` are not mounted. New
   endpoints must be mapped in `routeScopes`; that is the only table with an
   effect.
 
