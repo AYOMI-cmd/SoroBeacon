@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -190,6 +191,14 @@ func testWorkspaceIsolation(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, err)
 	assert.Equal(t, acmeMonitor.ID, written.MonitorID)
 
+	// Acknowledging stops escalation, so a cross-tenant id must be refused
+	// before the write rather than acknowledged and then reported missing.
+	assert.ErrorIs(t, st.AcknowledgeAlert(beta, acmeAlert.ID), ErrNotFound, "another tenant's alert cannot be acknowledged")
+	unacked, err := st.GetAlert(acme, acmeAlert.ID)
+	require.NoError(t, err)
+	assert.Nil(t, unacked.AcknowledgedAt, "the refused acknowledgement must leave the alert alone")
+	require.NoError(t, st.AcknowledgeAlert(acme, acmeAlert.ID), "the owner can still acknowledge it")
+
 	// Delivery attempts are scoped through their alert.
 	require.NoError(t, st.RecordDeliveryAttempt(system, &DeliveryAttempt{
 		AlertID: acmeAlert.ID, ChannelID: acmeChannel.ID, Status: DeliveryStatusSuccess, ResponseSnippet: "ok",
@@ -335,40 +344,60 @@ func TestDeleteTableAllowlist(t *testing.T) {
 // context, with why. It is the readable counterpart to the source scan below
 // and to the conditional predicates in each of these methods.
 var unscopedStoreMethods = map[string]string{
-	"ListMonitors":                       "the poller schedules every tenant's monitors",
-	"ListMonitorsPage":                   "serves a system context so the poller's view matches the dashboard's",
-	"ListAlerts":                         "the frequency rule reads one rule's history; rule_id implies the tenant",
-	"ListRules":                          "the poller loads rules for a monitor it already resolved",
-	"ListChannelsForMonitor":             "the dispatcher delivers for a monitor it already resolved",
-	"RecordDeliveryAttempt":              "the dispatcher writes for an alert it already resolved",
-	"CreateDeadLetter":                   "the dispatcher records a permanently failed delivery for an alert it already resolved; the row takes its tenant from that alert",
-	"CreateAlert":                        "derives the workspace from the monitor it inserts into",
-	"ExpiredAlerts":                      "retention sweeps every workspace",
-	"GetIngestState":                     "the ledger cursor is per instance, not per tenant",
-	"SetIngestState":                     "the ledger cursor is per instance, not per tenant",
-	"InitializeContractCursor":           "the per-contract ledger cursor is instance-wide, and initialization must see references across workspaces",
-	"AdvanceContractCursor":              "the poller advances shared per-contract state after resolving all workspace monitors",
+	"ListMonitors":            "the poller schedules every tenant's monitors",
+	"ListMonitorsPage":        "serves a system context so the poller's view matches the dashboard's",
+	"ListAlerts":              "the frequency rule reads one rule's history; rule_id implies the tenant",
+	"ListRules":               "the poller loads rules for a monitor it already resolved",
+	"ListChannelsForMonitor":  "the dispatcher delivers for a monitor it already resolved",
+	"RecordDeliveryAttempt":   "the dispatcher writes for an alert it already resolved",
+	"CreateDeadLetter":        "the dispatcher records a permanently failed delivery for an alert it already resolved; the row takes its tenant from that alert",
+	"CreateAlert":             "derives the workspace from the monitor it inserts into",
+	"ExpiredAlerts":           "retention sweeps every workspace",
+	"GetIngestState":          "the ledger cursor is per instance, not per tenant",
+	"SetIngestState":          "the ledger cursor is per instance, not per tenant",
+	"RecordLedgerHashes":      "the reorg window is per network, not per tenant",
+	"LedgerHashes":            "the reorg window is per network, not per tenant",
+	"PruneLedgerHashes":       "the reorg window is per network, not per tenant",
+	"RetractAlertsFromLedger": "a reorg orphans every tenant's alerts on that ledger",
+	"DeleteExpiredAlerts":     "retention sweeps every workspace, and ExpiredAlerts selects the rows it deletes",
+	"EnsureWorkspace":         "takes the workspace as an argument",
+	"AssignLegacyNetwork":     "the one-time startup upgrade labels rows the migration left unlabelled in every workspace; its predicate is the empty network, not a tenant",
+	"TokenByHash":             "authenticating: the token's own row is where its workspace comes from, so the read cannot be scoped to a tenant the caller does not have yet",
+	"ScheduleEscalation":      "the dispatcher schedules the remaining steps for an alert it already resolved; the row inherits its tenant through that alert",
+	"DueEscalations":          "the escalation scheduler sweeps every tenant's due steps, like the poller's other background passes",
+	"InitializeContractCursor": "the per-contract ledger cursor is instance-wide, and initialization must see references across workspaces",
+	"AdvanceContractCursor":    "the poller advances shared per-contract state after resolving all workspace monitors",
 	"cleanupUnusedContractCursors":       "cursor cleanup checks every workspace before deleting shared network/contract state",
 	"cleanupUnusedSQLiteContractCursors": "cursor cleanup checks every workspace before deleting shared network/contract state",
-	"RecordLedgerHashes":                 "the reorg window is per network, not per tenant",
-	"LedgerHashes":                       "the reorg window is per network, not per tenant",
-	"PruneLedgerHashes":                  "the reorg window is per network, not per tenant",
-	"RetractAlertsFromLedger":            "a reorg orphans every tenant's alerts on that ledger",
-	"DeleteExpiredAlerts":                "retention sweeps every workspace, and ExpiredAlerts selects the rows it deletes",
-	"EnsureWorkspace":                    "takes the workspace as an argument",
-	"AssignLegacyNetwork":                "the one-time startup upgrade labels rows the migration left unlabelled in every workspace; its predicate is the empty network, not a tenant",
-	"TokenByHash":                        "authenticating: the token's own row is where its workspace comes from, so the read cannot be scoped to a tenant the caller does not have yet",
-	"ListChannelsByIDs":                  "the dispatcher resolves an escalation step's channels for a policy it already loaded through the monitor",
-	"RecordChannelHealth":                "the dispatcher folds a delivery outcome into a channel it already resolved, in the poller's cross-tenant context",
-	"MarkAlertInhibited":                 "the dispatcher marks an alert it already resolved, in the poller's cross-tenant context",
-	"SetAlertSuppressed":                 "the dispatcher marks an alert it already resolved, in the poller's cross-tenant context",
-	"RuleFiredWithin":                    "the inhibition check asks about one rule the dispatcher already resolved; rule_id implies the tenant",
+	"ListChannelsByIDs":       "the dispatcher resolves an escalation step's channels for a policy it already loaded through the monitor",
+	"RecordChannelHealth":     "the dispatcher folds a delivery outcome into a channel it already resolved, in the poller's cross-tenant context",
+	"MarkAlertInhibited":      "the dispatcher marks an alert it already resolved, in the poller's cross-tenant context",
+	"SetAlertSuppressed":      "the dispatcher marks an alert it already resolved, in the poller's cross-tenant context",
+	"RuleFiredWithin":         "the inhibition check asks about one rule the dispatcher already resolved; rule_id implies the tenant",
 }
 
-// scannedFiles are the store sources that hold queries against tenant tables.
-// New files belong here the moment they start embedding SQL, or a method in
-// them would pass the scan by being invisible to it.
-var scannedFiles = []string{"postgres.go", "sqlite.go", "prune.go", "partition.go"}
+// sqlSourceFiles lists every non-test Go source in the package directory.
+//
+// The list used to be maintained by hand and had already fallen behind: the
+// escalation-policy surface and the SQLite half of API-token storage grew
+// outside the guard because nobody added their filenames. Reading the
+// directory removes the failure mode rather than remembering to avoid it — a
+// new file is scanned the moment it exists, so there is no list to forget.
+func sqlSourceFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err, "read the store package directory")
+	var files []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files = append(files, name)
+	}
+	require.NotEmpty(t, files, "discovered no store sources to scan")
+	return files
+}
 
 // TestEveryScopedQueryCarriesWorkspace is the guard the design leans on: a new
 // store method that touches a tenant's table without scoping to the caller's
@@ -388,9 +417,8 @@ var scannedFiles = []string{"postgres.go", "sqlite.go", "prune.go", "partition.g
 func TestEveryScopedQueryCarriesWorkspace(t *testing.T) {
 	tenantTableRead := regexp.MustCompile(`(?i)\b(?:FROM|INTO|UPDATE|JOIN)\s+(?:ONLY\s+)?(monitors|channels|alerts|saved_searches|monitor_templates|api_tokens)\b`)
 
-	for _, file := range scannedFiles {
+	for _, file := range sqlSourceFiles(t) {
 		functions := sqlFunctions(t, file)
-		require.NotEmpty(t, functions, "%s parsed into no functions", file)
 		helpers := scopingHelperNames()
 		for _, fn := range functions {
 			if !tenantTableRead.MatchString(fn.sql) {
@@ -440,7 +468,7 @@ func delegatesToHelper(fn sqlFunc, helpers map[string]bool) bool {
 // then fail the scan with no predicate of their own.
 func TestScopingHelpersAreReal(t *testing.T) {
 	defined := map[string]bool{}
-	for _, file := range scannedFiles {
+	for _, file := range sqlSourceFiles(t) {
 		for _, fn := range sqlFunctions(t, file) {
 			defined[fn.name] = true
 		}
@@ -455,7 +483,7 @@ func TestScopingHelpersAreReal(t *testing.T) {
 // calls is how an unscoped query becomes permanent.
 func TestUnscopedStoreMethodsAreReal(t *testing.T) {
 	called := map[string]bool{}
-	for _, file := range scannedFiles {
+	for _, file := range sqlSourceFiles(t) {
 		for _, fn := range sqlFunctions(t, file) {
 			called[fn.name] = true
 		}

@@ -444,6 +444,24 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 }'
 ```
 
+**`event_name_glob`** — match the event's **name** (the first topic) against a
+glob pattern, for the families a glob says better than a regex: `swap_*`
+covers `swap_exact_in`, `swap_exact_out` and everything else in the family.
+Patterns use Go's `path.Match` syntax (`*`, `?`, `[a-z]`), several patterns
+are ORed, and the match is anchored at both ends and case-sensitive — `swap`
+does not match `swap_exact_in`, `swap_*` does:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "event_name_glob",
+  "params": {
+    "patterns": ["swap_*", "pool_deposit"]
+  }
+}'
+```
+
+See [docs/rules/event-name-glob.md](docs/rules/event-name-glob.md).
+
 **`address_watchlist`** — match any SEP-41 token event whose from or to
 address is on a configured list. "Did these specific addresses move anything"
 becomes one rule instead of one `token_event` rule per address. `match` is
@@ -461,6 +479,24 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
   }
 }'
 ```
+
+**`contract_allowlist`** — match the **contract** an event came from against
+a list of contract IDs, or — with `exclude` — against everything else. A
+monitor can watch a whole protocol's contracts while a rule narrows it to
+one of them, so the rule is at its best inside a `composite`, AND-combined
+with a rule that looks at the payload. The set is built once, so the list
+costs no more per event than a single entry:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "contract_allowlist",
+  "params": {
+    "contract_ids": ["CA7Q...TREASURY"]
+  }
+}'
+```
+
+See [docs/rules/contract-allowlist.md](docs/rules/contract-allowlist.md).
 
 **`topic_position`** — match when the decoded topic at a fixed position
 exactly equals a configured value. Custom (non-SEP-41) contracts put

@@ -120,45 +120,45 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # terraform-provider-sorobeacon/ is a nested module, so nothing above sees
-  # it: `go build ./...` from the root stops at the subdirectory that carries
-  # its own go.mod, by design. Without this job seven Go files ship with no
-  # build check, no vet and no lint. The whole job runs inside the module
-  # directory — that is the only thing that makes the commands see the
-  # provider — and caches on the provider's own go.sum, because setup-go's
-  # cache key comes from the go.sum it is pointed at.
-  terraform-provider:
+  # -race needs cgo, which ubuntu-latest provides. It runs without
+  # TEST_DATABASE_URL: the detector is about this process's shared state, and
+  # the SQLite backend plus the library suites cover the concurrent paths that
+  # need no service container. The Postgres-backed suite already runs in
+  # test-db; doubling it here would pay the race detector's cost on the
+  # slowest job. The nested Terraform provider is out of scope: it does not
+  # start the poller, dispatcher or lease.
+  race:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: terraform-provider-sorobeacon
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: terraform-provider-sorobeacon/go.mod
-          cache-dependency-path: terraform-provider-sorobeacon/go.sum
-      - name: Build
-        run: go build ./...
-      - name: Vet
-        run: go vet ./...
-      # The provider has no tests yet; running the command now means the job
-      # already covers them on the day they land, rather than waiting for a
-      # follow-up to notice a red suite.
-      - name: Test
-        run: go test ./... -count=1
-      # A nested module drifts silently: nothing in the root module's build
-      # notices an untidy go.mod here, and the next person to run tidy gets a
-      # diff nobody reviewed.
-      - name: Verify go.mod is tidy
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-      - uses: golangci/golangci-lint-action@v9.3.0
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Test (race detector)
+        run: make test-race
+
+  # A separate job from lint, so the pull request page distinguishes a code
+  # smell from a known vulnerability. `make vulncheck` is the same command a
+  # contributor runs locally; the tool version is pinned in the Makefile so an
+  # unrelated change does not turn red on the day the database updates.
+  #
+  # The Terraform provider is a separate module with its own dependency tree,
+  # so the root scan cannot see it: both modules are scanned explicitly.
+  vulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          version: v2.12.2
-          working-directory: terraform-provider-sorobeacon
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            terraform-provider-sorobeacon/go.sum
+      - name: govulncheck (root and Terraform provider modules)
+        run: make vulncheck
 
   lint:
     runs-on: ubuntu-latest

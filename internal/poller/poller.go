@@ -141,6 +141,9 @@ type Poller struct {
 	knownNetworks []string
 	// warnedOrphans latches that warning so it cannot repeat.
 	warnedOrphans bool
+	// slowRuleThreshold is the duration after which a rule evaluation is
+	// considered slow and logged. Zero disables slow rule logging.
+	slowRuleThreshold time.Duration
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -260,6 +263,13 @@ func (p *Poller) Network() string { return p.network }
 func (p *Poller) WithReorg(window, depth uint32) *Poller {
 	p.reorgWindow = window
 	p.confirmDepth = depth
+	return p
+}
+
+// WithSlowRuleThreshold sets the duration after which a rule evaluation is
+// considered slow and logged at warn level. Zero disables slow rule logging.
+func (p *Poller) WithSlowRuleThreshold(d time.Duration) *Poller {
+	p.slowRuleThreshold = d
 	return p
 }
 
@@ -685,7 +695,12 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			// frequency rule) can key its per-rule state.
 			p.evaluations++
 			ruleCtx := rules.WithRuleID(ctx, rule.ID)
+			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
+			duration := time.Since(start)
+			if p.metrics != nil {
+				p.metrics.RecordRuleEval(rule.Type, matched, err, duration)
+			}
 			if err != nil {
 				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
 				processed = false

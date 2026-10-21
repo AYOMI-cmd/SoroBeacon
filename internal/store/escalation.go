@@ -204,6 +204,11 @@ func (p *Postgres) CompleteEscalation(ctx context.Context, alertID int64) error 
 // transaction, so a step cannot fire between the acknowledgement and the
 // escalation being cleared. It is idempotent: acknowledging twice is not an
 // error, but a missing alert is ErrNotFound.
+//
+// The alert is scoped to the caller's workspace, so another tenant's id is
+// ErrNotFound rather than an acknowledgement that stops its paging. The
+// escalation row has no workspace of its own; it is only reached once the
+// scoped alert update has found a row in this workspace.
 func (p *Postgres) AcknowledgeAlert(ctx context.Context, alertID int64) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
@@ -211,14 +216,15 @@ func (p *Postgres) AcknowledgeAlert(ctx context.Context, alertID int64) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
+	ws := workspaceID(ctx)
 	tag, err := tx.Exec(ctx,
-		`UPDATE alerts SET acknowledged_at = now() WHERE id = $1 AND acknowledged_at IS NULL`, alertID)
+		`UPDATE alerts SET acknowledged_at = now() WHERE id = $1 AND workspace_id = $2 AND acknowledged_at IS NULL`, alertID, ws)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM alerts WHERE id = $1)`, alertID).Scan(&exists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM alerts WHERE id = $1 AND workspace_id = $2)`, alertID, ws).Scan(&exists); err != nil {
 			return err
 		}
 		if !exists {
