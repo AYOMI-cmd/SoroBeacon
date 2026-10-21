@@ -68,6 +68,11 @@ func (s *SQLite) setAlertCreatedAt(ctx context.Context, id int64, at time.Time) 
 	return err
 }
 
+func (s *SQLite) setDeliveryAttemptAt(ctx context.Context, id int64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE delivery_attempts SET attempted_at = ? WHERE id = ?`, sqliteTimeString(at), id)
+	return err
+}
+
 func (s *SQLite) backdateRuleLastAlert(ctx context.Context, id int64, d time.Duration) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE rules SET last_alert_at = ? WHERE id = ?`,
 		sqliteTimeString(time.Now().Add(-d)), id)

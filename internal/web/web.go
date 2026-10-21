@@ -1203,6 +1203,17 @@ func (s *Server) setMonitorChannels(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
+// The window the channels page's delivery-health column aggregates over, and
+// the label it is shown under. It is deliberately the same default the stats
+// API uses (GET /channels/{id}/stats), so the dashboard and the endpoint
+// answer "how is this channel doing?" over the same span and can never
+// disagree about which window either one meant. The label is a constant
+// because Duration.String() would spell 24h as "24h0m0s".
+const (
+	deliveryHealthWindow      = 24 * time.Hour
+	deliveryHealthWindowLabel = "24h"
+)
+
 func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 	f := store.ListFilter{Limit: 50}
 	if v := r.URL.Query().Get("cursor"); v != "" {
@@ -1218,6 +1229,22 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	// Delivery health for the listed channels, aggregated in the database per
+	// channel. A store failure fails the page like every other read here:
+	// a half-rendered health column that silently shows nothing would be
+	// mistaken for "no attempts". One query per listed channel is bounded by
+	// the page size, and each is answered by the (channel_id, attempted_at)
+	// index added in migration 0032.
+	since := time.Now().UTC().Add(-deliveryHealthWindow)
+	health := make(map[int64]store.ChannelDeliveryStats, len(channels))
+	for _, ch := range channels {
+		ds, err := s.store.GetChannelDeliveryStats(r.Context(), ch.ID, since)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		health[ch.ID] = ds
+	}
 	empty := ""
 	if len(channels) == 0 {
 		empty = "no_channels"
@@ -1230,6 +1257,9 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		"Title": "Channels", "Channels": channels, "ChannelTypes": s.factory.Types(),
 		"Empty": empty, "HasMonitors": len(monitors) > 0,
 		"NextCursor": next,
+		// DeliveryStats is keyed by channel id; index in the template reads a
+		// missing entry as the zero value, which is exactly "no attempts".
+		"DeliveryStats": health, "DeliveryWindow": deliveryHealthWindowLabel,
 	})
 }
 
