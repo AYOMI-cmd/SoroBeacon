@@ -59,8 +59,15 @@ func (r *Registry) AllSchemas() map[string][]FieldSchema {
 // ParamsFromForm builds a JSON params blob from form key-value pairs using the
 // schema to coerce types. Unknown keys are ignored; missing required fields
 // produce an empty value (validation catches them later).
-func ParamsFromForm(schema []FieldSchema, values map[string]string) json.RawMessage {
+//
+// A number field that does not hold a number is reported by name instead of
+// being dropped. The builder used to put the text into the map regardless,
+// ignore the error json.Marshal returned for it, and hand back no params at
+// all — so one typo in one field lost every other field the user had filled
+// in, and the dashboard then complained about a field they had never touched.
+func ParamsFromForm(schema []FieldSchema, values map[string]string) (json.RawMessage, error) {
 	m := make(map[string]any, len(schema))
+	var problems FieldErrors
 	for _, f := range schema {
 		v, ok := values[f.Name]
 		if !ok || v == "" {
@@ -68,14 +75,35 @@ func ParamsFromForm(schema []FieldSchema, values map[string]string) json.RawMess
 		}
 		switch f.Type {
 		case "number":
-			n := json.Number(v)
-			m[f.Name] = n
+			// json.Number carries the text through unchanged, so an integer
+			// larger than float64 can hold survives the round trip. The
+			// validity check is the encoder's own, so a value that could
+			// never be encoded is reported here rather than taking the whole
+			// params blob down with it.
+			if !isJSONNumber(v) {
+				problems = append(problems, FieldError{Field: f.Name, Reason: "must be a number"})
+				continue
+			}
+			m[f.Name] = json.Number(v)
 		default:
 			m[f.Name] = v
 		}
 	}
-	b, _ := json.Marshal(m)
-	return b
+	if len(problems) > 0 {
+		return nil, problems
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// isJSONNumber reports whether s is a JSON number literal. "50" and
+// "123456789012345678901234567890" are numbers; "5x", "1,5" and "" are not.
+func isJSONNumber(s string) bool {
+	_, err := json.Marshal(json.Number(s))
+	return err == nil
 }
 
 // Implement SchemaProvider on built-in evaluators.

@@ -900,32 +900,44 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
+	data, err := s.monitorPage(r, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.notFound(w, r)
+			return
+		}
+		s.fail(w, err)
+		return
+	}
+	s.render(w, r, "monitor", data)
+}
+
+// monitorPage assembles the monitor detail page's data. The rule builder
+// re-renders this same page when it rejects a malformed form, so the two
+// share one assembly: a page that has to show the monitor's rules must not
+// be built in two places that can drift apart.
+func (s *Server) monitorPage(r *http.Request, id int64) (map[string]any, error) {
 	m, err := s.store.GetMonitor(r.Context(), id)
 	if err != nil {
-		s.notFound(w, r)
-		return
+		return nil, err
 	}
 	ruleList, err := s.store.ListRules(r.Context(), id, false)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	channels, err := s.store.ListChannels(r.Context(), false)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	recent, err := s.store.ListAlerts(r.Context(), store.AlertFilter{
 		MonitorID: id, Limit: recentAlertsPanelSize,
 	})
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	stats, err := s.store.GetMonitorStats(r.Context(), id)
 	if err != nil {
-		s.fail(w, err)
-		return
+		return nil, err
 	}
 	attached := map[int64]bool{}
 	for _, cid := range m.ChannelIDs {
@@ -936,7 +948,7 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 	// monitorRow the list pages use. Two readings of "when did this fire" on
 	// one page would be the disagreement the issue asks not to create.
 	row := s.monitorRow(*m, tz, time.Now())
-	s.render(w, r, "monitor", map[string]any{
+	return map[string]any{
 		"Title": m.Name, "Monitor": row, "Rules": ruleList,
 		"Channels": channels, "Attached": attached, "RuleTypes": s.registry.Types(),
 		"RecentAlerts": recent,
@@ -945,7 +957,14 @@ func (s *Server) monitorDetail(w http.ResponseWriter, r *http.Request) {
 		"AlertsHref": template.URL("/alerts?monitor_id=" + strconv.FormatInt(id, 10)),
 		"Stats":      stats,
 		"LastAlert":  formatStatTime(stats.LastAlertAt, tz),
-	})
+		// The rule builder's own state. The page is also rendered after the
+		// builder rejects a malformed form, which fills these in with what
+		// the user typed; the defaults are the empty form.
+		"BuilderType":      "",
+		"BuilderFields":    "",
+		"BuilderRawParams": defaultBuilderParams,
+		"BuilderErrors":    []string{},
+	}, nil
 }
 
 // formatStatTime renders the nullable most-recent-alert timestamp from
@@ -1203,6 +1222,17 @@ func (s *Server) setMonitorChannels(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, fmt.Sprintf("/monitors/%d", id), http.StatusSeeOther)
 }
 
+// The window the channels page's delivery-health column aggregates over, and
+// the label it is shown under. It is deliberately the same default the stats
+// API uses (GET /channels/{id}/stats), so the dashboard and the endpoint
+// answer "how is this channel doing?" over the same span and can never
+// disagree about which window either one meant. The label is a constant
+// because Duration.String() would spell 24h as "24h0m0s".
+const (
+	deliveryHealthWindow      = 24 * time.Hour
+	deliveryHealthWindowLabel = "24h"
+)
+
 func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 	f := store.ListFilter{Limit: 50}
 	if v := r.URL.Query().Get("cursor"); v != "" {
@@ -1218,6 +1248,22 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
+	// Delivery health for the listed channels, aggregated in the database per
+	// channel. A store failure fails the page like every other read here:
+	// a half-rendered health column that silently shows nothing would be
+	// mistaken for "no attempts". One query per listed channel is bounded by
+	// the page size, and each is answered by the (channel_id, attempted_at)
+	// index added in migration 0032.
+	since := time.Now().UTC().Add(-deliveryHealthWindow)
+	health := make(map[int64]store.ChannelDeliveryStats, len(channels))
+	for _, ch := range channels {
+		ds, err := s.store.GetChannelDeliveryStats(r.Context(), ch.ID, since)
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		health[ch.ID] = ds
+	}
 	empty := ""
 	if len(channels) == 0 {
 		empty = "no_channels"
@@ -1230,6 +1276,9 @@ func (s *Server) channels(w http.ResponseWriter, r *http.Request) {
 		"Title": "Channels", "Channels": channels, "ChannelTypes": s.factory.Types(),
 		"Empty": empty, "HasMonitors": len(monitors) > 0,
 		"NextCursor": next,
+		// DeliveryStats is keyed by channel id; index in the template reads a
+		// missing entry as the zero value, which is exactly "no attempts".
+		"DeliveryStats": health, "DeliveryWindow": deliveryHealthWindowLabel,
 	})
 }
 

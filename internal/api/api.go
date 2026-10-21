@@ -263,6 +263,9 @@ func (s *Server) Routes() chi.Router {
 		r.Post("/bulk", s.bulkChannels)
 		r.Post("/{id}/duplicate", s.duplicateChannel)
 		r.Get("/{id}", s.getChannel)
+		// Registered under the channel's own id rather than under /stats:
+		// the statistics are one channel's, not the instance's.
+		r.Get("/{id}/stats", s.channelStats)
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
@@ -441,6 +444,18 @@ func writeValidation(w http.ResponseWriter, r *http.Request, details []FieldErro
 		msg = "validation failed"
 	}
 	writeErr(w, r, http.StatusBadRequest, msg, details...)
+}
+
+// writeUnprocessable reports problems that make a well-formed request
+// impossible to satisfy: the request was understood, and what it carries
+// cannot be turned into a valid result. The details list every problem,
+// keyed by the field, rule index or parameter it belongs to, so a caller can
+// see all of them at once instead of fixing one per round trip.
+func writeUnprocessable(w http.ResponseWriter, r *http.Request, details []FieldError) {
+	if len(details) == 0 {
+		return
+	}
+	writeErr(w, r, http.StatusUnprocessableEntity, "validation failed", details...)
 }
 
 // detailsFromErr turns a Validate / constructor error into envelope

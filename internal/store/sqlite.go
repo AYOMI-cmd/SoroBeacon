@@ -641,6 +641,49 @@ func (s *SQLite) deleteByID(ctx context.Context, table string, id int64) error {
 	return nil
 }
 
+// CreateMonitorWithRules creates a monitor, its rules and its channel
+// attachments in one transaction. The three land together or not at all: a
+// monitor whose rules went missing is a monitor that watches a contract and
+// never says anything, and nothing outside this call would report the gap.
+func (s *SQLite) CreateMonitorWithRules(ctx context.Context, m *Monitor, rules []*Rule, channelIDs []int64) error {
+	ws := workspaceID(ctx)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapSQLiteErr(err)
+	}
+	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
+
+	ids, err := json.Marshal(m.ContractIDs)
+	if err != nil {
+		return err
+	}
+	var created string
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO monitors (name, contract_ids, enabled, priority, workspace_id, network, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+		 RETURNING id, created_at`,
+		m.Name, string(ids), boolToInt(m.Enabled), string(m.Priority.Normalized()), ws, m.Network, sqliteCreatedAt(m.CreatedAt),
+	).Scan(&m.ID, &created); err != nil {
+		return mapSQLiteErr(err)
+	}
+	if m.CreatedAt, err = parseSQLiteTime(created); err != nil {
+		return err
+	}
+	for _, r := range rules {
+		r.MonitorID = m.ID
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO rules (monitor_id, type, params, enabled) VALUES (?, ?, ?, ?) RETURNING id`,
+			r.MonitorID, r.Type, string(jsonOrEmpty(r.Params)), boolToInt(r.Enabled),
+		).Scan(&r.ID); err != nil {
+			return mapSQLiteErr(err)
+		}
+	}
+	if err := s.setMonitorChannels(ctx, tx, m.ID, channelIDs, ws); err != nil {
+		return err
+	}
+	return mapSQLiteErr(tx.Commit())
+}
+
 // SetMonitorChannels replaces one monitor's notification targets. Both sides
 // must belong to the caller's workspace: the monitor check is what stops one
 // tenant re-pointing another's monitor, and the channel check is what stops a
@@ -654,6 +697,16 @@ func (s *SQLite) SetMonitorChannels(ctx context.Context, monitorID int64, channe
 	}
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
+	if err := s.setMonitorChannels(ctx, tx, monitorID, channelIDs, ws); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// setMonitorChannels replaces one monitor's notification targets inside an
+// open transaction, so a caller that is already writing a monitor does not
+// have to open a second one.
+func (s *SQLite) setMonitorChannels(ctx context.Context, tx *sql.Tx, monitorID int64, channelIDs []int64, ws workspace.ID) error {
 	if err := s.requireMonitorWorkspace(ctx, tx, monitorID, ws); err != nil {
 		return err
 	}
@@ -688,7 +741,7 @@ func (s *SQLite) SetMonitorChannels(ctx context.Context, monitorID int64, channe
 			return mapSQLiteErr(err)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *SQLite) DuplicateMonitor(ctx context.Context, id int64) (*Monitor, error) {
@@ -1236,6 +1289,54 @@ func parseSQLiteTimePtr(ns sql.NullString) (*time.Time, error) {
 		return nil, err
 	}
 	return &t, nil
+}
+
+// GetChannelDeliveryStats mirrors the Postgres backend statement for
+// statement: the same existence probe riding along in the same row, the same
+// filtered counts and conditional maxes, the same ErrNotFound and nil-when-
+// empty timestamps. The window cutoff arrives from the caller as an absolute
+// time and is bound as the canonical fixed-width UTC TEXT string, so the
+// comparison stays chronological exactly like every other time filter here.
+//
+// sum(CASE ...) over an empty set is NULL rather than 0 as on Postgres, so it
+// is wrapped in COALESCE; max(...) yielding NULL is the desired "no such
+// attempt" and is read through the nullable-timestamp helper.
+func (s *SQLite) GetChannelDeliveryStats(ctx context.Context, channelID int64, since time.Time) (ChannelDeliveryStats, error) {
+	cs := ChannelDeliveryStats{ChannelID: channelID}
+	var exists int64
+	var lastOK, lastFail sql.NullString
+	ws := workspaceID(ctx)
+	cut := sqliteTimeString(since)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT count(*) FROM channels WHERE id = ? AND workspace_id = ?),
+			count(*),
+			COALESCE(sum(CASE WHEN da.status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(sum(CASE WHEN da.status = ? THEN 1 ELSE 0 END), 0),
+			max(CASE WHEN da.status = ? THEN da.attempted_at END),
+			max(CASE WHEN da.status = ? THEN da.attempted_at END)
+		FROM delivery_attempts da
+		WHERE da.channel_id = ? AND da.attempted_at >= ?`,
+		channelID, ws,
+		DeliveryStatusSuccess, DeliveryStatusFailed,
+		DeliveryStatusSuccess, DeliveryStatusFailed,
+		channelID, cut).
+		Scan(&exists, &cs.Total, &cs.Succeeded, &cs.Failed, &lastOK, &lastFail)
+	if err != nil {
+		return cs, mapSQLiteErr(err)
+	}
+	if exists == 0 {
+		return cs, ErrNotFound
+	}
+	var err2 error
+	if cs.LastSuccessAt, err2 = parseSQLiteTimePtr(lastOK); err2 != nil {
+		return cs, err2
+	}
+	if cs.LastFailureAt, err2 = parseSQLiteTimePtr(lastFail); err2 != nil {
+		return cs, err2
+	}
+	cs.deriveSuccessRate()
+	return cs, nil
 }
 
 // UpdateChannel mirrors the Postgres implementation, including the health
