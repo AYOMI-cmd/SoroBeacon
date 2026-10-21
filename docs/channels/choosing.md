@@ -20,6 +20,7 @@ HTTP behaviour, and each channel's own file for its failure mode.
 | [Email](email.md) | moderate | SMTP host + credentials, from, to list | `net/smtp` has no context support — the send runs to completion (or the 15s HTTP timeout does not apply); the dispatcher's backoff still applies | `email: <smtp error>` — often connection-level text, not a status code |
 | [PagerDuty](pagerduty.md) | moderate | Events API v2 routing key (secret) | same HTTP path; `dedup_key` is `(rule_id, event_id)`, so redeliveries do not open a second incident | `pagerduty: status %d: <body>` or redacted network error |
 | [Webhook](webhook.md) | easy, but the receiver is yours | endpoint URL + HMAC secret (both secret) | whatever your endpoint does is what you get: slow endpoint, slow delivery (up to the 15s timeout, per attempt) | the raw status and a 300-byte slice of your endpoint's response body |
+| [Federation](federation.md) | moderate, and it needs two instances | the other instance's URL + token (both secret) | the same HTTP path; the other instance answers 400 or 404 today, because the channel does not cross between two instances yet (see its page) | the other instance's status and its error body |
 
 `trivial` means one paste-a-URL step; `easy` one bot creation step;
 `moderate` means several required config fields or an account on the target
@@ -55,6 +56,14 @@ and every one of those shows up in SoroBeacon's delivery records.
 external stakeholders, compliance archives. It is the slowest and least
 structured path (no status codes, no rate-limit feedback) and mail itself is
 lossy; do not build an on-call flow on it.
+
+**Another SoroBeacon instance** — the `federation` type, for a fleet that
+wants one instance to collect the alerts of others. It is the only channel
+that talks to SoroBeacon itself, and it is also the only one that does not
+work end to end yet: the sender sends an empty origin and the receiver
+stores the alert against the sender's ids, so a delivery is refused with a
+`400` or a `404`. Read the [federation page](federation.md) before you plan
+around it — it lists both bugs and what does work.
 
 A common shape: Discord/Slack for the team, PagerDuty on the few monitors
 that page, and a webhook into the ops data pipeline — all on the same
