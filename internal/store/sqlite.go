@@ -1758,14 +1758,21 @@ func (s *SQLite) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
 	return err
 }
 
-// GetDeadLetter returns one dead-letter record by id.
+// GetDeadLetter returns one dead-letter record by id. dead_letters carries no
+// workspace_id of its own, so the tenant predicate reaches it through the
+// alert it belongs to; a caller without a tenant reads by id alone.
 func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
 	var d DeadLetter
 	var created string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
-		 FROM dead_letters WHERE id = ?`, id,
-	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created)
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE id = ?`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
+		args = append(args, ws)
+	}
+	err := s.db.QueryRowContext(ctx, q, args...).
+		Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created)
 	if err != nil {
 		return nil, mapSQLiteErr(err)
 	}
@@ -1777,11 +1784,16 @@ func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, erro
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters.
+// optional channel, alert, and pagination filters. A tenant sees only records
+// whose alert belongs to it; the dispatcher's system context sees every row.
 func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
 		FROM dead_letters WHERE 1 = 1`
 	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
+		args = append(args, ws)
+	}
 	if f.ChannelID != 0 {
 		q += ` AND channel_id = ?`
 		args = append(args, f.ChannelID)
