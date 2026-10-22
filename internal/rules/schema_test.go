@@ -17,6 +17,7 @@ func TestParamsFromForm(t *testing.T) {
 		{Name: "event_name", Type: "string"},
 		{Name: "count", Type: "number"},
 		{Name: "threshold", Type: "number"},
+		{Name: "enabled", Type: "boolean"},
 	}
 	tests := []struct {
 		name       string
@@ -48,6 +49,21 @@ func TestParamsFromForm(t *testing.T) {
 			name:    "a number field with a thousands separator is not a number",
 			values:  map[string]string{"count": "1,000"},
 			wantErr: "count",
+		},
+		{
+			name:       "boolean field becomes a boolean",
+			values:     map[string]string{"enabled": "true"},
+			wantParams: `{"enabled":true}`,
+		},
+		{
+			name:       "false becomes the boolean false",
+			values:     map[string]string{"enabled": "false"},
+			wantParams: `{"enabled":false}`,
+		},
+		{
+			name:    "non-boolean value is reported by field name",
+			values:  map[string]string{"event_name": "transfer", "enabled": "yes"},
+			wantErr: "enabled",
 		},
 		{
 			name:       "empty and absent fields are left out",
@@ -109,4 +125,111 @@ func TestParamsFromFormKeepsLargeIntegersExact(t *testing.T) {
 	var got map[string]json.Number
 	require.NoError(t, json.Unmarshal(raw, &got))
 	assert.Equal(t, "9007199254740993", got["threshold"].String())
+}
+
+// formFixtures are the required values a generic schema cannot invent: a
+// valid contract id, a real account strkey, a duration, and so on. Optional
+// fields use the schema's own Default, which is the path the dashboard takes
+// when the operator leaves them alone.
+var formFixtures = map[string]map[string]string{
+	TypeEventEmitted: {
+		"event_name": "transfer",
+	},
+	TypeContractAllowlist: {
+		"contract_ids": `["` + allowTreasury + `"]`,
+		"exclude":      "true",
+	},
+	TypeValueThreshold: {
+		"comparison": "gt",
+		"threshold":  "1",
+	},
+	TypeEventNameGlob: {
+		"patterns": `["swap_*"]`,
+	},
+	TypeNumericRange: {
+		"min": "1",
+	},
+	TypeTokenEvent: {
+		"event": "transfer",
+	},
+	TypeFrequencyThreshold: {
+		"count":  "1",
+		"window": "1m",
+	},
+	TypeTopicRegex: {
+		"pattern": "^swap_",
+	},
+	TypeComposite: {
+		"rules": `[{"type":"event_emitted","params":{"event_name":"transfer"}}]`,
+	},
+	TypeTimeWindow: {
+		"start":   "09:00",
+		"end":     "17:00",
+		"outside": "true",
+	},
+	TypeAddressWatchlist: {
+		"addresses": `["` + wlAlice + `"]`,
+	},
+	TypeTopicPosition: {
+		"position": "1",
+		"equals":   "transfer",
+	},
+	TypeAbsenceOfEvent: {
+		"event_name": "transfer",
+		"window":     "5m",
+	},
+}
+
+// TestEveryRuleTypeFormParamsValidate is the guard the boolean bug needed:
+// take each registered type's own schema, fill required fields from a fixture
+// and every optional field from its default, coerce through ParamsFromForm,
+// and require the registry to accept the result. A boolean accidentally left
+// as a string fails here before a user ever sees a 400 from the dashboard.
+func TestEveryRuleTypeFormParamsValidate(t *testing.T) {
+	reg := NewRegistry()
+	schemas := reg.AllSchemas()
+	require.Len(t, schemas, len(reg.Types()), "every registered rule type must declare a schema")
+
+	for typ, schema := range schemas {
+		t.Run(typ, func(t *testing.T) {
+			values := make(map[string]string, len(schema))
+			for _, f := range schema {
+				if v, ok := formFixtures[typ][f.Name]; ok {
+					values[f.Name] = v
+					continue
+				}
+				if f.Default != "" {
+					values[f.Name] = f.Default
+					continue
+				}
+				if f.Required {
+					t.Fatalf("no form fixture for required field %s.%s", typ, f.Name)
+				}
+			}
+			raw, err := ParamsFromForm(schema, values)
+			require.NoError(t, err)
+
+			// The dashboard parses object fields (JSON arrays and maps typed
+			// into a textarea) after ParamsFromForm, so mirror that step
+			// before handing the blob to the registry.
+			var params map[string]any
+			require.NoError(t, json.Unmarshal(raw, &params))
+			for _, f := range schema {
+				if f.Type != "object" || values[f.Name] == "" {
+					continue
+				}
+				var obj any
+				require.NoError(t, json.Unmarshal([]byte(values[f.Name]), &obj), "field %s", f.Name)
+				params[f.Name] = obj
+			}
+			raw, err = json.Marshal(params)
+			require.NoError(t, err)
+			require.NoError(t, reg.Validate(typ, raw), "params: %s", raw)
+		})
+	}
+
+	for typ := range formFixtures {
+		_, ok := schemas[typ]
+		require.True(t, ok, "form fixture names unknown rule type %q", typ)
+	}
 }
