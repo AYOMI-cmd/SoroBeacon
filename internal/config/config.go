@@ -218,17 +218,21 @@ type Config struct {
 	// GraphQL is the GraphQL endpoint configuration.
 	GraphQL GraphQLConfig
 
-	// NotifyRateLimitSlackRPS is the max requests per second for Slack channels
-	// (NOTIFY_RATE_LIMIT_SLACK_RPS, default 1.0, citing Slack API tier 2 / webhooks guidelines ~1 msg/sec).
+	// NotifyRateLimitSlackRPS overrides the Slack delivery rate
+	// (NOTIFY_RATE_LIMIT_SLACK_RPS). Zero keeps the built-in notifier default;
+	// see notify.RateLimits.
 	NotifyRateLimitSlackRPS float64
-	// NotifyRateLimitTelegramRPS is the max requests per second for Telegram channels
-	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS, default 30.0, citing Telegram Bot API limit of 30 msg/sec).
+	// NotifyRateLimitTelegramRPS overrides the Telegram delivery rate
+	// (NOTIFY_RATE_LIMIT_TELEGRAM_RPS). Zero keeps the built-in notifier
+	// default; see notify.RateLimits.
 	NotifyRateLimitTelegramRPS float64
-	// NotifyRateLimitPagerDutyRPS is the max requests per second for PagerDuty channels
-	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS, default 2.0, citing PagerDuty Events API v2 rate limit ~2 requests/sec).
+	// NotifyRateLimitPagerDutyRPS overrides the PagerDuty delivery rate
+	// (NOTIFY_RATE_LIMIT_PAGERDUTY_RPS). Zero keeps the built-in notifier
+	// default; see notify.RateLimits.
 	NotifyRateLimitPagerDutyRPS float64
-	// NotifyRateLimitDefaultRPS is the default max requests per second for any other channel
-	// (NOTIFY_RATE_LIMIT_DEFAULT_RPS, default 5.0).
+	// NotifyRateLimitDefaultRPS overrides the fallback delivery rate for
+	// channel types without a specific limit (NOTIFY_RATE_LIMIT_DEFAULT_RPS).
+	// Zero keeps the built-in notifier default; see notify.RateLimits.
 	NotifyRateLimitDefaultRPS float64
 }
 
