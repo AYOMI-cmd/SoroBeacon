@@ -425,6 +425,20 @@ at `warn` and counted in `sorobeacon_reorgs_total`.
 
 Archive objects contain only alert rows (contract id, event, payload, ledger); channel `config` — the webhook URLs, bot tokens and SMTP credentials — is never read by the archiver and can never appear in one.
 
+## Flapping detection
+
+Flapping is derived from persisted alert times, grouped into episodes separated
+by a quiet period. Alert rows remain in history. When the threshold is reached,
+the second alert in an episode is delivered as a cumulative summary and later
+alerts in that episode are marked suppressed; a later episode is delivered
+normally when the threshold is no longer met.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `FLAPPING_EPISODES` | positive integer | `3` | optional | Number of episodes in the window that trigger damping. |
+| `FLAPPING_WINDOW` | Go duration | `15m` | optional | Window used to count alert episodes. |
+| `FLAPPING_QUIET_AFTER` | Go duration | `2m` | optional | Gap greater than this starts a new episode. |
+
 ## Alert enrichment
 
 Optional HTTP JSON context fetched for an alert as it is created, before delivery. The full contract, failure behaviour, caching and an example service are in the [alert enrichment guide](guides/alert-enrichment.md); the variables:

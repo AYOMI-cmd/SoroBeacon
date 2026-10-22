@@ -32,6 +32,9 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
+	DefaultFlappingEpisodes   = 3
+	DefaultFlappingWindow     = 15 * time.Minute
+	DefaultFlappingQuietAfter = 2 * time.Minute
 	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
 	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
 	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
@@ -170,6 +173,13 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// FlappingEpisodes is the number of alert episodes in FlappingWindow
+	// that trigger notification damping.
+	FlappingEpisodes int
+	// FlappingWindow is the alert-history window used to count episodes.
+	FlappingWindow time.Duration
+	// FlappingQuietAfter is the minimum gap between episodes.
+	FlappingQuietAfter time.Duration
 	// OTLP is the OpenTelemetry tracing configuration. Endpoint empty (the
 	// default, OTLP_ENDPOINT unset) disables tracing entirely: no exporter,
 	// no exporter goroutines, no measurable overhead — spans collapse to
@@ -308,6 +318,9 @@ func Load() (Config, error) {
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,
 		LogLevel:           slog.LevelInfo,
 		MonitorSilentAfter: DefaultMonitorSilentAfter,
+		FlappingEpisodes:   DefaultFlappingEpisodes,
+		FlappingWindow:     DefaultFlappingWindow,
+		FlappingQuietAfter: DefaultFlappingQuietAfter,
 		// Detection is on by default; confirmation depth off, so a monitor
 		// alerts exactly as soon as it did before this feature.
 		ReorgTrackingWindow:    DefaultReorgTrackingWindow,
@@ -537,6 +550,27 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("invalid ALERT_RETENTION %q: %w", v, err)
 		}
 		cfg.AlertRetention = d
+	}
+	if v := lookupConfigValue("FLAPPING_EPISODES", fileValues); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return cfg, fmt.Errorf("invalid FLAPPING_EPISODES %q: must be a positive integer", v)
+		}
+		cfg.FlappingEpisodes = n
+	}
+	if v := lookupConfigValue("FLAPPING_WINDOW", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid FLAPPING_WINDOW %q: must be a positive duration", v)
+		}
+		cfg.FlappingWindow = d
+	}
+	if v := lookupConfigValue("FLAPPING_QUIET_AFTER", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return cfg, fmt.Errorf("invalid FLAPPING_QUIET_AFTER %q: must be a positive duration", v)
+		}
+		cfg.FlappingQuietAfter = d
 	}
 	cfg.AlertEnrichmentURL = strings.TrimSpace(lookupConfigValue("ALERT_ENRICHMENT_URL", fileValues))
 	cfg.AlertEnrichmentTimeout = 2 * time.Second

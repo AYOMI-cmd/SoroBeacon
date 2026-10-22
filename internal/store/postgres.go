@@ -2176,6 +2176,31 @@ func (p *Postgres) RuleFiredWithin(ctx context.Context, ruleID int64, window tim
 	return fired, err
 }
 
+func (p *Postgres) ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	query := `SELECT created_at FROM alerts WHERE rule_id = $1 AND created_at >= $2`
+	args := []any{ruleID, since.UTC()}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		query += ` AND workspace_id = $3`
+		args = append(args, ws)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var times []time.Time
+	for rows.Next() {
+		var at time.Time
+		if err := rows.Scan(&at); err != nil {
+			return nil, err
+		}
+		times = append(times, at)
+	}
+	return times, rows.Err()
+}
+
 func (p *Postgres) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {
 	// No row check: the alert may have been pruned between dispatch and
 	// this write, and that must not fail the dispatch path.
