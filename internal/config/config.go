@@ -32,6 +32,8 @@ const (
 	// DefaultMonitorSilentAfter is how long since last_matched_at before
 	// the monitors list treats a monitor as silent.
 	DefaultMonitorSilentAfter = 24 * time.Hour
+	// DefaultShutdownGracePeriod is how long to wait for in-flight deliveries
+	// before persisting them as retries and exiting.\n\tDefaultShutdownGracePeriod = 30 * time.Second
 	// DefaultReorgTrackingWindow is how many recent ledger hashes the poller
 	// keeps for reorg detection. 128 ledgers is roughly ten minutes on
 	// Stellar and a few getLedgers pages per cycle — cheap, and deep enough
@@ -165,6 +167,9 @@ type Config struct {
 	// MonitorSilentAfter is how long since last_matched_at before the
 	// dashboard marks a monitor silent. Default 24h.
 	MonitorSilentAfter time.Duration
+	// ShutdownGracePeriod is how long to wait for in-flight deliveries
+	// before persisting them as retries and exiting.
+	ShutdownGracePeriod time.Duration
 	// OTLP is the OpenTelemetry tracing configuration. Endpoint empty (the
 	// default, OTLP_ENDPOINT unset) disables tracing entirely: no exporter,
 	// no exporter goroutines, no measurable overhead — spans collapse to
@@ -455,6 +460,17 @@ func Load() (Config, error) {
 			return cfg, fmt.Errorf("MONITOR_SILENT_AFTER %q must be greater than 0", v)
 		}
 		cfg.MonitorSilentAfter = d
+	}
+
+	if v := lookupConfigValue("SHUTDOWN_GRACE_PERIOD", fileValues); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid SHUTDOWN_GRACE_PERIOD %q: %w", v, err)
+		}
+		if d <= 0 {
+			return cfg, fmt.Errorf("SHUTDOWN_GRACE_PERIOD %q must be greater than 0", v)
+		}
+		cfg.ShutdownGracePeriod = d
 	}
 
 	if v := lookupConfigValue("RATE_LIMIT_TRUST_FORWARDED", fileValues); v != "" {
