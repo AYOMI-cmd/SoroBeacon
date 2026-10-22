@@ -112,6 +112,26 @@ func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings)
 	return p, nil
 }
 
+// NewPostgresReadOnly opens a primary pool whose transactions default to
+// read-only. It intentionally does not open the optional replica pool because
+// preflight inspection uses only the primary database.
+func NewPostgresReadOnly(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
+	cfg, err := buildPoolConfig(databaseURL, settings)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return &Postgres{pool: pool}, nil
+}
+
 // buildPoolConfig parses databaseURL and overlays any non-zero pool
 // settings. Zero means "leave the pgx default" so unset env vars do
 // not change MaxConns / MinConns / lifetimes.

@@ -80,6 +80,13 @@ type Notifier interface {
 	Send(ctx context.Context, a Alert) error
 }
 
+// PreflightChecker verifies a notifier's remote configuration without sending
+// an alert. A channel that cannot offer a non-delivering probe should not
+// implement this interface.
+type PreflightChecker interface {
+	Check(ctx context.Context) error
+}
+
 // Constructor builds a Notifier from a channel's JSON config.
 type Constructor func(config json.RawMessage) (Notifier, error)
 
@@ -193,13 +200,20 @@ func (f *Factory) InvalidateSecretCache() {
 // resolved against the attached resolver, if any; the resolved copy stays in
 // memory with the notifier and is never written back, logged or returned.
 func (f *Factory) New(channelType string, config json.RawMessage) (Notifier, error) {
+	return f.NewContext(context.Background(), channelType, config)
+}
+
+// NewContext builds a notifier while resolving secrets with ctx. It is useful
+// for bounded preflight checks; resolved values remain only in the returned
+// notifier and are never written back to channel config.
+func (f *Factory) NewContext(ctx context.Context, channelType string, config json.RawMessage) (Notifier, error) {
 	c, ok := f.constructors[channelType]
 	if !ok {
 		return nil, fmt.Errorf("unknown channel type %q (registered: %v)", channelType, f.Types())
 	}
 	resolved := config
 	if f.secrets != nil && len(config) > 0 {
-		r, err := f.secrets.ResolveConfig(context.Background(), config)
+		r, err := f.secrets.ResolveConfig(ctx, config)
 		if err != nil {
 			return nil, err
 		}
