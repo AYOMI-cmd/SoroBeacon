@@ -494,6 +494,12 @@ client-side buckets, not a promise that the provider accepts every request: a
 provider-side `429` is still possible and is retried using its `Retry-After`
 when one is present.
 
+## Federation
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `INSTANCE_NAME` | string | empty | optional | Stable identity for this deployment, stamped as the `origin` on every federated alert. It must be unique across instances that federate with each other. Empty is fine for a standalone instance, but creating a `federation` channel then fails with an actionable error; the process still starts. |
+
 ## Channel health
 
 | Variable | Type | Default | Required | What it does |

@@ -113,6 +113,11 @@ config:
   # the application's defaults.
   graphqlMaxDepth: ""
   graphqlMaxComplexity: ""
+  # Stable identity for this deployment, stamped as the origin on federated
+  # alerts. Must be unique across instances that federate with each other.
+  # Empty is fine for a standalone instance, but creating a federation channel
+  # then fails with an actionable error; the process still starts.
+  instanceName: ""
   # API + dashboard listen address. Must match service.targetPort.
   httpAddr: ":8080"
   # Maximum request body size for API write endpoints (POST/PATCH/PUT), in

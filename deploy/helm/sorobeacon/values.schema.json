@@ -162,6 +162,10 @@
           "type": "string",
           "description": "SoroTrail indexer base URL. Required when sourceMode is sorotrail."
         },
+        "instanceName": {
+          "type": "string",
+          "description": "Stable identity stamped as the origin on federated alerts. Empty is fine unless a federation channel is created."
+        },
         "httpAddr": {
           "type": "string",
           "pattern": "^:?[0-9]+$|^[^:]+:[0-9]+$",
