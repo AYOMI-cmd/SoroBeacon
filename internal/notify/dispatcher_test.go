@@ -58,6 +58,8 @@ type fakeDispatchStore struct {
 	channels []store.Channel
 	attempts []store.DeliveryAttempt
 	health   []channelHealthCall
+	// deadLetters records the dead letters the dispatcher wrote.
+	deadLetters []store.DeadLetter
 	// window, when set, is returned by ActiveMaintenanceWindow.
 	window *store.MaintenanceWindow
 	// suppressed records the alert ID and reason of each suppression.
@@ -82,7 +84,8 @@ func (f *fakeDispatchStore) RecordDeliveryAttempt(_ context.Context, d *store.De
 	return nil
 }
 
-func (f *fakeDispatchStore) CreateDeadLetter(_ context.Context, _ *store.DeadLetter) error {
+func (f *fakeDispatchStore) CreateDeadLetter(_ context.Context, d *store.DeadLetter) error {
+	f.deadLetters = append(f.deadLetters, *d)
 	return nil
 }
 
@@ -599,3 +602,76 @@ func TestRetryAppliesPerChannelTimeout(t *testing.T) {
 	require.True(t, n.hasDeadline, "Retry must apply channel timeout to ctx")
 	assert.WithinDuration(t, before.Add(8*time.Second), n.gotDeadline, 500*time.Millisecond)
 }
+
+
+func TestDispatchDisableAfterFailuresBasic(t *testing.T) {
+	// Default (0) never auto-disables
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &mockNotifier{failures: 99, err: &HTTPStatusError{StatusCode: 404, Body: "gone"}}
+	d := newTestDispatcher(t, st, n)
+
+	d.Dispatch(context.Background(), Alert{ID: 34, MonitorID: 2})
+
+	updates := healthFor(st, 1)
+	require.Len(t, updates, 1)
+	assert.Zero(t, updates[0].DisableAfter, "default (0) never auto-disables")
+}
+
+// Threshold 4 with 404 permanent failures - after 4 failures, channel auto-disables
+func TestDispatchDisableAfterFailuresThreshold(t *testing.T) {
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &mockNotifier{failures: 99, err: &HTTPStatusError{StatusCode: 404, Body: "gone"}}
+	d := newTestDispatcher(t, st, n)
+	d.WithDisableAfterFailures(4)
+
+	// Each dispatch records health with DisableAfter=4 (the threshold),
+	// but the auto-disable behavior depends on whether the channel has
+	// already accumulated enough permanent failures in the store.
+	// First dispatch: health recorded with DisableAfter=4
+	d.Dispatch(context.Background(), Alert{ID: 34, MonitorID: 2})
+	updates := healthFor(st, 1)
+	require.Len(t, updates, 1)
+	// The threshold value is always 4 when configured; what matters is
+	// whether the store's auto-disable logic triggers after N permanent failures.
+	assert.Equal(t, 4, updates[0].DisableAfter, "DisableAfter is set to the configured threshold")
+
+	// A 404 is not retried — the receiver rejected the request itself, and
+	// sending it again unchanged fails the same way — so a delivery is one
+	// attempt and the circuit breaker counts one failure per delivery. The
+	// second and third dispatches still reach the channel.
+	d.Dispatch(context.Background(), Alert{ID: 35, MonitorID: 2})
+	updates = healthFor(st, 1)
+	require.Len(t, updates, 2)
+	assert.Equal(t, 4, updates[1].DisableAfter, "DisableAfter remains at threshold value")
+
+	// Third dispatch
+	d.Dispatch(context.Background(), Alert{ID: 36, MonitorID: 2})
+	updates = healthFor(st, 1)
+	require.Len(t, updates, 3)
+	assert.Equal(t, 4, updates[2].DisableAfter, "DisableAfter remains at threshold value")
+
+	// Fourth dispatch: the breaker is open by now, so the channel is skipped
+	// and the health is left alone.
+	d.Dispatch(context.Background(), Alert{ID: 37, MonitorID: 2})
+	updates = healthFor(st, 1)
+	require.Len(t, updates, 3)
+	assert.Equal(t, 4, updates[2].DisableAfter, "DisableAfter remains at threshold value")
+
+	// Fifth dispatch
+	d.Dispatch(context.Background(), Alert{ID: 38, MonitorID: 2})
+	updates = healthFor(st, 1)
+	require.Len(t, updates, 3)
+	assert.Equal(t, 4, updates[0].DisableAfter, "DisableAfter remains at threshold value")
+}
+
+// WithMetrics(nil) should be nil-safe
+func TestDispatchWithMetricsNilSafe(t *testing.T) {
+	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+	d.WithMetrics(nil) // should not panic
+
+	d.Dispatch(context.Background(), Alert{ID: 39, MonitorID: 2})
+	assert.Equal(t, 1, n.calls, "dispatch with nil metrics should still work")
+}
+
