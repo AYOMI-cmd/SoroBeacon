@@ -130,6 +130,10 @@ config:
   # How long since a monitor's last match before the dashboard marks it
   # silent.
   monitorSilentAfter: "24h"
+  # Dampen repeated alert episodes; defaults match internal/config.
+  flappingEpisodes: 3
+  flappingWindow: "15m"
+  flappingQuietAfter: "2m"
   # Ledger lag at which /readyz fails. 0 disables the check, so a lagging
   # poller cannot take itself out of a load balancer without opting in.
   readyzLagThreshold: 0

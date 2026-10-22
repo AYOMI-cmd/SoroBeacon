@@ -412,7 +412,12 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		}).
 		WithMetrics(m).
 		WithDigestQueue(st).
-		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures).
+		WithFlapping(alerts.FlappingConfig{
+			Episodes:   cfg.FlappingEpisodes,
+			Window:     cfg.FlappingWindow,
+			QuietAfter: cfg.FlappingQuietAfter,
+		})
 	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
 	if err != nil {
 		return nil, err

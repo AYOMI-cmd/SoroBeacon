@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sorotrail/sorobeacon/internal/alerts"
 	"github.com/sorotrail/sorobeacon/internal/store"
 )
 
@@ -67,6 +68,7 @@ type fakeDispatchStore struct {
 	// inhibitions feeds the inhibition check; firing answers RuleFiredWithin.
 	inhibitions []store.Inhibition
 	firing      map[int64]bool
+	alertTimes  map[int64][]time.Time
 	inhibited   []inhibitedMark
 }
 
@@ -138,6 +140,10 @@ func (f *fakeDispatchStore) ListInhibitionsForTarget(_ context.Context, target i
 
 func (f *fakeDispatchStore) RuleFiredWithin(_ context.Context, ruleID int64, _ time.Duration) (bool, error) {
 	return f.firing[ruleID], nil
+}
+
+func (f *fakeDispatchStore) ListRuleAlertTimes(_ context.Context, ruleID int64, _ time.Time) ([]time.Time, error) {
+	return f.alertTimes[ruleID], nil
 }
 
 func (f *fakeDispatchStore) MarkAlertInhibited(_ context.Context, alertID, sourceID int64) error {
@@ -225,6 +231,57 @@ func TestDispatchSuccessFirstTry(t *testing.T) {
 	assert.Equal(t, "success", st.attempts[0].Status)
 	assert.Equal(t, int64(10), st.attempts[0].AlertID)
 	assert.Equal(t, int64(1), st.attempts[0].ChannelID)
+}
+
+func TestDispatchDampsFlappingRule(t *testing.T) {
+	base := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	st := &fakeDispatchStore{
+		channels:   []store.Channel{mockChannel(1)},
+		alertTimes: map[int64][]time.Time{},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n).WithFlapping(alerts.FlappingConfig{
+		Episodes: 3, Window: 15 * time.Minute, QuietAfter: 2 * time.Minute,
+	}).WithClock(func() time.Time { return base.Add(11 * time.Minute) })
+
+	alertTimes := []time.Time{
+		base,
+		base.Add(5 * time.Minute),
+		base.Add(10 * time.Minute),
+		base.Add(10*time.Minute + 30*time.Second),
+		base.Add(11 * time.Minute),
+	}
+	for i, at := range alertTimes {
+		st.alertTimes[9] = append(st.alertTimes[9], at)
+		d.Dispatch(context.Background(), Alert{
+			ID: int64(i + 1), MonitorID: 2, RuleID: 9, CreatedAt: at,
+		})
+	}
+
+	require.Equal(t, 4, n.calls, "episode starts and one summary are delivered")
+	assert.Contains(t, n.lastSent.Digest, "4 alerts in the last 15 minutes across 3 episodes")
+	require.Len(t, st.suppressed, 1)
+	assert.Contains(t, st.suppressed[0], "flapping")
+	require.Len(t, st.attempts, 4)
+	assert.Len(t, st.alertTimes[9], 5, "all alert history remains available to detection")
+}
+
+func TestDispatchNonFlappingRuleUnchanged(t *testing.T) {
+	base := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	st := &fakeDispatchStore{
+		channels:   []store.Channel{mockChannel(1)},
+		alertTimes: map[int64][]time.Time{9: {base}},
+	}
+	n := &mockNotifier{}
+	d := newTestDispatcher(t, st, n)
+	alert := Alert{ID: 20, MonitorID: 2, RuleID: 9, CreatedAt: base.Add(time.Minute)}
+
+	d.Dispatch(context.Background(), alert)
+
+	require.Equal(t, 1, n.calls)
+	assert.Equal(t, alert, n.lastSent)
+	require.Len(t, st.attempts, 1)
+	assert.Empty(t, st.suppressed)
 }
 
 func TestDispatchRetriesThenSucceeds(t *testing.T) {
@@ -603,7 +660,6 @@ func TestRetryAppliesPerChannelTimeout(t *testing.T) {
 	assert.WithinDuration(t, before.Add(8*time.Second), n.gotDeadline, 500*time.Millisecond)
 }
 
-
 func TestDispatchDisableAfterFailuresBasic(t *testing.T) {
 	// Default (0) never auto-disables
 	st := &fakeDispatchStore{channels: []store.Channel{mockChannel(1)}}
@@ -674,4 +730,3 @@ func TestDispatchWithMetricsNilSafe(t *testing.T) {
 	d.Dispatch(context.Background(), Alert{ID: 39, MonitorID: 2})
 	assert.Equal(t, 1, n.calls, "dispatch with nil metrics should still work")
 }
-

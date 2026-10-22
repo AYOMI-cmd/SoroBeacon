@@ -191,6 +191,19 @@
           "pattern": "^[0-9]+(ms|s|m|h)$",
           "description": "How long since a monitor's last match before it is shown as silent."
         },
+        "flappingEpisodes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Alert episodes inside the flapping window that trigger damping."
+        },
+        "flappingWindow": {
+          "type": "string",
+          "description": "Go duration for the flapping episode-count window."
+        },
+        "flappingQuietAfter": {
+          "type": "string",
+          "description": "Go duration of quiet that separates alert episodes."
+        },
         "readyzLagThreshold": {
           "type": "integer",
           "minimum": 0,

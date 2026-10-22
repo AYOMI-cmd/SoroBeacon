@@ -2373,6 +2373,35 @@ func (s *SQLite) RuleFiredWithin(ctx context.Context, ruleID int64, window time.
 	return fired != 0, nil
 }
 
+func (s *SQLite) ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	query := `SELECT created_at FROM alerts WHERE rule_id = ? AND created_at >= ?`
+	args := []any{ruleID, sqliteTimeString(since.UTC())}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		query += ` AND workspace_id = ?`
+		args = append(args, ws)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer rows.Close()
+
+	var times []time.Time
+	for rows.Next() {
+		var stored string
+		if err := rows.Scan(&stored); err != nil {
+			return nil, err
+		}
+		at, err := time.Parse(sqliteTimeLayout, stored)
+		if err != nil {
+			return nil, err
+		}
+		times = append(times, at)
+	}
+	return times, rows.Err()
+}
+
 func (s *SQLite) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {
 	// No row check: the alert may have been pruned between dispatch and
 	// this write, and that must not fail the dispatch path.
