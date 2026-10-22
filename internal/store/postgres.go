@@ -1644,13 +1644,20 @@ func (p *Postgres) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
 	).Scan(&d.ID, &d.CreatedAt))
 }
 
-// GetDeadLetter returns one dead-letter record by id.
+// GetDeadLetter returns one dead-letter record by id. dead_letters carries no
+// workspace_id of its own, so the tenant predicate reaches it through the
+// alert it belongs to; a caller without a tenant reads by id alone.
 func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
 	var d DeadLetter
-	err := p.pool.QueryRow(ctx,
-		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
-		 FROM dead_letters WHERE id = $1`, id,
-	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE id = $1`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	err := p.pool.QueryRow(ctx, q, args...).
+		Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1658,7 +1665,8 @@ func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, er
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters.
+// optional channel, alert, and pagination filters. A tenant sees only records
+// whose alert belongs to it; the dispatcher's system context sees every row.
 func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
 		FROM dead_letters WHERE TRUE`
@@ -1668,6 +1676,9 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]D
 		n++
 		args = append(args, v)
 		return fmt.Sprintf("$%d", n)
+	}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ` + arg(ws) + `)`
 	}
 	if f.ChannelID != 0 {
 		q += ` AND channel_id = ` + arg(f.ChannelID)
