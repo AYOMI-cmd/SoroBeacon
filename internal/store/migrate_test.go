@@ -4,15 +4,60 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMigrationStateSQLiteIsReadOnly(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "preflight.db")
+	url := "sqlite://" + path
+
+	if _, _, _, err := MigrationState(ctx, url); err == nil {
+		t.Fatal("an absent database should not be treated as migrated")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only preflight created the database: stat error = %v", err)
+	}
+
+	require.NoError(t, Migrate(url))
+	current, latest, dirty, err := MigrationState(ctx, url)
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.Equal(t, latest, current)
+
+	st, err := NewReadOnly(ctx, url, PoolSettings{}, nil)
+	require.NoError(t, err)
+	defer st.Close()
+	err = st.CreateMonitor(ctx, &Monitor{Name: "must not be written", ContractIDs: []string{"C"}, Enabled: true})
+	require.Error(t, err, "the preflight store must reject writes")
+}
+
+func TestMigrationStatePostgresReadOnly(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres preflight test")
+	}
+	require.NoError(t, Migrate(url))
+	current, latest, dirty, err := MigrationState(context.Background(), url)
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.Equal(t, latest, current)
+
+	st, err := NewReadOnly(context.Background(), url, PoolSettings{}, nil)
+	require.NoError(t, err)
+	defer st.Close()
+	err = st.CreateMonitor(context.Background(), &Monitor{Name: "must not be written", ContractIDs: []string{"C"}, Enabled: true})
+	require.Error(t, err, "Postgres preflight transactions must reject writes")
+}
 
 // TestMigrate_RoundTrip tests that migrations apply up, down, and up again
 // correctly. It skips when TEST_DATABASE_URL is unset so `go test ./...`

@@ -99,6 +99,26 @@ func NewSQLite(ctx context.Context, databaseURL string) (*SQLite, error) {
 	return &SQLite{db: db}, nil
 }
 
+// NewSQLiteReadOnly opens an existing SQLite database without creating files
+// or allowing a statement through this handle to modify the database.
+func NewSQLiteReadOnly(ctx context.Context, databaseURL string) (*SQLite, error) {
+	dsn, err := sqliteReadOnlyDSN(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(sqliteDriver, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite read-only: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite: %w", err)
+	}
+	return &SQLite{db: db}, nil
+}
+
 func (s *SQLite) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 func (s *SQLite) Close()                         { _ = s.db.Close() }
 
@@ -199,6 +219,18 @@ func sqliteDSN(databaseURL string) (string, error) {
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Set("_txlock", "immediate")
+	return "file:" + path + "?" + q.Encode(), nil
+}
+
+func sqliteReadOnlyDSN(databaseURL string) (string, error) {
+	path, err := sqliteFilePath(databaseURL)
+	if err != nil {
+		return "", err
+	}
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "query_only(1)")
 	return "file:" + path + "?" + q.Encode(), nil
 }
 
