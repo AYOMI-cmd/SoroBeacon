@@ -509,8 +509,11 @@ func TestChaosAutoDisableAfterPermanentFailures(t *testing.T) {
 	alert := Alert{ID: 1, MonitorID: 1, MonitorName: "test", RuleID: 1, EventID: "evt-1", Payload: json.RawMessage(`{}`), CreatedAt: time.Now()}
 	d.Dispatch(context.Background(), alert)
 
-	// Should have attempted 3 times (MaxAttempts) and then auto-disabled
-	require.GreaterOrEqual(t, len(st.attempts), 3)
+	// Should have attempted once: a 404 is the receiver rejecting the request
+	// itself, so a second identical attempt cannot succeed. The failure is
+	// still classified permanent, which is what the auto-disable threshold
+	// counts.
+	require.Len(t, st.attempts, 1)
 	require.Len(t, st.health, 1)
 	// The last health update should show auto-disable
 	// (We can't easily check DisabledAt from the mock, but we verify permanent classification)

@@ -558,27 +558,20 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 			}
 		}
 
+		// A receiver that rejected the request itself (a 4xx that is not a
+		// "come back later" answer) will reject it again, so the delivery is
+		// over rather than paused: spending the retry budget on it would
+		// write the same failure three times and delay the dead letter that
+		// tells the operator the payload is the problem.
+		if !Retryable(err) {
+			d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: lastErr.Error(), Permanent: permanent})
+			d.deadLetter(ctx, a, ch, err, attempt)
+			return
+		}
+
 		if attempt >= d.MaxAttempts {
 			d.recordHealth(ctx, ch.ID, store.ChannelHealthUpdate{Error: lastErr.Error(), Permanent: permanent})
-			lastStatus := 0
-			if statusErr, ok := err.(*StatusError); ok {
-				lastStatus = statusErr.Code
-			}
-			dl := &store.DeadLetter{
-				AlertID:      a.ID,
-				ChannelID:    ch.ID,
-				LastError:    sanitizeDeliveryError(redactURLError(err)).Error(),
-				AttemptCount: attempt,
-				LastStatus:   lastStatus,
-			}
-			if errStore := d.store.CreateDeadLetter(ctx, dl); errStore != nil {
-				d.log.Error("create dead letter", "alert_id", a.ID, "channel_id", ch.ID, "err", errStore)
-			} else if d.metrics != nil {
-				d.metrics.RecordDeadLetter()
-			}
-			// The attempt cap is the end of this delivery: without returning,
-			// the loop falls through to the backoff and keeps retrying past
-			// MaxAttempts, writing one dead letter per extra attempt.
+			d.deadLetter(ctx, a, ch, err, attempt)
 			return
 		}
 		if ctx.Err() != nil || cb.State() == StateOpen {
@@ -593,6 +586,30 @@ func (d *Dispatcher) deliver(ctx context.Context, a Alert, ch store.Channel) {
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// deadLetter records a delivery that will not be retried. The error is
+// sanitized before it is stored: the message becomes the dead letter's
+// last_error, which the dashboard reads back, and a transport error can carry
+// the webhook URL or a token from the request.
+func (d *Dispatcher) deadLetter(ctx context.Context, a Alert, ch store.Channel, err error, attempts int) {
+	lastStatus := 0
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) {
+		lastStatus = statusErr.Code
+	}
+	dl := &store.DeadLetter{
+		AlertID:      a.ID,
+		ChannelID:    ch.ID,
+		LastError:    sanitizeDeliveryError(redactURLError(err)).Error(),
+		AttemptCount: attempts,
+		LastStatus:   lastStatus,
+	}
+	if errStore := d.store.CreateDeadLetter(ctx, dl); errStore != nil {
+		d.log.Error("create dead letter", "alert_id", a.ID, "channel_id", ch.ID, "err", errStore)
+	} else if d.metrics != nil {
+		d.metrics.RecordDeadLetter()
 	}
 }
 
@@ -704,6 +721,10 @@ func (d *Dispatcher) RedriveDeadLetter(ctx context.Context, deadLetterID int64, 
 		Enrichment: alert.Enrichment,
 		Severity:   string(alert.Severity),
 		CreatedAt:  alert.CreatedAt,
+		// A federated alert has no local rule, so the channels that key on
+		// the rule need the instance it came from to tell two peers' alerts
+		// apart.
+		FederationOrigin: alert.FederationOrigin,
 	}
 
 	err = notifier.Send(attemptCtx, alertObj)
