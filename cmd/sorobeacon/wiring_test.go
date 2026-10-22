@@ -321,7 +321,7 @@ func buildWiring(ctx context.Context, cfg config.Config, log *slog.Logger) (*wir
 	// Minimal stubs for dependencies not under test.
 	st := &fakeStore{}
 	reg := rules.NewRegistry()
-	factory := notify.DefaultFactory()
+	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName)
 
 	// Poller interval
 	p := poller.New(nil, st, reg, nil, cfg.PollInterval, log)

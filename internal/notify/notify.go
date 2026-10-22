@@ -88,8 +88,9 @@ type Constructor func(config json.RawMessage) (Notifier, error)
 // config before it runs, so all channel types support external secrets
 // without individual changes.
 type Factory struct {
-	constructors map[string]Constructor
-	secrets      *secrets.Resolver
+	constructors     map[string]Constructor
+	secrets          *secrets.Resolver
+	federationOrigin string
 }
 
 // Channel type names understood by DefaultFactory.
@@ -129,7 +130,7 @@ func DefaultFactory() *Factory {
 	f.Register(TypeNtfy, NewNtfy)
 	f.Register(TypeMatrix, NewMatrix)
 	f.Register(TypePagerDuty, NewPagerDuty)
-	f.Register(TypeFederation, NewFederation)
+	f.Register(TypeFederation, f.newFederation)
 	f.Register(TypeTwilio, NewTwilio)
 	f.Register(TypeSignal, NewSignal)
 	f.Register(TypeWebex, NewWebex)
@@ -167,6 +168,15 @@ func (f *Factory) Types() []string {
 // secrets existed.
 func (f *Factory) WithSecrets(r *secrets.Resolver) *Factory {
 	f.secrets = r
+	return f
+}
+
+// WithFederationOrigin sets the sending instance's identity, stamped as the
+// origin on every federated alert. An empty origin leaves federation
+// fail-closed: creating a federation channel returns an actionable error
+// instead of sending payloads the receiving instance must reject.
+func (f *Factory) WithFederationOrigin(origin string) *Factory {
+	f.federationOrigin = strings.TrimSpace(origin)
 	return f
 }
 

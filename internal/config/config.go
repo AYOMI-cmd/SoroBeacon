@@ -132,6 +132,11 @@ type Config struct {
 	// call the API cross-origin (CORS_ALLOWED_ORIGINS, comma-separated).
 	// Empty disables CORS; the dashboard is same-origin and never needs it.
 	CORSAllowedOrigins []string
+	// InstanceName is this deployment's stable identity (INSTANCE_NAME). It is
+	// stamped as the origin on federated alerts and must be unique across the
+	// sending instances. Empty is fine unless a federation channel is created;
+	// the channel factory then fails closed with an actionable error.
+	InstanceName string
 	// HTTPAddr is the listen address for the API and dashboard.
 	HTTPAddr string
 	// HTTPMaxBodyBytes is the maximum request body size accepted by API
@@ -297,6 +302,7 @@ func Load() (Config, error) {
 		RPCURL:             net.RPCURL,
 		RPCURLs:            net.RPCURLs,
 		DatabaseURL:        lookupConfigValue("DATABASE_URL", fileValues),
+		InstanceName:       strings.TrimSpace(lookupConfigValue("INSTANCE_NAME", fileValues)),
 		PollInterval:       DefaultPollInterval,
 		HTTPAddr:           valueOrFallback("HTTP_ADDR", fileValues, DefaultHTTPAddr),
 		HTTPMaxBodyBytes:   DefaultHTTPMaxBodyBytes,

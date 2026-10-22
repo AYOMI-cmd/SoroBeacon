@@ -392,7 +392,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			}
 			return records, nil
 		})))
-	factory := notify.DefaultFactory()
+	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName)
 	// External secrets: when a provider is configured, ${secret:...}
 	// references in channel configs resolve when a notifier is built. The
 	// stored config keeps the reference.
@@ -837,7 +837,7 @@ func runBackfill(args []string) error {
 	}
 
 	registry := rules.NewRegistry()
-	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory(), log)
+	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName), log)
 	ingestor := poller.NewIngestor(st, registry, dispatcher, log)
 	job := backfill.New(src, st, registry, ingestor, log)
 
