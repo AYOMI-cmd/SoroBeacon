@@ -85,6 +85,7 @@ type Dispatcher struct {
 	// metrics is optional Prometheus instrumentation; nil-safe.
 	metrics     *metrics.Metrics
 	registry    *BreakerRegistry
+	rateLimits  RateLimits
 	rateLimiter *ChannelRateLimiter
 	// telemetry is optional tracing; nil-safe. Delivery spans are started
 	// from the alert's context, so they are children of the alert's span —
@@ -119,14 +120,6 @@ type Dispatcher struct {
 
 // NewDispatcher wires a Dispatcher with default retry settings.
 func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
-	defaults := map[string]float64{
-		"slack":     1.0,
-		"telegram":  30.0,
-		"pagerduty": 2.0,
-		"discord":   5.0,
-		"email":     5.0,
-		"webhook":   5.0,
-	}
 	return &Dispatcher{
 		store:              s,
 		factory:            f,
@@ -134,10 +127,24 @@ func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
 		registry:           NewBreakerRegistry(3, 30*time.Second),
 		MaxAttempts:        3,
 		BaseBackoff:        time.Second,
-		rateLimiter:        NewChannelRateLimiter(defaults),
+		rateLimits:         RateLimits{},
+		rateLimiter:        NewRateLimiter(RateLimits{}),
 		EscalationInterval: DefaultEscalationInterval,
 		EscalationBatch:    DefaultEscalationBatch,
 	}
+}
+
+// WithRateLimits applies operator overrides to the channel rate limiter. A
+// zero field keeps the built-in default for that provider.
+func (d *Dispatcher) WithRateLimits(r RateLimits) *Dispatcher {
+	d.rateLimits = r
+	d.rateLimiter = NewRateLimiter(r)
+	return d
+}
+
+// RateLimits returns the configured overrides. Exposed for wiring tests.
+func (d *Dispatcher) RateLimits() RateLimits {
+	return d.rateLimits
 }
 
 // WithDisableAfterFailures sets how many consecutive permanent failures

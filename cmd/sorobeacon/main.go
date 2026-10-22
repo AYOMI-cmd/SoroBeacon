@@ -404,6 +404,12 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// threshold is off unless the operator sets it — auto-disabling a channel
 	// is a destructive answer to a temporary problem.
 	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithRateLimits(notify.RateLimits{
+			SlackRPS:     cfg.NotifyRateLimitSlackRPS,
+			TelegramRPS:  cfg.NotifyRateLimitTelegramRPS,
+			PagerDutyRPS: cfg.NotifyRateLimitPagerDutyRPS,
+			DefaultRPS:   cfg.NotifyRateLimitDefaultRPS,
+		}).
 		WithMetrics(m).
 		WithDigestQueue(st).
 		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)

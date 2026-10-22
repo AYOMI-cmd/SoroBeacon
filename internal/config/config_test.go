@@ -33,6 +33,10 @@ func TestLoadDefaults(t *testing.T) {
 	t.Setenv("CONFIG_ENCRYPTION_KEY", "")
 	t.Setenv("API_TOKEN", "")
 	t.Setenv("CHANNEL_DISABLE_AFTER_FAILURES", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_SLACK_RPS", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", "")
+	t.Setenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS", "")
 	t.Setenv("WORKSPACE_TOKENS", "")
 	t.Setenv("OIDC_ISSUER", "")
 	t.Setenv("OIDC_CLIENT_ID", "")
@@ -67,6 +71,10 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Zero(t, cfg.DatabaseMaxConnIdleTime)
 	assert.Equal(t, time.Duration(0), cfg.AlertRetention)
 	assert.Equal(t, DefaultMonitorSilentAfter, cfg.MonitorSilentAfter)
+	assert.Zero(t, cfg.NotifyRateLimitSlackRPS)
+	assert.Zero(t, cfg.NotifyRateLimitTelegramRPS)
+	assert.Zero(t, cfg.NotifyRateLimitPagerDutyRPS)
+	assert.Zero(t, cfg.NotifyRateLimitDefaultRPS)
 	assert.Nil(t, cfg.ConfigEncryptionKey)
 	assert.Empty(t, cfg.APITokens)
 	// Tracing defaults to entirely off.
@@ -484,6 +492,48 @@ func TestLoadRateLimit(t *testing.T) {
 	cfg, err = Load()
 	require.NoError(t, err)
 	assert.Equal(t, 25, cfg.RateLimitBurst)
+}
+
+func TestLoadNotifyRateLimits(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("NOTIFY_RATE_LIMIT_SLACK_RPS", "7.5")
+	t.Setenv("NOTIFY_RATE_LIMIT_TELEGRAM_RPS", "42")
+	t.Setenv("NOTIFY_RATE_LIMIT_PAGERDUTY_RPS", "3.5")
+	t.Setenv("NOTIFY_RATE_LIMIT_DEFAULT_RPS", "11")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 7.5, cfg.NotifyRateLimitSlackRPS)
+	assert.Equal(t, 42.0, cfg.NotifyRateLimitTelegramRPS)
+	assert.Equal(t, 3.5, cfg.NotifyRateLimitPagerDutyRPS)
+	assert.Equal(t, 11.0, cfg.NotifyRateLimitDefaultRPS)
+
+	// Zero is accepted and means "keep the built-in default", not "disable".
+	t.Setenv("NOTIFY_RATE_LIMIT_SLACK_RPS", "0")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Zero(t, cfg.NotifyRateLimitSlackRPS)
+}
+
+func TestLoadRejectsBadNotifyRateLimits(t *testing.T) {
+	names := []string{
+		"NOTIFY_RATE_LIMIT_SLACK_RPS",
+		"NOTIFY_RATE_LIMIT_TELEGRAM_RPS",
+		"NOTIFY_RATE_LIMIT_PAGERDUTY_RPS",
+		"NOTIFY_RATE_LIMIT_DEFAULT_RPS",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			for _, other := range names {
+				t.Setenv(other, "1")
+			}
+			t.Setenv(name, "-1")
+
+			_, err := Load()
+			assert.ErrorContains(t, err, name)
+		})
+	}
 }
 
 func TestLoadRejectsBadRateLimit(t *testing.T) {

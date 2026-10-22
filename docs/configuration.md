@@ -475,6 +475,25 @@ export OTLP_ENDPOINT=http://localhost:4318
 # OTLP_SAMPLE_RATE=0.25                  # keep a quarter of traces
 ```
 
+## Notification rate limits
+
+The dispatcher keeps one token bucket per channel, keyed by channel ID, so two
+channels of the same type do not share a budget. These variables change the
+per-type defaults; they do not limit the API or the dashboard.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `NOTIFY_RATE_LIMIT_SLACK_RPS` | float | `1` | optional | Maximum Slack deliveries per second. The default follows Slack's webhook guidance of roughly one message per second. |
+| `NOTIFY_RATE_LIMIT_TELEGRAM_RPS` | float | `30` | optional | Maximum Telegram deliveries per second, matching the Bot API's 30 messages-per-second limit. |
+| `NOTIFY_RATE_LIMIT_PAGERDUTY_RPS` | float | `2` | optional | Maximum PagerDuty deliveries per second, matching the Events API v2 rate limit. |
+| `NOTIFY_RATE_LIMIT_DEFAULT_RPS` | float | `5` | optional | Fallback for channel types without a dedicated limit (Discord, email, webhook, and any future type). |
+
+Unset or `0` keeps the built-in default; zero does **not** disable delivery.
+Negative, non-numeric, NaN and infinite values fail startup. These are
+client-side buckets, not a promise that the provider accepts every request: a
+provider-side `429` is still possible and is retried using its `Retry-After`
+when one is present.
+
 ## Channel health
 
 | Variable | Type | Default | Required | What it does |
