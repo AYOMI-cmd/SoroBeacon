@@ -2385,7 +2385,7 @@ func (s *SQLite) ListRuleAlertTimes(ctx context.Context, ruleID int64, since tim
 	if err != nil {
 		return nil, mapSQLiteErr(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var times []time.Time
 	for rows.Next() {
