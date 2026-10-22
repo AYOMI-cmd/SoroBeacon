@@ -61,6 +61,7 @@ type DispatchStore interface {
 	// records why delivery stopped.
 	ListInhibitionsForTarget(ctx context.Context, targetRuleID int64) ([]store.Inhibition, error)
 	RuleFiredWithin(ctx context.Context, ruleID int64, window time.Duration) (bool, error)
+	ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error)
 	MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error
 	// ActiveMaintenanceWindow reports a window silencing this alert's
 	// monitor/contract at the given time, or nil when none is active.
@@ -85,6 +86,7 @@ type Dispatcher struct {
 	// metrics is optional Prometheus instrumentation; nil-safe.
 	metrics     *metrics.Metrics
 	registry    *BreakerRegistry
+	rateLimits  RateLimits
 	rateLimiter *ChannelRateLimiter
 	// telemetry is optional tracing; nil-safe. Delivery spans are started
 	// from the alert's context, so they are children of the alert's span —
@@ -114,19 +116,12 @@ type Dispatcher struct {
 	EscalationBatch    int
 	// now is the clock used for escalation bookkeeping. Nil means time.Now;
 	// tests substitute it so a delayed step can be reached without sleeping.
-	now func() time.Time
+	now      func() time.Time
+	flapping alerts.FlappingConfig
 }
 
 // NewDispatcher wires a Dispatcher with default retry settings.
 func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
-	defaults := map[string]float64{
-		"slack":     1.0,
-		"telegram":  30.0,
-		"pagerduty": 2.0,
-		"discord":   5.0,
-		"email":     5.0,
-		"webhook":   5.0,
-	}
 	return &Dispatcher{
 		store:              s,
 		factory:            f,
@@ -134,10 +129,43 @@ func NewDispatcher(s DispatchStore, f *Factory, log *slog.Logger) *Dispatcher {
 		registry:           NewBreakerRegistry(3, 30*time.Second),
 		MaxAttempts:        3,
 		BaseBackoff:        time.Second,
-		rateLimiter:        NewChannelRateLimiter(defaults),
+		rateLimits:         RateLimits{},
+		rateLimiter:        NewRateLimiter(RateLimits{}),
 		EscalationInterval: DefaultEscalationInterval,
 		EscalationBatch:    DefaultEscalationBatch,
+		flapping: alerts.FlappingConfig{
+			Episodes:   alerts.DefaultFlappingEpisodes,
+			Window:     alerts.DefaultFlappingWindow,
+			QuietAfter: alerts.DefaultFlappingQuietAfter,
+		},
 	}
+}
+
+// WithRateLimits applies operator overrides to the channel rate limiter. A
+// zero field keeps the built-in default for that provider.
+func (d *Dispatcher) WithRateLimits(r RateLimits) *Dispatcher {
+	d.rateLimits = r
+	d.rateLimiter = NewRateLimiter(r)
+	return d
+}
+
+// RateLimits returns the configured overrides. Exposed for wiring tests.
+func (d *Dispatcher) RateLimits() RateLimits {
+	return d.rateLimits
+}
+
+// WithFlapping configures when repeated alert episodes are damped.
+func (d *Dispatcher) WithFlapping(config alerts.FlappingConfig) *Dispatcher {
+	if config.Episodes > 0 {
+		d.flapping.Episodes = config.Episodes
+	}
+	if config.Window > 0 {
+		d.flapping.Window = config.Window
+	}
+	if config.QuietAfter > 0 {
+		d.flapping.QuietAfter = config.QuietAfter
+	}
+	return d
 }
 
 // WithDisableAfterFailures sets how many consecutive permanent failures
@@ -218,6 +246,21 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 	if d.suppressed(ctx, a) {
 		return
 	}
+	if a.RuleID > 0 {
+		state, ok := d.flappingState(ctx, a)
+		if ok && state.Flapping && state.CurrentEpisodeAlerts > 1 {
+			if state.CurrentEpisodeAlerts > 2 {
+				reason := fmt.Sprintf("flapping: notification damped after %d alerts in the current episode", state.CurrentEpisodeAlerts)
+				if err := d.store.SetAlertSuppressed(ctx, a.ID, reason); err != nil {
+					d.log.Error("mark flapping alert suppressed", "alert_id", a.ID, "rule_id", a.RuleID, "err", err)
+				}
+				d.log.Info("flapping alert damped", "alert_id", a.ID, "rule_id", a.RuleID, "episodes", state.Episodes)
+				return
+			}
+			a.Digest = fmt.Sprintf("Rule %d is flapping: %d alerts in the last %s across %d episodes.",
+				a.RuleID, state.AlertCount, flappingWindowLabel(d.flapping.Window), state.Episodes)
+		}
+	}
 
 	policy, err := d.store.GetEscalationPolicyForMonitor(ctx, a.MonitorID)
 	switch {
@@ -231,6 +274,32 @@ func (d *Dispatcher) Dispatch(ctx context.Context, a Alert) {
 	default:
 		d.startEscalation(ctx, a, policy)
 	}
+}
+
+func flappingWindowLabel(window time.Duration) string {
+	if window%time.Minute == 0 {
+		minutes := int(window / time.Minute)
+		unit := "minutes"
+		if minutes == 1 {
+			unit = "minute"
+		}
+		return fmt.Sprintf("%d %s", minutes, unit)
+	}
+	return window.String()
+}
+
+func (d *Dispatcher) flappingState(ctx context.Context, a Alert) (alerts.FlappingState, bool) {
+	at := a.CreatedAt
+	if at.IsZero() {
+		at = d.nowTime()
+	}
+	since := at.Add(-d.flapping.Window - d.flapping.QuietAfter)
+	times, err := d.store.ListRuleAlertTimes(ctx, a.RuleID, since)
+	if err != nil {
+		d.log.Error("list rule alert times for flapping detection", "alert_id", a.ID, "rule_id", a.RuleID, "err", err)
+		return alerts.FlappingState{}, false
+	}
+	return alerts.DetectFlapping(times, at, d.flapping), true
 }
 
 // dispatchFlat is the pre-escalation behaviour: deliver to every enabled

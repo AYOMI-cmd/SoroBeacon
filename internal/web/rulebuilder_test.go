@@ -74,6 +74,60 @@ func TestRuleBuilderFields_ValueThresholdHasSelect(t *testing.T) {
 	}
 }
 
+func TestRuleBuilderFields_StartsWithSchemaDefault(t *testing.T) {
+	body := builderFields([]rules.FieldSchema{
+		{Name: "flag", Type: "boolean", Default: "true"},
+		{Name: "outside", Type: "boolean", Default: "false"},
+		{Name: "threshold", Type: "number", Default: "10"},
+	}, nil)
+	if !strings.Contains(body, `<option value="true" selected>true</option>`) {
+		t.Errorf("boolean field did not select its default: %s", body)
+	}
+	if !strings.Contains(body, `<option value="false" selected>false</option>`) {
+		t.Errorf("boolean field did not select its default: %s", body)
+	}
+	if !strings.Contains(body, `value="10"`) {
+		t.Errorf("number field did not render its default: %s", body)
+	}
+
+	body = builderFields([]rules.FieldSchema{{Name: "flag", Type: "boolean", Default: "true"}},
+		map[string]string{"flag": "false"})
+	if !strings.Contains(body, `<option value="false" selected>false</option>`) {
+		t.Errorf("submitted value did not override the default: %s", body)
+	}
+}
+
+// TestRuleBuilderCreatesBooleanOptionAsJSONBoolean is the end-to-end guard for
+// the bug: exclude=true used to be stored as the string "true" and rejected by
+// the evaluator after the form had already been accepted.
+func TestRuleBuilderCreatesBooleanOptionAsJSONBoolean(t *testing.T) {
+	const contractID = "CA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJUWDA"
+	st := &ruleBuilderStore{monitor: store.Monitor{ID: 1, Name: "treasury"}}
+	srv := newRuleBuilderServer(t, st)
+	defer srv.Close()
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	res, err := client.PostForm(srv.URL+"/monitors/1/rules", url.Values{
+		"type":               {"contract_allowlist"},
+		"use_builder":        {"true"},
+		"param_contract_ids": {`["` + contractID + `"]`},
+		"param_exclude":      {"true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303: %s", res.StatusCode, res.Status)
+	}
+	if len(st.created) != 1 {
+		t.Fatalf("created %d rules, want 1", len(st.created))
+	}
+	assert.JSONEq(t, `{"contract_ids":["`+contractID+`"],"exclude":true}`, string(st.created[0].Params))
+}
+
 func TestParamsFromForm(t *testing.T) {
 	schema := []rules.FieldSchema{
 		{Name: "event_name", Type: "string"},
