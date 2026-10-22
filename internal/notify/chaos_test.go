@@ -99,6 +99,10 @@ func (m *mockDispatchStore) RuleFiredWithin(ctx context.Context, ruleID int64, w
 	return false, nil
 }
 
+func (m *mockDispatchStore) ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	return nil, nil
+}
+
 func (m *mockDispatchStore) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {
 	return nil
 }
@@ -617,7 +621,7 @@ func TestChaosDeterministicReproduction(t *testing.T) {
 
 	st1 := &mockDispatchStore{
 		channels: []store.Channel{{ID: 1, Name: "chaos-webhook", Type: "webhook", Config: json.RawMessage(`{"url": "` + server.URL + `"}`), Enabled: true}},
-		alerts: map[int64]*store.Alert{1: {ID: 1, MonitorID: 1, RuleID: 1, EventID: "evt-1", Payload: json.RawMessage(`{}`), CreatedAt: time.Now()}},
+		alerts:   map[int64]*store.Alert{1: {ID: 1, MonitorID: 1, RuleID: 1, EventID: "evt-1", Payload: json.RawMessage(`{}`), CreatedAt: time.Now()}},
 	}
 	d1 := newChaosDispatcher(t, st1, client1)
 	d1.Dispatch(context.Background(), Alert{ID: 1, MonitorID: 1, RuleID: 1, EventID: "evt-1", Payload: json.RawMessage(`{}`), CreatedAt: time.Now()})
@@ -633,7 +637,7 @@ func TestChaosDeterministicReproduction(t *testing.T) {
 
 	st2 := &mockDispatchStore{
 		channels: []store.Channel{{ID: 1, Name: "chaos-webhook", Type: "webhook", Config: json.RawMessage(`{"url": "` + server.URL + `"}`), Enabled: true}},
-		alerts: map[int64]*store.Alert{1: {ID: 1, MonitorID: 1, RuleID: 1, EventID: "evt-1", Payload: json.RawMessage(`{}`), CreatedAt: time.Now()}},
+		alerts:   map[int64]*store.Alert{1: {ID: 1, MonitorID: 1, RuleID: 1, EventID: "evt-1", Payload: json.RawMessage(`{}`), CreatedAt: time.Now()}},
 	}
 	d2 := newChaosDispatcher(t, st2, client2)
 	d2.Dispatch(context.Background(), Alert{ID: 1, MonitorID: 1, RuleID: 1, EventID: "evt-1", Payload: json.RawMessage(`{}`), CreatedAt: time.Now()})

@@ -392,7 +392,7 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			}
 			return records, nil
 		})))
-	factory := notify.DefaultFactory()
+	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName)
 	// External secrets: when a provider is configured, ${secret:...}
 	// references in channel configs resolve when a notifier is built. The
 	// stored config keeps the reference.
@@ -404,9 +404,20 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	// threshold is off unless the operator sets it — auto-disabling a channel
 	// is a destructive answer to a temporary problem.
 	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithRateLimits(notify.RateLimits{
+			SlackRPS:     cfg.NotifyRateLimitSlackRPS,
+			TelegramRPS:  cfg.NotifyRateLimitTelegramRPS,
+			PagerDutyRPS: cfg.NotifyRateLimitPagerDutyRPS,
+			DefaultRPS:   cfg.NotifyRateLimitDefaultRPS,
+		}).
 		WithMetrics(m).
 		WithDigestQueue(st).
-		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures).
+		WithFlapping(alerts.FlappingConfig{
+			Episodes:   cfg.FlappingEpisodes,
+			Window:     cfg.FlappingWindow,
+			QuietAfter: cfg.FlappingQuietAfter,
+		})
 	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
 	if err != nil {
 		return nil, err
@@ -831,7 +842,7 @@ func runBackfill(args []string) error {
 	}
 
 	registry := rules.NewRegistry()
-	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory(), log)
+	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName), log)
 	ingestor := poller.NewIngestor(st, registry, dispatcher, log)
 	job := backfill.New(src, st, registry, ingestor, log)
 

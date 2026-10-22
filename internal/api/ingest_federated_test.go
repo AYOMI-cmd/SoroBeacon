@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
+	"github.com/sorotrail/sorobeacon/internal/notify"
 	"github.com/sorotrail/sorobeacon/internal/store"
 	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
@@ -32,7 +33,11 @@ func federatedIngestServer(t *testing.T) (*httptest.Server, store.Store) {
 	m := &store.Monitor{Name: "local", ContractIDs: []string{"C"}, Enabled: true}
 	require.NoError(t, st.CreateMonitor(context.Background(), m))
 
-	srv := httptest.NewServer(authServerOn(st, auth.New([]string{"peer-token"}, 0)))
+	// Mount the API where a real sender expects it. The federation notifier
+	// posts to <base>/api/v1/ingest, so this test exercises the same path.
+	mux := http.NewServeMux()
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", authServerOn(st, auth.New([]string{"peer-token"}, 0))))
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, st
 }
@@ -51,7 +56,7 @@ func postFederated(t *testing.T, srv *httptest.Server, monitorID, ruleID int64, 
 		"hop_count": 1,
 	})
 	require.NoError(t, err)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/ingest", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/ingest", bytes.NewReader(body))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer peer-token")
 	res, err := srv.Client().Do(req)
@@ -181,7 +186,7 @@ func TestIngestRejectsAnUnknownSeverity(t *testing.T) {
 		"hop_count": 1,
 	})
 	require.NoError(t, err)
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/ingest", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/ingest", bytes.NewReader(body))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer peer-token")
 	res, err := srv.Client().Do(req)
@@ -191,4 +196,79 @@ func TestIngestRejectsAnUnknownSeverity(t *testing.T) {
 
 	raw, _ := io.ReadAll(res.Body)
 	assert.Contains(t, string(raw), "severity")
+}
+
+// The receiver still enforces the hop limit even though nothing re-forwards
+// federated alerts today.
+func TestIngestRejectsAtHopLimit(t *testing.T) {
+	srv, _ := federatedIngestServer(t)
+
+	body, err := json.Marshal(map[string]any{
+		"alert": map[string]any{
+			"monitor_id": 1,
+			"rule_id":    1,
+			"event_id":   "evt-1",
+		},
+		"origin":    "peer-a",
+		"hop_count": notify.MaxHopCount,
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/ingest", bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer peer-token")
+	res, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	defer func() { _ = res.Body.Close() }()
+
+	require.Equal(t, http.StatusBadRequest, res.StatusCode)
+	raw, _ := io.ReadAll(res.Body)
+	assert.Contains(t, string(raw), "hop limit")
+}
+
+// A federation channel built through the production factory must stamp the
+// sender's origin and be accepted by the real ingest handler. This is the
+// regression test for the empty-origin bug: the old factory constructor never
+// set one, so every delivery was rejected with 400.
+func TestFederationChannelSendsItsOriginToRealIngest(t *testing.T) {
+	srv, st := federatedIngestServer(t)
+
+	var gotStatus int
+	wrapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := httptest.NewRecorder()
+		srv.Config.Handler.ServeHTTP(rec, r)
+		gotStatus = rec.Code
+		for key, values := range rec.Header() {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	}))
+	defer wrapped.Close()
+
+	factory := notify.DefaultFactory().WithFederationOrigin("beacon-a")
+	cfg, err := json.Marshal(map[string]string{"url": wrapped.URL, "token": "peer-token"})
+	require.NoError(t, err)
+	n, err := factory.New(notify.TypeFederation, cfg)
+	require.NoError(t, err)
+
+	err = n.Send(context.Background(), notify.Alert{
+		ID:          42,
+		MonitorID:   1,
+		MonitorName: "remote",
+		RuleID:      1,
+		RuleType:    "event_emitted",
+		EventID:     "evt-1",
+		ContractID:  "C1",
+		Ledger:      100,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusCreated, gotStatus)
+
+	alerts, err := st.ListAlerts(context.Background(), store.AlertFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, alerts, 1)
+	assert.True(t, alerts[0].Federated)
+	assert.Equal(t, "beacon-a", alerts[0].FederationOrigin)
 }
