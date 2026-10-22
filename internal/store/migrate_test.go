@@ -5,9 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	pgxmigrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -42,17 +45,18 @@ func TestMigrationStateSQLiteIsReadOnly(t *testing.T) {
 }
 
 func TestMigrationStatePostgresReadOnly(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	rawURL := os.Getenv("TEST_DATABASE_URL")
+	if rawURL == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping Postgres preflight test")
 	}
-	require.NoError(t, Migrate(url))
-	current, latest, dirty, err := MigrationState(context.Background(), url)
+	databaseURL := isolatedMigrationURL(t, rawURL)
+	require.NoError(t, Migrate(databaseURL))
+	current, latest, dirty, err := MigrationState(context.Background(), databaseURL)
 	require.NoError(t, err)
 	require.False(t, dirty)
 	require.Equal(t, latest, current)
 
-	st, err := NewReadOnly(context.Background(), url, PoolSettings{}, nil)
+	st, err := NewReadOnly(context.Background(), databaseURL, PoolSettings{}, nil)
 	require.NoError(t, err)
 	defer st.Close()
 	err = st.CreateMonitor(context.Background(), &Monitor{Name: "must not be written", ContractIDs: []string{"C"}, Enabled: true})
@@ -66,10 +70,11 @@ func TestMigrationStatePostgresReadOnly(t *testing.T) {
 // If the database is already migrated, it skips the round-trip and just verifies
 // that reapplying is a no-op.
 func TestMigrate_RoundTrip(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	rawURL := os.Getenv("TEST_DATABASE_URL")
+	if rawURL == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping migration round-trip test")
 	}
+	url := isolatedMigrationURL(t, rawURL)
 
 	// Check current version
 	verBefore := getMigrationVersion(t, url)
@@ -123,16 +128,44 @@ func TestMigrate_RoundTrip(t *testing.T) {
 // TestMigrate_ReapplyingIsNoop tests that applying migrations twice in a
 // row is a no-op rather than an error.
 func TestMigrate_ReapplyingIsNoop(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
+	rawURL := os.Getenv("TEST_DATABASE_URL")
+	if rawURL == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping migration reapply test")
 	}
+	url := isolatedMigrationURL(t, rawURL)
 
 	require.NoError(t, Migrate(url))
 	require.NoError(t, Migrate(url)) // Second application should not error
 
 	ver := getMigrationVersion(t, url)
 	require.True(t, ver > 0, "expected version > 0 after reapply, got %d", ver)
+}
+
+func isolatedMigrationURL(t *testing.T, rawURL string) string {
+	t.Helper()
+	schema := fmt.Sprintf("migration_test_%d_%d", os.Getpid(), time.Now().UnixNano())
+	db, err := sql.Open("pgx", rawURL)
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.ExecContext(context.Background(), `CREATE SCHEMA "`+schema+`"`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanup, err := sql.Open("pgx", rawURL)
+		if err != nil {
+			t.Errorf("open database to drop isolated migration schema: %v", err)
+			return
+		}
+		defer cleanup.Close()
+		if _, err := cleanup.ExecContext(context.Background(), `DROP SCHEMA "`+schema+`" CASCADE`); err != nil {
+			t.Errorf("drop isolated migration schema: %v", err)
+		}
+	})
+	u, err := url.Parse(rawURL)
+	require.NoError(t, err)
+	q := u.Query()
+	q.Set("options", "-csearch_path="+schema)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // getMigrationVersion returns the current migration version for the database.
@@ -153,6 +186,9 @@ func getMigrationVersion(t *testing.T, url string) uint {
 	defer func() { _, _ = m.Close() }()
 
 	version, dirty, err := m.Version()
+	if errors.Is(err, migrate.ErrNilVersion) {
+		return 0
+	}
 	require.NoError(t, err)
 	require.False(t, dirty, "database should not be dirty after migration")
 	return version
@@ -204,8 +240,7 @@ func verifyKeyTablesExist(t *testing.T, url string) {
 		"maintenance_windows",
 		"ingest_state",
 		"ledger_hashes",
-		"backfill_progress",
-		"channel_health",
+		"backfills",
 	}
 
 	for _, table := range tables {
