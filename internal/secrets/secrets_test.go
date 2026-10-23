@@ -190,6 +190,23 @@ func TestResolveConfigInvalidJSONPassesThrough(t *testing.T) {
 	}
 }
 
+func TestResolveConfigReportsEveryFailedReference(t *testing.T) {
+	r := NewResolver().WithTTL(0)
+	raw := json.RawMessage(`{"first":"${secret:missing:one}","nested":["${secret:missing:two}"]}`)
+	_, err := r.ResolveConfig(context.Background(), raw)
+	if err == nil {
+		t.Fatal("expected secret resolution failures")
+	}
+	for _, reference := range []string{"${secret:missing:one}", "${secret:missing:two}"} {
+		if !strings.Contains(err.Error(), reference) {
+			t.Errorf("combined error %q does not include reference %q", err, reference)
+		}
+	}
+	if strings.Contains(err.Error(), "resolved-secret-value") {
+		t.Errorf("combined error leaked a secret value: %v", err)
+	}
+}
+
 func TestEnvProvider(t *testing.T) {
 	p := &EnvProvider{Getenv: func(k string) string {
 		if k == "SLACK_WEBHOOK_URL" {
@@ -214,8 +231,8 @@ func TestEnvProvider(t *testing.T) {
 
 func TestIsReference(t *testing.T) {
 	tests := []struct {
-		in   string
-		ok   bool
+		in string
+		ok bool
 	}{
 		{"${secret:env:SLACK_WEBHOOK_URL}", true},
 		{"${secret:vault:kv/data/sorobeacon#slack_token}", true},

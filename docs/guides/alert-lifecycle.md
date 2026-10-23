@@ -163,25 +163,18 @@ chars), and counted in `/metrics` per channel and outcome.
   `monitors.last_matched_at` drives the "silent" marker; the Overview chart uses
   `alerts` over 30 days.
 
-## What is not here
+## Lifecycle boundaries
 
-Two things a reader of this page might expect do not exist in SoroBeacon, and
-pretending otherwise is how an operator ends up debugging a feature that was
-never built:
+Flapping detection groups persisted alert times into episodes and damps repeat
+notifications without removing alert rows. It is independent of
+[frequency thresholds](../rules/frequency-threshold.md), which count matching
+events, and [cooldowns](../rules/cooldown.md), which suppress alert creation
+for a fixed interval. The thresholds and the summary behavior are documented
+in [configuration](../configuration.md#flapping-detection).
 
-* **No flapping detection or damping.** Nothing watches a rule's alert state
-  for repeated flips and then goes quiet on it. The
-  [frequency rule](../rules/frequency-threshold.md) counts *matching events*,
-  which is a different thing from counting alert-state changes, and the
-  [cooldown](../rules/cooldown.md) suppresses repeats for a fixed window
-  without looking at how often the rule flips. If you want a noisy rule to
-  stop shouting, use one of those two.
-* **No separate alert lifecycle state machine.** An alert's state lives in the
-  store and is reachable through the API: `POST /alerts/{id}/acknowledge`
-  acknowledges it, and a rule's `cooldown` decides whether a repeat is
-  recorded or suppressed. There is no "resolved" state and no transition
-  table in `internal/alerts` — the package holds the delivery-time decisions
-  (grouping, inhibition, enrichment) and nothing else.
+There is no separate alert lifecycle state machine or "resolved" state.
+`POST /alerts/{id}/acknowledge` records acknowledgement and stops escalation;
+grouping, inhibition and flapping are delivery-time decisions.
 
 ## "Why didn't it…" quick map
 

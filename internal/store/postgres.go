@@ -112,6 +112,26 @@ func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings)
 	return p, nil
 }
 
+// NewPostgresReadOnly opens a primary pool whose transactions default to
+// read-only. It intentionally does not open the optional replica pool because
+// preflight inspection uses only the primary database.
+func NewPostgresReadOnly(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
+	cfg, err := buildPoolConfig(databaseURL, settings)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return &Postgres{pool: pool}, nil
+}
+
 // buildPoolConfig parses databaseURL and overlays any non-zero pool
 // settings. Zero means "leave the pgx default" so unset env vars do
 // not change MaxConns / MinConns / lifetimes.
@@ -205,7 +225,10 @@ func (p *Postgres) CreateMonitor(ctx context.Context, m *Monitor) error {
 		 RETURNING id, created_at`,
 		m.Name, ids, m.Enabled, m.Priority.Normalized(), workspaceID(ctx), m.Network, pgCreatedAt(m.CreatedAt),
 	).Scan(&m.ID, &m.CreatedAt); err != nil {
-		return err
+		// A name already taken in this workspace violates the unique index, and
+		// that is the request's fault rather than the server's: mapErr turns
+		// it into the typed constraint error the API answers 422 with.
+		return mapErr(err)
 	}
 	return tx.Commit(ctx)
 }
@@ -1337,6 +1360,10 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
+	if a.Federated {
+		return p.createFederatedAlert(ctx, tx, a)
+	}
+
 	// The rule and the monitor are separate foreign keys, so the database
 	// alone cannot stop an alert that names this tenant's monitor and another
 	// tenant's rule. The join is the check, and it runs inside the same
@@ -1413,14 +1440,18 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	var reserved int
 	err = tx.QueryRow(ctx,
 		`INSERT INTO alert_dedup (rule_id, event_id, alert_created_at) VALUES ($1, $2, now())
-		 ON CONFLICT (rule_id, event_id) DO NOTHING
+		 ON CONFLICT DO NOTHING
 		 RETURNING 1`,
 		a.RuleID, a.EventID).Scan(&reserved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return AlertDuplicate, nil // duplicate (rule_id, event_id): deduped
 	}
 	if err != nil {
-		return "", err
+		// mapErr, not the raw driver error: this insert references the rule,
+		// so a rule that does not exist is a foreign-key violation and has to
+		// reach the caller as one. A raw *pgconn.PgError here is what turned a
+		// bad payload into an unexplained 500.
+		return "", mapErr(err)
 	}
 
 	err = tx.QueryRow(ctx,
@@ -1471,6 +1502,57 @@ func (p *Postgres) createAlert(ctx context.Context, a *Alert) (AlertOutcome, err
 	return AlertCreated, nil
 }
 
+// createFederatedAlert stores an alert another SoroBeacon instance
+// forwarded.
+//
+// None of the local machinery applies to it: there is no local monitor and
+// no local rule behind it, so the tenant join would look for a rule that
+// cannot exist, the cooldown belongs to a rule that is not ours, and the
+// dedup key cannot be the rule id. The key is the origin plus the event id
+// instead — the same event forwarded twice by the same peer is one alert,
+// and the same event id from two peers is two.
+//
+// The alert lands in the workspace of the credential that delivered it, which
+// is the caller's context and never anything the payload says.
+func (p *Postgres) createFederatedAlert(ctx context.Context, tx pgx.Tx, a *Alert) (AlertOutcome, error) {
+	var reserved int
+	err := tx.QueryRow(ctx,
+		`INSERT INTO alert_dedup (rule_id, event_id, federation_origin, alert_created_at)
+		 VALUES (NULL, $1, $2, now())
+		 ON CONFLICT DO NOTHING
+		 RETURNING 1`,
+		a.EventID, a.FederationOrigin).Scan(&reserved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AlertDuplicate, nil
+	}
+	if err != nil {
+		return "", mapErr(err)
+	}
+
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO alerts (monitor_id, rule_id, event_id, payload, enrichment, severity, ledger, network, workspace_id, federated, federation_origin, source_monitor_id, source_rule_id)
+		 VALUES (NULL, NULL, $1, $2, $3, $4, $5, '', $6, TRUE, $7, $8, $9)
+		 RETURNING id, created_at`,
+		a.EventID, jsonOrEmpty(a.Payload), nullableJSON(a.Enrichment), NormalizedSeverity(a.Severity), int64(a.Ledger),
+		workspaceID(ctx), a.FederationOrigin, a.SourceMonitorID, a.SourceRuleID,
+	).Scan(&a.ID, &a.CreatedAt); err != nil {
+		return "", mapErr(err)
+	}
+
+	// Link the reserved key to the row it produced, and carry the alert's
+	// created_at so retention can drop dedup rows by time.
+	if _, err := tx.Exec(ctx,
+		`UPDATE alert_dedup SET alert_id = $1, alert_created_at = $2 WHERE federation_origin = $3 AND event_id = $4`,
+		a.ID, a.CreatedAt, a.FederationOrigin, a.EventID); err != nil {
+		return "", mapErr(err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", mapErr(err)
+	}
+	return AlertCreated, nil
+}
+
 // CreateAlertGroup creates or increments the alert group identified
 // by key and windowStart. On conflict it increments the count; on
 // first insertion it initializes count to 1. Returns the new count.
@@ -1504,14 +1586,32 @@ func (p *Postgres) GroupAlerts(ctx context.Context, key string, windowStart time
 func (p *Postgres) GetAlert(ctx context.Context, id int64) (*Alert, error) {
 	var a Alert
 	var ledger int64
+	var monitorID, ruleID *int64
+	var origin *string
+	var sourceMonitorID, sourceRuleID *int64
 	err := p.pool.QueryRow(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network, federated, federation_origin, source_monitor_id, source_rule_id
 		   FROM alerts WHERE id = $1 AND workspace_id = $2`, id, workspaceID(ctx),
-	).Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network)
+	).Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	a.Ledger = uint32(ledger)
+	if monitorID != nil {
+		a.MonitorID = *monitorID
+	}
+	if ruleID != nil {
+		a.RuleID = *ruleID
+	}
+	if origin != nil {
+		a.FederationOrigin = *origin
+	}
+	if sourceMonitorID != nil {
+		a.SourceMonitorID = *sourceMonitorID
+	}
+	if sourceRuleID != nil {
+		a.SourceRuleID = *sourceRuleID
+	}
 	return &a, nil
 }
 
@@ -1564,13 +1664,20 @@ func (p *Postgres) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
 	).Scan(&d.ID, &d.CreatedAt))
 }
 
-// GetDeadLetter returns one dead-letter record by id.
+// GetDeadLetter returns one dead-letter record by id. dead_letters carries no
+// workspace_id of its own, so the tenant predicate reaches it through the
+// alert it belongs to; a caller without a tenant reads by id alone.
 func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
 	var d DeadLetter
-	err := p.pool.QueryRow(ctx,
-		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
-		 FROM dead_letters WHERE id = $1`, id,
-	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE id = $1`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	err := p.pool.QueryRow(ctx, q, args...).
+		Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1578,7 +1685,8 @@ func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, er
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters.
+// optional channel, alert, and pagination filters. A tenant sees only records
+// whose alert belongs to it; the dispatcher's system context sees every row.
 func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
 		FROM dead_letters WHERE TRUE`
@@ -1588,6 +1696,9 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]D
 		n++
 		args = append(args, v)
 		return fmt.Sprintf("$%d", n)
+	}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ` + arg(ws) + `)`
 	}
 	if f.ChannelID != 0 {
 		q += ` AND channel_id = ` + arg(f.ChannelID)
@@ -1636,7 +1747,7 @@ func (p *Postgres) DeleteDeadLetter(ctx context.Context, id int64) error {
 // readers call it so the routed and primary-bound forms cannot drift into
 // returning different pages.
 func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
-	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network
+	q := `SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network, federated, federation_origin, source_monitor_id, source_rule_id
 		 FROM alerts WHERE TRUE`
 	args := []any{}
 	n := 0
@@ -1706,11 +1817,34 @@ func buildAlertQuery(ctx context.Context, f AlertFilter) (string, []any) {
 // iterates; a true streaming implementation would use a cursor.
 // scanAlert reads one alerts row. It is shared by ListAlerts and ExpiredAlerts
 // so the column order and the ledger/retracted_at mapping cannot drift.
+//
+// The monitor and rule ids are nullable: a federated alert belongs to no
+// local monitor and no local rule, and a NULL is how that is spelled. Zero is
+// not a valid id, so a NULL reads back as zero and the row is not attached to
+// anything local.
 func scanAlert(row pgx.CollectableRow) (Alert, error) {
 	var a Alert
 	var ledger int64
-	err := row.Scan(&a.ID, &a.MonitorID, &a.RuleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network)
+	var monitorID, ruleID *int64
+	var origin *string
+	var sourceMonitorID, sourceRuleID *int64
+	err := row.Scan(&a.ID, &monitorID, &ruleID, &a.EventID, &a.Payload, &a.Enrichment, &a.CreatedAt, &ledger, &a.RetractedAt, &a.Backfilled, &a.InhibitedByRuleID, &a.Suppressed, &a.SuppressionReason, &a.AcknowledgedAt, &a.Network, &a.Federated, &origin, &sourceMonitorID, &sourceRuleID)
 	a.Ledger = uint32(ledger)
+	if monitorID != nil {
+		a.MonitorID = *monitorID
+	}
+	if ruleID != nil {
+		a.RuleID = *ruleID
+	}
+	if origin != nil {
+		a.FederationOrigin = *origin
+	}
+	if sourceMonitorID != nil {
+		a.SourceMonitorID = *sourceMonitorID
+	}
+	if sourceRuleID != nil {
+		a.SourceRuleID = *sourceRuleID
+	}
 	return a, err
 }
 
@@ -1724,7 +1858,7 @@ func (p *Postgres) ExpiredAlerts(ctx context.Context, cutoff time.Time, limit in
 		limit = DefaultPruneBatch
 	}
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network
+		`SELECT id, monitor_id, rule_id, event_id, payload, enrichment, created_at, ledger, retracted_at, backfilled, inhibited_by_rule_id, suppressed, suppression_reason, acknowledged_at, network, federated, federation_origin, source_monitor_id, source_rule_id
 		   FROM alerts WHERE created_at < $1 ORDER BY created_at ASC, id ASC LIMIT $2`,
 		cutoff, limit)
 	if err != nil {
@@ -1993,11 +2127,14 @@ func (p *Postgres) CreateInhibition(ctx context.Context, in *Inhibition) error {
 	if in.FiringWindowSeconds <= 0 {
 		in.FiringWindowSeconds = DefaultInhibitionWindowSeconds
 	}
-	return p.pool.QueryRow(ctx,
+	// mapErr, not the raw driver error: the pair names two rules, and a rule
+	// that does not exist is a foreign-key violation the caller has to be
+	// told about, not an unexplained server fault.
+	return mapErr(p.pool.QueryRow(ctx,
 		`INSERT INTO alert_inhibitions (source_rule_id, target_rule_id, firing_window_seconds)
 		 VALUES ($1, $2, $3) RETURNING created_at`,
 		in.SourceRuleID, in.TargetRuleID, in.FiringWindowSeconds,
-	).Scan(&in.CreatedAt)
+	).Scan(&in.CreatedAt))
 }
 
 func (p *Postgres) scanInhibition(row pgx.CollectableRow) (Inhibition, error) {
@@ -2057,6 +2194,31 @@ func (p *Postgres) RuleFiredWithin(ctx context.Context, ruleID int64, window tim
 		`SELECT EXISTS(SELECT 1 FROM alerts WHERE rule_id = $1 AND created_at >= $2)`,
 		ruleID, cutoff).Scan(&fired)
 	return fired, err
+}
+
+func (p *Postgres) ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	query := `SELECT created_at FROM alerts WHERE rule_id = $1 AND created_at >= $2`
+	args := []any{ruleID, since.UTC()}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		query += ` AND workspace_id = $3`
+		args = append(args, ws)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var times []time.Time
+	for rows.Next() {
+		var at time.Time
+		if err := rows.Scan(&at); err != nil {
+			return nil, err
+		}
+		times = append(times, at)
+	}
+	return times, rows.Err()
 }
 
 func (p *Postgres) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {
@@ -2571,7 +2733,9 @@ func (p *Postgres) SetDefaultSearch(ctx context.Context, id int64) error {
 	_, _ = tx.Exec(ctx, `UPDATE saved_searches SET is_default = FALSE WHERE is_default = TRUE AND workspace_id = $1`, ws)
 	tag, err := tx.Exec(ctx, `UPDATE saved_searches SET is_default = TRUE WHERE id = $1 AND workspace_id = $2`, id, ws)
 	if err != nil {
-		return err
+		// The partial unique index allows one default per workspace, and a
+		// second one is the request's fault rather than the server's.
+		return mapErr(err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
@@ -2858,14 +3022,40 @@ func WithSuppressed(payload json.RawMessage, n int64) json.RawMessage {
 	return merged
 }
 
-// mapErr converts pgx sentinel and FK errors into store-level errors.
+// Postgres reports a constraint violation as an SQLSTATE code on the driver's
+// error. The three that matter here are the ones a request can cause: a
+// foreign key naming a row that does not exist, a CHECK the value fails and a
+// unique index the value collides with.
+const (
+	pgForeignKeyViolation = "23503"
+	pgCheckViolation      = "23514"
+	pgUniqueViolation     = "23505"
+)
+
+// mapErr converts pgx sentinel and constraint errors into store-level errors.
 func mapErr(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
-		return fmt.Errorf("%w: %s", ErrNotFound, pgErr.ConstraintName)
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	switch pgErr.Code {
+	case pgForeignKeyViolation:
+		// The row the request named does not exist, so this is a missing row
+		// as well as a constraint violation: a caller that only knows
+		// ErrNotFound keeps the answer it has always had, and a caller that
+		// knows ErrConstraint can tell the caller it was the request's fault
+		// rather than the server's.
+		return fmt.Errorf("%w: %w", ErrNotFound, &ConstraintError{
+			Kind:       ConstraintForeignKey,
+			Constraint: pgErr.ConstraintName,
+		})
+	case pgCheckViolation:
+		return &ConstraintError{Kind: ConstraintCheck, Constraint: pgErr.ConstraintName}
+	case pgUniqueViolation:
+		return &ConstraintError{Kind: ConstraintUnique, Constraint: pgErr.ConstraintName}
 	}
 	return err
 }

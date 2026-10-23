@@ -375,6 +375,17 @@ func ParseTimeout(raw []byte) (time.Duration, error) {
 	return 0, fmt.Errorf("must be integer seconds or duration string such as \"15s\"")
 }
 
+// NormalizedSeverity maps the empty severity onto the default one, so a
+// write that does not know the severity stores the value the database's
+// default column would have stored anyway. The CHECK constraint on the
+// column has a closed vocabulary, and the empty string is not in it.
+func NormalizedSeverity(s Severity) Severity {
+	if s == "" {
+		return SeverityWarning
+	}
+	return s
+}
+
 // Alert records one rule match on one event. EventID is the source event's
 // TOID-based id; (RuleID, EventID) is unique so the same match can never
 // fire twice.
@@ -435,6 +446,24 @@ type Alert struct {
 	// has not been acknowledged, so an escalation attached to it keeps
 	// running. Acknowledging stops escalation.
 	AcknowledgedAt *time.Time `json:"acknowledged_at"`
+	// Federated marks an alert another SoroBeacon instance forwarded. Such an
+	// alert belongs to no local monitor and no local rule: the ids in the
+	// payload are the sending instance's, and writing them against this
+	// instance's foreign keys would either fail or attach the alert to an
+	// unrelated local monitor.
+	//
+	// A federated alert has MonitorID and RuleID zero — zero is not a valid
+	// id, so it is how "no local monitor" is spelled — and carries the
+	// sender's ids in SourceMonitorID and SourceRuleID instead.
+	Federated bool `json:"federated"`
+	// FederationOrigin is the sending instance's identifier, so the
+	// dashboard can say where the alert came from. Empty for a local alert.
+	FederationOrigin string `json:"federation_origin,omitempty"`
+	// SourceMonitorID and SourceRuleID are the monitor and rule ids on the
+	// sending instance. They are kept so the origin of an alert survives the
+	// trip, and they are never used as local keys.
+	SourceMonitorID int64 `json:"source_monitor_id,omitempty"`
+	SourceRuleID    int64 `json:"source_rule_id,omitempty"`
 }
 
 // Maintenance window scopes. A window suppresses matching alerts for its
