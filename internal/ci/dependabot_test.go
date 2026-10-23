@@ -36,23 +36,26 @@ func TestDependabotConfig(t *testing.T) {
 	require.Regexp(t, `(?m)^version:\s*2\s*$`, text)
 
 	updates := splitUpdates(text)
-	// Two gomod entries and one github-actions: the Terraform provider is a
+	// Root gomod, terraform-provider gomod, github-actions, and docker: the Terraform provider is a
 	// nested module, and a gomod entry for "/" does not reach it.
-	require.Len(t, updates, 3, "want gomod (root), gomod (terraform provider) and github-actions")
+	require.Len(t, updates, 4, "want gomod (root), gomod (terraform provider), github-actions and docker")
 
-	gomod := findUpdate(t, updates, "gomod")
+	gomodRoot := updates[0]
+	gomodTF := updates[1]
 	actions := findUpdate(t, updates, "github-actions")
 	docker := findUpdate(t, updates, "docker")
 
-	assertWeeklyRoot(t, gomod)
+	assertWeeklyRoot(t, gomodRoot)
+	assertWeeklyRoot(t, gomodTF)
 	assertWeeklyRoot(t, actions)
 	assertWeeklyRoot(t, docker)
 
-	require.Contains(t, gomod, "go-minor-and-patch", "minor/patch Go bumps should be grouped")
-	require.Contains(t, gomod, "minor")
-	require.Contains(t, gomod, "patch")
-	require.NotContains(t, gomod, "major", "major Go updates must stay ungrouped")
+	require.Contains(t, gomodRoot, "go-minor-and-patch", "minor/patch Go bumps should be grouped")
+	require.Contains(t, gomodRoot, "minor")
+	require.Contains(t, gomodRoot, "patch")
+	require.NotContains(t, gomodRoot, "major", "major Go updates must stay ungrouped")
 	require.NotContains(t, actions, "go-minor-and-patch")
+
 }
 
 func TestDependabotConfigFailsIfEcosystemDropped(t *testing.T) {
