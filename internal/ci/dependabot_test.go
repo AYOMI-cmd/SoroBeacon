@@ -36,7 +36,9 @@ func TestDependabotConfig(t *testing.T) {
 	require.Regexp(t, `(?m)^version:\s*2\s*$`, text)
 
 	updates := splitUpdates(text)
-	require.Len(t, updates, 3, "want gomod, github-actions and docker ecosystems")
+	// Two gomod entries and one github-actions: the Terraform provider is a
+	// nested module, and a gomod entry for "/" does not reach it.
+	require.Len(t, updates, 3, "want gomod (root), gomod (terraform provider) and github-actions")
 
 	gomod := findUpdate(t, updates, "gomod")
 	actions := findUpdate(t, updates, "github-actions")
@@ -56,7 +58,10 @@ func TestDependabotConfig(t *testing.T) {
 func TestDependabotConfigFailsIfEcosystemDropped(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(repoRoot(t), ".github", "dependabot.yml"))
 	require.NoError(t, err)
-	broken := strings.Replace(string(raw), "package-ecosystem: gomod", "package-ecosystem: removed", 1)
+	// Every gomod entry: the provider module has one of its own, so replacing
+	// only the first would leave a survivor and the check would pass on a file
+	// that still watches the provider.
+	broken := strings.ReplaceAll(string(raw), "package-ecosystem: gomod", "package-ecosystem: removed")
 	updates := splitUpdates(broken)
 	_, found := lookupUpdate(updates, "gomod")
 	require.False(t, found, "dropping the gomod ecosystem must fail this check")
