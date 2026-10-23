@@ -37,6 +37,7 @@ host is shared.
 | `sorobeacon_rule_evaluations_total` | counter | — | one per event x enabled rule; rises with rules per monitor, not just traffic |
 | `sorobeacon_alerts_fired_total` | counter | — | grows when alerts are created; can lag matched (dedup and cooldown suppress) |
 | `sorobeacon_alert_deliveries_total` | counter | `channel`, `outcome` (`ok`\|`error`) | `outcome="error"` stays a small share per channel type |
+| `sorobeacon_dead_letters_total` | gauge | - | `0`; a positive value means failed deliveries are waiting for a redrive |
 | `sorobeacon_http_request_duration_seconds` | histogram | `route`, `method`, `status` | request times at millisecond scale |
 
 Details worth knowing:
@@ -50,6 +51,14 @@ Details worth knowing:
   all** until the first delivery attempt is recorded (the counter vector
   creates its series lazily). A fresh deployment with no alerts yet shows
   nothing for it; that is normal, not a missing metric.
+* `sorobeacon_dead_letters_total` is kept by the delivery path: the
+  dispatcher increments it when it writes a dead letter and decrements it
+  after a successful dashboard redrive. The API redrive path deletes rows
+  without touching the gauge. It is process-local, so a restart starts it at
+  zero even when rows remain in the queue, and an alert-retention cascade can
+  remove rows without the gauge seeing it. Treat `GET /api/v1/dead-letters`
+  as the authoritative queue and this gauge as the signal that the queue is
+  non-empty (see [Diagnosing failed alert deliveries](../operations/delivery-failures.md#dead-letter-queue-and-redrive)).
 * The `route` label of the HTTP histogram is the matched route pattern (for
   example `/api/v1/monitors/{id}`), not the raw path, for the same
   cardinality reason; `status` is the response code as a string.
@@ -74,12 +83,19 @@ sum by (channel) (rate(sorobeacon_alert_deliveries_total{outcome="error"}[5m]))
   / sum by (channel) (rate(sorobeacon_alert_deliveries_total[5m]))
 ```
 
-**p95 poll duration** — how close a poll cycle gets to the interval (a p95
+**p95 poll duration** - how close a poll cycle gets to the interval (a p95
 approaching `POLL_INTERVAL` means the next poll starts late and lag grows):
 
 ```promql
 histogram_quantile(0.95,
   sum by (le) (rate(sorobeacon_poll_duration_seconds_bucket[5m])))
+```
+
+**Dead letters waiting for a redrive** - any value above zero means a
+permanently failed delivery needs an operator:
+
+```promql
+sorobeacon_dead_letters_total > 0
 ```
 
 ## Alerting on stalled ingestion

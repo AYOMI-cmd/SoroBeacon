@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -111,4 +112,52 @@ func TestMonitorCRUDPaths(t *testing.T) {
 		require.ErrorIs(t, st.DeleteMonitor(ctx, 424242), ErrNotFound)
 		require.ErrorIs(t, st.UpdateMonitor(ctx, &Monitor{ID: 424242, Name: "ghost"}), ErrNotFound)
 	})
+}
+
+func TestPostgresContractCursorPersistenceAndCleanup(t *testing.T) {
+	if os.Getenv("TEST_DATABASE_URL") == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping Postgres contract cursor test")
+	}
+	ctx := context.Background()
+	st := newTestPostgres(t).(*Postgres)
+
+	first := &Monitor{Name: "cursor-first", ContractIDs: []string{"CA_CURSOR_A", "CA_CURSOR_B"}, Enabled: true}
+	second := &Monitor{Name: "cursor-second", ContractIDs: []string{"CA_CURSOR_B"}, Enabled: false}
+	require.NoError(t, st.CreateMonitor(ctx, first))
+	require.NoError(t, st.CreateMonitor(ctx, second))
+	require.NoError(t, st.InitializeContractCursor(ctx, "", "CA_CURSOR_A", 10))
+	require.NoError(t, st.InitializeContractCursor(ctx, "", "CA_CURSOR_B", 10))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "", "CA_CURSOR_A", 20))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "", "CA_CURSOR_B", 30))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "", "CA_CURSOR_A", 15))
+
+	reopened, err := NewPostgres(ctx, os.Getenv("TEST_DATABASE_URL"), PoolSettings{})
+	require.NoError(t, err)
+	t.Cleanup(reopened.Close)
+	cursors, err := reopened.ListContractCursors(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, cursors, 2)
+	positions := map[string]uint32{}
+	for _, cursor := range cursors {
+		positions[cursor.ContractID] = cursor.LastLedger
+	}
+	assert.Equal(t, uint32(20), positions["CA_CURSOR_A"], "older advancement cannot overwrite A")
+	assert.Equal(t, uint32(30), positions["CA_CURSOR_B"], "B advances independently")
+
+	first.ContractIDs = []string{"CA_CURSOR_A"}
+	require.NoError(t, reopened.UpdateMonitor(ctx, first))
+	cursors, err = reopened.ListContractCursors(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, cursors, 2, "B remains while the second monitor references it")
+
+	require.NoError(t, reopened.DeleteMonitor(ctx, second.ID))
+	cursors, err = reopened.ListContractCursors(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, cursors, 1)
+	assert.Equal(t, "CA_CURSOR_A", cursors[0].ContractID)
+
+	require.NoError(t, reopened.DeleteMonitor(ctx, first.ID))
+	cursors, err = reopened.ListContractCursors(ctx, "")
+	require.NoError(t, err)
+	assert.Empty(t, cursors, "final monitor deletion removes its contract cursor")
 }

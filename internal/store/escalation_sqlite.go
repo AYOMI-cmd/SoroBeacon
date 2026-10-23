@@ -244,6 +244,11 @@ func (s *SQLite) CompleteEscalation(ctx context.Context, alertID int64) error {
 // transaction, so a step cannot fire between the acknowledgement and the
 // escalation being cleared. It is idempotent: acknowledging twice is not an
 // error, but a missing alert is ErrNotFound.
+//
+// The alert is scoped to the caller's workspace, so another tenant's id is
+// ErrNotFound rather than an acknowledgement that stops its paging. The
+// escalation row has no workspace of its own; it is only reached once the
+// scoped alert update has found a row in this workspace.
 func (s *SQLite) AcknowledgeAlert(ctx context.Context, alertID int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -252,8 +257,9 @@ func (s *SQLite) AcknowledgeAlert(ctx context.Context, alertID int64) error {
 	defer func() { _ = tx.Rollback() }() // rollback after commit is a no-op
 
 	now := sqliteTimeString(time.Now())
+	ws := workspaceID(ctx)
 	res, err := tx.ExecContext(ctx,
-		`UPDATE alerts SET acknowledged_at = ? WHERE id = ? AND acknowledged_at IS NULL`, now, alertID)
+		`UPDATE alerts SET acknowledged_at = ? WHERE id = ? AND workspace_id = ? AND acknowledged_at IS NULL`, now, alertID, ws)
 	if err != nil {
 		return err
 	}
@@ -263,7 +269,7 @@ func (s *SQLite) AcknowledgeAlert(ctx context.Context, alertID int64) error {
 	}
 	if n == 0 {
 		var one int
-		err := tx.QueryRowContext(ctx, `SELECT 1 FROM alerts WHERE id = ?`, alertID).Scan(&one)
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM alerts WHERE id = ? AND workspace_id = ?`, alertID, ws).Scan(&one)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}

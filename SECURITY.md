@@ -15,6 +15,18 @@ issue for anything you believe is exploitable.
 Include reproduction steps and, where relevant, the request that
 triggers it. A proof of concept is welcome but not required.
 
+## Dependency scanning
+
+Every pull request and every push to `main` runs `govulncheck` over the root
+module **and** the nested Terraform provider module, which has its own
+dependency tree and would otherwise be invisible to the scan. The job is
+separate from lint so the pull request page distinguishes a code smell from a
+known vulnerability, and the tool version is pinned in the `Makefile` so an
+unrelated change cannot fail on the day the vulnerability database updates.
+`make vulncheck` reproduces the CI job locally. Only vulnerabilities reachable
+from compiled code fail the build; an advisory against an unused path is
+reported by the database but is not treated as a release blocker here.
+
 ## Scope
 
 In scope:

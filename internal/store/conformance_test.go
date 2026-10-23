@@ -23,6 +23,9 @@ type conformanceStore interface {
 	resetConformance(ctx context.Context) error
 	// setAlertCreatedAt backdates one alert row.
 	setAlertCreatedAt(ctx context.Context, id int64, at time.Time) error
+	// setDeliveryAttemptAt backdates one delivery attempt's attempted_at, so
+	// window-filtering tests do not have to sleep or mock the clock.
+	setDeliveryAttemptAt(ctx context.Context, id int64, at time.Time) error
 	// backdateRuleLastAlert moves a rule's cooldown window into the past,
 	// so cooldown-expiry tests do not have to sleep.
 	backdateRuleLastAlert(ctx context.Context, id int64, d time.Duration) error
@@ -48,6 +51,7 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("ListMonitorsPageSearchFilterSort", func(t *testing.T) { testListMonitorsPage(t, newStore) })
 	t.Run("RuleCRUDAndCascade", func(t *testing.T) { testRuleCRUD(t, newStore) })
 	t.Run("CreateRulesAtomic", func(t *testing.T) { testCreateRulesAtomic(t, newStore) })
+	t.Run("CreateMonitorWithRulesIsAtomic", func(t *testing.T) { testCreateMonitorWithRules(t, newStore) })
 	t.Run("ChannelsAndAttachments", func(t *testing.T) { testChannelsAndAttachments(t, newStore) })
 	t.Run("ListChannelsByIDs", func(t *testing.T) { testListChannelsByIDs(t, newStore) })
 	t.Run("ListChannelsTypeAndEnabledFilters", func(t *testing.T) { testListChannelsFilters(t, newStore) })
@@ -63,9 +67,11 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("DeleteExpiredAlertsKeepsRecentAndCascades", func(t *testing.T) { testDeleteExpiredAlertsCascade(t, newStore) })
 	t.Run("DeleteExpiredAlertsBatches", func(t *testing.T) { testDeleteExpiredAlertsBatches(t, newStore) })
 	t.Run("IngestStateRoundTrip", func(t *testing.T) { testIngestState(t, newStore) })
+	t.Run("ContractIngestCursors", func(t *testing.T) { testContractIngestCursors(t, newStore) })
 	t.Run("AbsenceStateRoundTrip", func(t *testing.T) { testAbsenceState(t, newStore) })
 	t.Run("GetStats", func(t *testing.T) { testGetStats(t, newStore) })
 	t.Run("GetMonitorStats", func(t *testing.T) { testGetMonitorStats(t, newStore) })
+	t.Run("ChannelDeliveryStatsAggregation", func(t *testing.T) { testChannelDeliveryStats(t, newStore) })
 	t.Run("AlertCountsByDayZeroFillAndWindow", func(t *testing.T) { testAlertCountsByDay(t, newStore) })
 	t.Run("DuplicateMonitorCopiesRulesChannelsDisabledUniqueName", func(t *testing.T) { testDuplicateMonitor(t, newStore) })
 	t.Run("LedgerHashesAndAlertRetraction", func(t *testing.T) { testLedgerHashesAndRetraction(t, newStore) })
@@ -94,6 +100,14 @@ func runStoreConformance(t *testing.T, newStore conformanceFactory) {
 	t.Run("WorkspaceIsolation", func(t *testing.T) { testWorkspaceIsolation(t, newStore) })
 	t.Run("DeleteByIDAllowlist", func(t *testing.T) { testDeleteByIDAllowlist(t, newStore) })
 	t.Run("APITokens", func(t *testing.T) { testAPITokens(t, newStore) })
+	// A constraint violation is the request's fault, and both backends have
+	// to say so in the same typed way: the API answers 422 on the strength of
+	// it.
+	t.Run("ConstraintViolationsAreTyped", func(t *testing.T) { testConstraintViolationsAreTyped(t, newStore) })
+	// An alert another instance forwarded belongs to no local monitor and no
+	// local rule, and both backends have to store it that way.
+	t.Run("FederatedAlerts", func(t *testing.T) { testFederatedAlerts(t, newStore) })
+	t.Run("FederatedAlertsFollowTheDeliveringWorkspace", func(t *testing.T) { testFederatedAlertFollowsTheDeliveringWorkspace(t, newStore) })
 }
 
 // testChannelDigest pins the digest settings round trip and the pending
@@ -343,11 +357,11 @@ func testKeysetPagination(t *testing.T, newStore conformanceFactory) {
 	// Seven monitors, newest last by id. Mix enabled so the enabled-only
 	// filter has something to compose with the cursor.
 	for i := 0; i < 7; i++ {
-		m := &Monitor{Name: "m", ContractIDs: []string{"C"}, Enabled: i%2 == 0}
+		m := &Monitor{Name: fmt.Sprintf("m%d", i), ContractIDs: []string{"C"}, Enabled: i%2 == 0}
 		require.NoError(t, st.CreateMonitor(ctx, m))
 	}
 	for i := 0; i < 7; i++ {
-		c := &Channel{Name: "c", Type: "webhook", Config: json.RawMessage(`{}`), Enabled: i%2 == 0}
+		c := &Channel{Name: fmt.Sprintf("c%d", i), Type: "webhook", Config: json.RawMessage(`{}`), Enabled: i%2 == 0}
 		require.NoError(t, st.CreateChannel(ctx, c))
 	}
 
@@ -526,6 +540,51 @@ func testCreateRulesAtomic(t *testing.T, newStore conformanceFactory) {
 	list, err = st.ListRules(ctx, m.ID, false)
 	require.NoError(t, err)
 	require.Len(t, list, 2, "failed batch must not insert a prefix of the rules")
+}
+
+// testCreateMonitorWithRules covers the write a template instantiation
+// needs: a monitor, its rules and its channel attachments land together. A
+// failure in any part of it must leave nothing behind — a monitor without
+// its rules is a monitor that watches a contract and never says anything.
+func testCreateMonitorWithRules(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	ch := &Channel{Name: "c1", Type: "webhook", Config: json.RawMessage(`{"url":"u","secret":"s"}`), Enabled: true}
+	require.NoError(t, st.CreateChannel(ctx, ch))
+
+	m := &Monitor{Name: "from template", ContractIDs: []string{"C1", "C2"}, Enabled: true}
+	rules := []*Rule{
+		{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"transfer"}`), Enabled: true},
+		{Type: "token_event", Params: json.RawMessage(`{"event":"mint"}`), Enabled: true},
+	}
+	require.NoError(t, st.CreateMonitorWithRules(ctx, m, rules, []int64{ch.ID}))
+	require.NotZero(t, m.ID)
+	require.NotZero(t, rules[0].ID)
+
+	got, err := st.GetMonitor(ctx, m.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"C1", "C2"}, got.ContractIDs)
+	assert.Equal(t, []int64{ch.ID}, got.ChannelIDs)
+
+	list, err := st.ListRules(ctx, m.ID, false)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	assert.Equal(t, "event_emitted", list[0].Type)
+	assert.Equal(t, "token_event", list[1].Type)
+
+	// A channel that does not exist fails the whole call, and the monitor
+	// that was created alongside it is not left in the table.
+	bad := &Monitor{Name: "half written", ContractIDs: []string{"C3"}, Enabled: true}
+	badRules := []*Rule{{Type: "event_emitted", Params: json.RawMessage(`{"event_name":"burn"}`), Enabled: true}}
+	err = st.CreateMonitorWithRules(ctx, bad, badRules, []int64{ch.ID + 999})
+	require.Error(t, err)
+
+	monitors, err := st.ListMonitors(ctx, false)
+	require.NoError(t, err)
+	require.Len(t, monitors, 1, "a failed write must not leave a monitor behind")
+	_, err = st.GetMonitor(ctx, bad.ID)
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func testChannelsAndAttachments(t *testing.T, newStore conformanceFactory) {
@@ -1144,6 +1203,58 @@ func testIngestState(t *testing.T, newStore conformanceFactory) {
 	require.NoError(t, err)
 	assert.Equal(t, uint32(123456), got.LastLedger)
 	assert.Equal(t, "0000001-0000000", got.LastCursor)
+}
+
+func testContractIngestCursors(t *testing.T, newStore conformanceFactory) {
+	ctx := context.Background()
+	st := newStore(t)
+	first := &Monitor{Name: "first", ContractIDs: []string{"CA", "CB"}, Enabled: true, Network: "testnet"}
+	second := &Monitor{Name: "second", ContractIDs: []string{"CB"}, Enabled: false, Network: "testnet"}
+	require.NoError(t, st.CreateMonitor(ctx, first))
+	require.NoError(t, st.CreateMonitor(ctx, second))
+
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CA", 100))
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CB", 100))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "testnet", "CA", 120))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "testnet", "CB", 130))
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CA", 5))
+	require.NoError(t, st.AdvanceContractCursor(ctx, "testnet", "CA", 110))
+
+	cursors, err := st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	require.Len(t, cursors, 2)
+	assert.Equal(t, uint32(120), cursors[0].LastLedger)
+	assert.Equal(t, uint32(130), cursors[1].LastLedger)
+	require.NoError(t, st.RewindContractCursors(ctx, "testnet", 115))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Equal(t, uint32(115), cursors[0].LastLedger)
+	assert.Equal(t, uint32(115), cursors[1].LastLedger)
+
+	first.ContractIDs = []string{"CA"}
+	require.NoError(t, st.UpdateMonitor(ctx, first))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Len(t, cursors, 2, "a disabled monitor still retains its referenced contract cursor")
+
+	require.NoError(t, st.DeleteMonitor(ctx, second.ID))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	require.Len(t, cursors, 1)
+	assert.Equal(t, "CA", cursors[0].ContractID)
+
+	require.NoError(t, st.DeleteMonitor(ctx, first.ID))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	assert.Empty(t, cursors, "the final monitor reference removes its cursor")
+
+	readded := &Monitor{Name: "readded", ContractIDs: []string{"CA"}, Enabled: true, Network: "testnet"}
+	require.NoError(t, st.CreateMonitor(ctx, readded))
+	require.NoError(t, st.InitializeContractCursor(ctx, "testnet", "CA", 140))
+	cursors, err = st.ListContractCursors(ctx, "testnet")
+	require.NoError(t, err)
+	require.Len(t, cursors, 1)
+	assert.Equal(t, uint32(140), cursors[0].LastLedger, "re-add uses the new global fallback baseline")
 }
 
 func testGetStats(t *testing.T, newStore conformanceFactory) {

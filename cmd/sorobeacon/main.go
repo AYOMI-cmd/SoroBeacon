@@ -9,9 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -61,6 +63,13 @@ func main() {
 		}
 		return
 	}
+	if len(args) > 0 && args[0] == "preflight" {
+		if err := runPreflightCLI(context.Background(), args[1:], os.Stdout); err != nil {
+			reportCLIError(os.Stderr, err)
+			os.Exit(exitCodeFor(err))
+		}
+		return
+	}
 	if len(args) > 0 {
 		switch args[0] {
 		case "backup":
@@ -75,6 +84,12 @@ func main() {
 				os.Exit(exitCodeFor(err))
 			}
 			return
+		}
+		// `sorobeacon validate` checks the configuration and exits with a
+		// code a deployment pipeline can branch on, so it is dispatched
+		// before the client: it talks to no instance and starts no server.
+		if ok, rest := validateRequested(args); ok {
+			os.Exit(runValidate(context.Background(), rest, os.Stdout))
 		}
 		if err := runCLI(context.Background(), args, os.Stdout); err != nil {
 			reportCLIError(os.Stderr, err)
@@ -97,6 +112,96 @@ func run() error {
 	slog.SetDefault(log)
 	log.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogAttrs()...)
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	srv, err := newServer(ctx, cfg, log, defaultStartupDeps())
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+	return srv.run(ctx)
+}
+
+// leaderLease is the part of lease.Lease the startup path drives: the loop
+// that runs the poller while this instance is leader, and the status the API
+// and the dashboard render. It is an interface so the startup tests can
+// replace the election with a fake and still assert that shutdown waits for
+// the lease to be given up.
+type leaderLease interface {
+	Run(context.Context, func(context.Context))
+	Status() lease.Status
+}
+
+// startupDeps are the two seams that reach outside the process: where events
+// come from, and how leadership is elected. Everything else is built from
+// config, so a startup test replaces only these and still exercises the real
+// wiring. buildSource receives the opened store so a test can pin that
+// migrations ran before the first component that queries it was wired.
+type startupDeps struct {
+	buildSource func(context.Context, *slog.Logger, config.Config, store.Store) (poller.EventSource, api.HealthChecker, error)
+	newLeader   func(config.Config, *slog.Logger) (leaderLease, error)
+}
+
+func defaultStartupDeps() startupDeps {
+	return startupDeps{
+		buildSource: func(ctx context.Context, log *slog.Logger, cfg config.Config, _ store.Store) (poller.EventSource, api.HealthChecker, error) {
+			return buildSource(ctx, log, cfg)
+		},
+		newLeader: func(cfg config.Config, log *slog.Logger) (leaderLease, error) {
+			// Leadership. Every instance serves the API and the dashboard, but
+			// only the one holding the lease runs the ingest loop: two pollers
+			// ingest the same events and race the same checkpoint, so alerts
+			// arrive twice and each instance believes the other's progress is
+			// its own. Postgres supplies the election as a session advisory
+			// lock, which needs no table and no migration. A SQLite database
+			// cannot be shared between machines and has no advisory locks, so
+			// a SQLite deployment is always the poller.
+			//
+			// Failing to build the lease is fatal rather than a silent fall
+			// back to "everyone polls", which is the bug this prevents.
+			if store.BackendName(cfg.DatabaseURL) == "postgres" {
+				return lease.NewPostgres(cfg.DatabaseURL, lease.Options{}, log)
+			}
+			return lease.SingleNode(log), nil
+		},
+	}
+}
+
+// server is everything newServer constructs, held together so run can start
+// it and Close can release it. Building it starts no loops: only run does
+// that, which is what lets a startup test assert what was wired before any
+// goroutine exists.
+type server struct {
+	cfg config.Config
+	log *slog.Logger
+
+	store      store.Store
+	poller     *poller.Poller
+	dispatcher *notify.Dispatcher
+	leader     leaderLease
+	archiver   store.AlertArchiver
+	tel        *telemetry.Provider
+
+	httpSrv      *http.Server
+	grpcSrv      *sorogrpc.Server
+	httpListener net.Listener
+	grpcListener net.Listener
+
+	// Wiring decisions, set once here and used by run. Keeping them in one
+	// place means the branch that constructs a component and the loop that
+	// starts it cannot disagree about whether it is enabled.
+	prunerEnabled   bool
+	playground      bool
+	shutdownTimeout time.Duration
+}
+
+// newServer builds the process from configuration: store and migrations,
+// lease, event source, pipeline, HTTP and gRPC servers, and finally the
+// listeners they will serve on. It starts nothing. Listeners are bound last,
+// so a failure earlier leaves no port held and the deferred Close has nothing
+// but the store and tracer to release.
+func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps startupDeps) (_ *server, err error) {
 	// Channel config holds secrets; encrypt it at rest when a key is set.
 	// The key is validated here so a malformed value fails startup rather
 	// than the first channel write. With no key the store keeps storing
@@ -105,7 +210,7 @@ func run() error {
 	if len(cfg.ConfigEncryptionKey) > 0 {
 		configCipher, err = store.NewAESGCMCipher(cfg.ConfigEncryptionKey)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	warnIfChannelConfigUnencrypted(log, cfg.ConfigEncryptionKey)
@@ -123,18 +228,9 @@ func run() error {
 	// of them being able to ask for someone else's data.
 	bindings, err := cfg.AuthBindings()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	authn := auth.NewBound(bindings, auth.DefaultSessionTTL)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	// The work this process does on its own behalf — ingesting ledgers,
-	// delivering alerts, pruning history — belongs to no single workspace: it
-	// acts across all of them. Marking the background context once here is
-	// what keeps a store method from silently reading it as a request from the
-	// default tenant instead.
-	sysCtx := workspace.WithSystem(ctx)
 
 	// Single sign-on, when a provider is configured. Discovery happens here, at
 	// startup, rather than on the first visitor's click: a mistyped
@@ -146,7 +242,7 @@ func run() error {
 		defer cancel()
 		provider, err := auth.NewOIDCProvider(discoverCtx, cfg.OIDC.AuthOIDC())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		authn.WithOIDC(provider)
 		// The issuer URL is configuration, not a secret; the client secret is
@@ -158,16 +254,16 @@ func run() error {
 
 	// Tracing is entirely off unless OTLP_ENDPOINT is set; with it unset
 	// Setup installs a no-op provider, spans cost nothing and Shutdown is
-	// a no-op. When enabled, the flush below must run before the process
-	// exits or the last spans of a deployment — often the interesting ones
-	// — are dropped with the batcher's queue.
+	// a no-op. When enabled, the flush must run before the process exits or
+	// the last spans of a deployment — often the interesting ones — are
+	// dropped with the batcher's queue.
 	tel, err := telemetry.Setup(ctx, telemetry.Config{
 		Endpoint:    cfg.OTLP.Endpoint,
 		ServiceName: cfg.OTLP.ServiceName,
 		SampleRate:  cfg.OTLP.SampleRate,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if tel.Enabled() {
 		log.Info("opentelemetry tracing enabled",
@@ -175,21 +271,30 @@ func run() error {
 			"otlp_service_name", cfg.OTLP.ServiceName,
 			"otlp_sample_rate", cfg.OTLP.SampleRate)
 	}
-	defer func() {
-		// Bounded so a hung collector delays shutdown by at most this long.
-		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := tel.Shutdown(flushCtx); err != nil {
-			log.Warn("flush pending spans on shutdown", "error", err)
-		}
-	}()
 
 	// Storage. The DATABASE_URL scheme selects the backend: postgres /
 	// postgresql for the pgx pool, sqlite for a single-file database that
 	// removes the Postgres prerequisite on a small VPS or Raspberry Pi. Both
 	// implement store.Store and apply their own embedded migrations.
+	//
+	// Ordering that matters: migrations run before anything queries the
+	// database, and the store is opened before the lease, the source or any
+	// server gets a handle to it. A server wired against a database that has
+	// not been migrated would serve 500s until the operator noticed.
 	if err := store.Migrate(cfg.DatabaseURL); err != nil {
-		return err
+		shutdownTelemetry(log, tel)
+		return nil, err
+	}
+	stateCtx, cancelState := context.WithTimeout(ctx, startupNetworkTimeout)
+	currentMigration, latestMigration, dirtyMigration, err := store.MigrationState(stateCtx, cfg.DatabaseURL)
+	cancelState()
+	if err != nil {
+		shutdownTelemetry(log, tel)
+		return nil, fmt.Errorf("verify database migration state: %w", err)
+	}
+	if dirtyMigration || currentMigration != latestMigration {
+		shutdownTelemetry(log, tel)
+		return nil, fmt.Errorf("verify database migration state: current=%d latest=%d dirty=%t", currentMigration, latestMigration, dirtyMigration)
 	}
 	// Metrics are built before the store now, because the store labels every
 	// routed read with the pool that served it. Nothing else about the order
@@ -203,9 +308,16 @@ func run() error {
 		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
 		ReplicaURL:      cfg.ReplicaDatabaseURL,
 		Metrics:         m,
+		// The connection retry is bounded and jittered: a database that is
+		// mid-failover refuses connections for a while, and that pause must
+		// not become a crash loop.
+		Log:             log,
+		ConnectAttempts: cfg.DatabaseConnectAttempts,
+		ConnectDelay:    cfg.DatabaseConnectDelay,
 	}, configCipher)
 	if err != nil {
-		return err
+		shutdownTelemetry(log, tel)
+		return nil, err
 	}
 	// store.New hands back the Store interface, which deliberately carries no
 	// telemetry: a backend without spans, and every test fake, would
@@ -216,7 +328,6 @@ func run() error {
 	if p, ok := st.(*store.Postgres); ok {
 		p.WithTelemetry(tel)
 	}
-	defer st.Close()
 	log.Info("database ready", "backend", store.BackendName(cfg.DatabaseURL))
 	if cfg.ReplicaDatabaseURL != "" {
 		// The URL itself stays out of the line: it carries credentials. The
@@ -225,32 +336,41 @@ func run() error {
 		log.Info("read replica enabled", "routed_reads", "monitors list, alert search, stats, alert counts by day")
 	}
 
-	// Leadership. Every instance serves the API and the dashboard, but only the
-	// one holding the lease runs the ingest loop: two pollers ingest the same
-	// events and race the same checkpoint, so alerts arrive twice and each
-	// instance believes the other's progress is its own. Postgres supplies the
-	// election as a session advisory lock, which needs no table and no
-	// migration. A SQLite database cannot be shared between machines and has no
-	// advisory locks, so a SQLite deployment is always the poller.
-	//
-	// Failing to build the lease is fatal rather than a silent fall back to
-	// "everyone polls", which is the bug this prevents.
-	var leader *lease.Lease
-	if store.BackendName(cfg.DatabaseURL) == "postgres" {
-		leader, err = lease.NewPostgres(cfg.DatabaseURL, lease.Options{}, log)
-		if err != nil {
-			return err
-		}
-	} else {
-		leader = lease.SingleNode(log)
+	srv := &server{
+		cfg:             cfg,
+		log:             log,
+		store:           st,
+		tel:             tel,
+		shutdownTimeout: 10 * time.Second,
 	}
+	// From here on the server owns the store and the tracer, so a failed
+	// build releases them rather than leaving a pool and a batcher behind.
+	built := false
+	defer func() {
+		if !built {
+			srv.Close()
+		}
+	}()
+
+	leader, err := deps.newLeader(cfg, log)
+	if err != nil {
+		return nil, err
+	}
+	srv.leader = leader
 
 	// Postgres partitions alerts by month. Make sure the months just ahead
 	// exist before the poller can write into them, so a row never has to fall
 	// back to the default partition under normal operation. A no-op on SQLite.
 	if pe, ok := st.(store.PartitionEnsurer); ok {
 		if err := pe.EnsureAlertPartitions(ctx, time.Now().UTC(), 3); err != nil {
-			return err
+			return nil, err
+		}
+		checker, ok := st.(store.PartitionRunwayChecker)
+		if !ok {
+			return nil, errors.New("partition backend does not support runway checks")
+		}
+		if err := checker.CheckAlertPartitionRunway(ctx, time.Now().UTC(), 3); err != nil {
+			return nil, fmt.Errorf("verify alert partition runway: %w", err)
 		}
 	}
 
@@ -260,7 +380,7 @@ func run() error {
 	// overwrites a name, and 'default' already exists from the migration.
 	for _, ws := range cfg.Workspaces() {
 		if err := st.EnsureWorkspace(ctx, ws); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -276,9 +396,9 @@ func run() error {
 	// the single seam between the poller and wherever events come from. The
 	// backfill subcommand shares this wiring so a replay reads exactly what
 	// live monitoring reads.
-	src, health, err := buildSource(ctx, log, cfg)
+	src, health, err := deps.buildSource(ctx, log, cfg, st)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	logStartupHealth(ctx, log, health)
 
@@ -309,24 +429,51 @@ func run() error {
 			}
 			return records, nil
 		})))
-	factory := notify.DefaultFactory()
+	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName)
 	// External secrets: when a provider is configured, ${secret:...}
 	// references in channel configs resolve when a notifier is built. The
 	// stored config keeps the reference.
 	if resolver := buildSecretResolver(cfg, log); resolver != nil {
 		factory.WithSecrets(resolver)
 	}
+	validationCtx, cancelValidation := context.WithTimeout(ctx, startupNetworkTimeout)
+	channels, err := st.ListChannels(workspace.WithSystem(validationCtx), false)
+	if err != nil {
+		cancelValidation()
+		return nil, fmt.Errorf("validate channel configurations: %w", err)
+	}
+	var channelErrors []error
+	for _, channel := range channels {
+		if _, err := validateChannelConfiguration(validationCtx, factory, channel, cfg.SecretsProvider); err != nil {
+			channelErrors = append(channelErrors, fmt.Errorf("channel %d (%s): %s", channel.ID, channel.Type, redactPreflightError(err, channelConfigValues(channel.Config)...)))
+		}
+	}
+	cancelValidation()
+	if len(channelErrors) > 0 {
+		return nil, fmt.Errorf("validate channel configurations: %w", errors.Join(channelErrors...))
+	}
 	// Channel health: delivery outcomes are folded into each channel so a
 	// revoked token surfaces as a broken channel instead of as silence. The
 	// threshold is off unless the operator sets it — auto-disabling a channel
 	// is a destructive answer to a temporary problem.
 	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithRateLimits(notify.RateLimits{
+			SlackRPS:     cfg.NotifyRateLimitSlackRPS,
+			TelegramRPS:  cfg.NotifyRateLimitTelegramRPS,
+			PagerDutyRPS: cfg.NotifyRateLimitPagerDutyRPS,
+			DefaultRPS:   cfg.NotifyRateLimitDefaultRPS,
+		}).
 		WithMetrics(m).
 		WithDigestQueue(st).
-		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures).
+		WithFlapping(alerts.FlappingConfig{
+			Episodes:   cfg.FlappingEpisodes,
+			Window:     cfg.FlappingWindow,
+			QuietAfter: cfg.FlappingQuietAfter,
+		})
 	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// One in-process fan-out carries newly created alerts to the SSE endpoint.
 	// The poller publishes into exactly the instance the API serves from, so
@@ -355,7 +502,7 @@ func run() error {
 		WithAuth(authn)
 	webSrv, err := web.New(st, registry, factory, log)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	webSrv.WithPoller(p).WithLeadership(leader).WithSilentAfter(cfg.MonitorSilentAfter).WithAuth(authn).
 		WithNetworks(config.NetworkNames(cfg.Networks)).WithTokens(tokens)
@@ -396,23 +543,6 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		log.Info("http server listening", "addr", cfg.HTTPAddr, "rpc_url", cfg.RPCURL)
-		if err := httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	}()
-	// gRPC serves reads exactly as the HTTP API does, so every instance runs
-	// it regardless of leadership.
-	if cfg.GRPCAddr != "" {
-		grpcSrv := sorogrpc.New(st, authn, log)
-		go func() {
-			if err := grpcSrv.Serve(ctx, cfg.GRPCAddr); err != nil {
-				log.Error("grpc server error", "err", err)
-			}
-		}()
-	}
 	// Retention can tier expired alerts to object storage before deleting
 	// them. Off by default: an empty ARCHIVE_URL leaves the pruner behaving
 	// exactly as it did before archiving existed. Built here rather than
@@ -422,11 +552,11 @@ func run() error {
 	if cfg.ArchiveURL != "" {
 		back, err := archive.FromURL(cfg.ArchiveURL)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		pruner, err := archive.NewPruner(back)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		archiver = pruner
 		// Never log the URL: an operator may embed an endpoint or token in a
@@ -439,52 +569,180 @@ func run() error {
 		log.Warn("ARCHIVE_URL is set but ALERT_RETENTION is unset; nothing will be archived or deleted")
 	}
 
-	// The poller, the retention pruner and the digest flusher all write on a
-	// schedule, so they run only while this instance holds the lease. Keeping
-	// them in one job means a demotion cancels the loop and the lease is not
-	// given up until the loop has genuinely returned, so a new leader cannot
-	// start polling while this one is still mid-cycle.
-	//
-	// The digest flusher is gated for the same reason as the pruner: it sends
-	// on a timer, and two instances flushing the same pending digests would
-	// deliver each one twice.
-	job := func(ctx context.Context) {
-		if cfg.AlertRetention > 0 {
-			go store.RunAlertPruner(ctx, st, cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, archiver, log)
-		}
-		go dispatcher.RunDigestFlusher(ctx, notify.DefaultDigestFlushInterval)
-		// Escalation steps are driven by their persisted next-due time, so
-		// this loop is also what resumes an escalation that was mid-flight at
-		// restart. Leader-gated for the same reason as the digest flusher:
-		// two instances stepping the same alert would page twice.
-		go dispatcher.RunEscalations(ctx)
-		p.Run(ctx)
+	srv.poller = p
+	srv.dispatcher = dispatcher
+	srv.archiver = archiver
+	srv.httpSrv = httpSrv
+	srv.prunerEnabled = cfg.AlertRetention > 0
+	srv.playground = cfg.GraphQL.EnablePlayground
+
+	// gRPC serves reads exactly as the HTTP API does, so every instance runs
+	// it regardless of leadership.
+	if cfg.GRPCAddr != "" {
+		srv.grpcSrv = sorogrpc.New(st, authn, log)
 	}
+
+	// Bind last. A listener is the first thing a failed startup could leave
+	// held, so it is acquired only once every component has been built and
+	// closed by Close on any error from here on.
+	httpLis, err := net.Listen("tcp", cfg.HTTPAddr)
+	if err != nil {
+		return nil, fmt.Errorf("http listen %s: %w", cfg.HTTPAddr, err)
+	}
+	srv.httpListener = httpLis
+	if srv.grpcSrv != nil {
+		grpcLis, err := net.Listen("tcp", cfg.GRPCAddr)
+		if err != nil {
+			// A gRPC bind failure has always been logged and survived rather
+			// than fatal to a deployment whose API is otherwise healthy, and
+			// that behaviour is kept: the API is the control plane.
+			log.Error("grpc server error", "err", fmt.Errorf("grpc listen %s: %w", cfg.GRPCAddr, err))
+			srv.grpcSrv = nil
+		} else {
+			srv.grpcListener = grpcLis
+		}
+	}
+
+	built = true
+	return srv, nil
+}
+
+// run starts the servers and the leader loop, then serves until ctx is
+// cancelled or a server fails. Shutdown is ordered: the listeners stop
+// accepting, the leader loop is waited for (which stops the poller and
+// releases the lease), and only then does run return. Every wait is bounded
+// so a wedged component cannot hang a deploy.
+func (s *server) run(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	httpErr := make(chan error, 1)
+	httpStopped := false
+	go func() {
+		s.log.Info("http server listening", "addr", s.httpListener.Addr().String(), "rpc_url", s.cfg.RPCURL)
+		err := s.httpSrv.Serve(s.httpListener)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			httpErr <- err
+			return
+		}
+		httpErr <- nil
+	}()
+
+	var grpcDone chan struct{}
+	if s.grpcSrv != nil {
+		grpcDone = make(chan struct{})
+		go func() {
+			defer close(grpcDone)
+			if err := s.grpcSrv.ServeListener(runCtx, s.grpcListener); err != nil {
+				s.log.Error("grpc server error", "err", err)
+			}
+		}()
+	}
+
 	leaderDone := make(chan struct{})
 	go func() {
 		defer close(leaderDone)
-		// sysCtx, not ctx: everything this job drives — the poller, the
+		// sysCtx, not runCtx: everything this job drives — the poller, the
 		// retention pruner, the digest flusher, the escalation stepper — acts
 		// across every workspace, and a plain context would be read by the
 		// store as a request from the default tenant.
-		leader.Run(sysCtx, job)
+		s.leader.Run(workspace.WithSystem(runCtx), s.job)
 	}()
 
+	var runErr error
 	select {
 	case <-ctx.Done():
-		log.Info("shutting down")
-	case err := <-errCh:
-		return err
+		s.log.Info("shutting down")
+	case err := <-httpErr:
+		// Serve only reports here when it failed, since ErrServerClosed is
+		// filtered out above; the goroutine has returned.
+		httpStopped = true
+		runErr = err
+		if err != nil {
+			s.log.Error("http server error", "err", err)
+		}
 	}
+	cancel()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err = httpSrv.Shutdown(shutdownCtx)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), s.shutdownTimeout)
+	defer cancelShutdown()
+	if err := s.httpSrv.Shutdown(shutdownCtx); err != nil && runErr == nil {
+		runErr = err
+	}
 	// Wait for the election loop to finish before exiting: on the way out it
 	// releases the advisory lock, so the surviving instances promote at once
-	// instead of waiting for this session to disappear.
+	// instead of waiting for this session to disappear. It also waits for the
+	// job it started, which is how the poller, pruner and dispatchers are
+	// known to have stopped before the process returns.
 	<-leaderDone
-	return err
+	if grpcDone != nil {
+		<-grpcDone
+	}
+	if !httpStopped {
+		<-httpErr
+	}
+	return runErr
+}
+
+// job is what the leader runs for as long as it holds the lease. Every loop
+// that writes on a schedule lives here rather than in run, because two
+// instances doing this work at once would deliver each alert twice. The
+// WaitGroup is what lets the lease be handed over safely: the loop does not
+// return until the pruner and both dispatcher loops have stopped, so a new
+// leader cannot start while this one is still mid-cycle.
+func (s *server) job(ctx context.Context) {
+	var wg sync.WaitGroup
+	start := func(loop func(context.Context)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			loop(ctx)
+		}()
+	}
+	if s.prunerEnabled {
+		start(func(ctx context.Context) {
+			store.RunAlertPruner(ctx, s.store, s.cfg.AlertRetention, store.DefaultPruneInterval, store.DefaultPruneBatch, s.archiver, s.log)
+		})
+	}
+	// The digest flusher and the escalation stepper are leader-gated for the
+	// same reason as the pruner: they send on a timer, and two instances
+	// flushing the same pending messages would deliver each one twice.
+	start(func(ctx context.Context) {
+		s.dispatcher.RunDigestFlusher(ctx, notify.DefaultDigestFlushInterval)
+	})
+	start(func(ctx context.Context) {
+		s.dispatcher.RunEscalations(ctx)
+	})
+	s.poller.Run(ctx)
+	wg.Wait()
+}
+
+// Close releases everything newServer acquired. It is safe on a partially
+// built server, which is exactly what an error from newServer relies on.
+func (s *server) Close() {
+	if s.httpListener != nil {
+		_ = s.httpListener.Close()
+	}
+	if s.grpcListener != nil {
+		_ = s.grpcListener.Close()
+	}
+	if s.store != nil {
+		s.store.Close()
+	}
+	if s.tel != nil {
+		shutdownTelemetry(s.log, s.tel)
+	}
+}
+
+// shutdownTelemetry flushes spans with the same bound an ordinary shutdown
+// uses. A collector that has gone away must not turn a startup error into a
+// hang.
+func shutdownTelemetry(log *slog.Logger, tel *telemetry.Provider) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tel.Shutdown(ctx); err != nil {
+		log.Warn("flush pending spans on shutdown", "error", err)
+	}
 }
 
 // buildSecretResolver selects the external-secret provider named by
@@ -637,7 +895,7 @@ func runBackfill(args []string) error {
 	}
 
 	registry := rules.NewRegistry()
-	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory(), log)
+	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName), log)
 	ingestor := poller.NewIngestor(st, registry, dispatcher, log)
 	job := backfill.New(src, st, registry, ingestor, log)
 
@@ -714,6 +972,7 @@ func verifyNetworkEndpoints(ctx context.Context, log *slog.Logger, client *stell
 	ctx, cancel := context.WithTimeout(ctx, startupNetworkTimeout)
 	defer cancel()
 
+	var mismatches []error
 	for _, ep := range client.Endpoints() {
 		net, err := ep.Client.GetNetwork(ctx)
 		if err != nil {
@@ -721,10 +980,10 @@ func verifyNetworkEndpoints(ctx context.Context, log *slog.Logger, client *stell
 			continue
 		}
 		if err := config.VerifyPassphrase(configured, net.Passphrase); err != nil {
-			return fmt.Errorf("rpc endpoint %s: %w", ep.URL, err)
+			mismatches = append(mismatches, fmt.Errorf("rpc endpoint %s: %w", ep.URL, err))
 		}
 	}
-	return nil
+	return errors.Join(mismatches...)
 }
 
 // startupHealthTimeout bounds the one-off health check logged at startup,

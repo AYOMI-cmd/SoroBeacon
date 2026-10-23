@@ -14,7 +14,9 @@
     }
   ],
   "security": [
-    { "bearerAuth": [] }
+    {
+      "bearerAuth": []
+    }
   ],
   "paths": {
     "/monitors": {
@@ -25,7 +27,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/MonitorInput" }
+              "schema": {
+                "$ref": "#/components/schemas/MonitorInput"
+              }
             }
           }
         },
@@ -34,11 +38,15 @@
             "description": "Created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Monitor" }
+                "schema": {
+                  "$ref": "#/components/schemas/Monitor"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "get": {
@@ -48,36 +56,57 @@
           {
             "name": "q",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Case-insensitive substring match against the monitor name"
           },
           {
             "name": "enabled",
             "in": "query",
-            "schema": { "type": "boolean" },
+            "schema": {
+              "type": "boolean"
+            },
             "description": "Tri-state: omitted = all, true = enabled only, false = disabled only"
           },
           {
             "name": "sort",
             "in": "query",
-            "schema": { "type": "string", "enum": ["name", "id", "created_at"], "default": "name" },
+            "schema": {
+              "type": "string",
+              "enum": [
+                "name",
+                "id",
+                "created_at"
+              ],
+              "default": "name"
+            },
             "description": "Allowlisted order: name (default), id (newest first), created_at"
           },
           {
             "name": "network",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Only monitors watching this Stellar chain. Omitted means every chain this instance polls."
           },
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
           },
           {
             "name": "cursor",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Opaque continuation cursor from a previous page"
           }
         ],
@@ -86,7 +115,9 @@
             "description": "Monitors",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MonitorPage" }
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorPage"
+                }
               }
             }
           }
@@ -95,14 +126,15 @@
     },
     "/monitors/bulk": {
       "post": {
-        "description": "Required role: editor",
-        "summary": "Bulk enable or disable monitors",
         "description": "Sets enabled on an explicit list of monitor IDs in one statement. Unknown IDs are returned and do not prevent the known ones from applying. There is no all-monitors shorthand.",
+        "summary": "Bulk enable or disable monitors",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/BulkMonitorInput" }
+              "schema": {
+                "$ref": "#/components/schemas/BulkMonitorInput"
+              }
             }
           }
         },
@@ -111,17 +143,23 @@
             "description": "Applied",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/BulkMonitorResult" }
+                "schema": {
+                  "$ref": "#/components/schemas/BulkMonitorResult"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "get": {
         "summary": "Fetch one monitor",
@@ -130,11 +168,15 @@
             "description": "Monitor",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Monitor" }
+                "schema": {
+                  "$ref": "#/components/schemas/Monitor"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "patch": {
@@ -143,7 +185,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/MonitorInput" }
+              "schema": {
+                "$ref": "#/components/schemas/MonitorInput"
+              }
             }
           }
         },
@@ -152,24 +196,34 @@
             "description": "Updated",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Monitor" }
+                "schema": {
+                  "$ref": "#/components/schemas/Monitor"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "delete": {
         "summary": "Delete a monitor",
         "responses": {
-          "204": { "description": "Deleted" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}/rules/bulk": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Create several rules in one request",
@@ -182,7 +236,9 @@
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 50,
-                "items": { "$ref": "#/components/schemas/RuleInput" }
+                "items": {
+                  "$ref": "#/components/schemas/RuleInput"
+                }
               }
             }
           }
@@ -194,38 +250,56 @@
               "application/json": {
                 "schema": {
                   "type": "array",
-                  "items": { "$ref": "#/components/schemas/Rule" }
+                  "items": {
+                    "$ref": "#/components/schemas/Rule"
+                  }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}/stats": {
-      "parameters": [ { "$ref": "#/components/parameters/ID" } ],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
       "get": {
         "summary": "Per-monitor statistics",
-        "description": "Alert, delivery and per-rule counts for one monitor \u2014 the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
+        "description": "Alert, delivery and per-rule counts for one monitor — the answer to \"is this monitor doing anything\", which the instance-wide /stats cannot give. Counts are explicit zeroes for a monitor with no history, and every one of the monitor's rules appears with its own alert count, including rules that never matched. An unknown monitor is 404 rather than a body of zeroes, so a deleted monitor cannot be misread as a quiet one.",
         "responses": {
           "200": {
             "description": "MonitorStats",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MonitorStats" }
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorStats"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}/duplicate": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Duplicate a monitor",
@@ -235,18 +309,26 @@
             "description": "Created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Monitor" }
+                "schema": {
+                  "$ref": "#/components/schemas/Monitor"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}/escalation": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "get": {
         "summary": "Get a monitor's escalation policy",
@@ -256,11 +338,15 @@
             "description": "Escalation policy",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/EscalationPolicy" }
+                "schema": {
+                  "$ref": "#/components/schemas/EscalationPolicy"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "put": {
@@ -270,7 +356,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/EscalationInput" }
+              "schema": {
+                "$ref": "#/components/schemas/EscalationInput"
+              }
             }
           }
         },
@@ -279,26 +367,38 @@
             "description": "The stored policy",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/EscalationPolicy" }
+                "schema": {
+                  "$ref": "#/components/schemas/EscalationPolicy"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "delete": {
         "summary": "Delete a monitor's escalation policy",
         "description": "Removes the policy so the monitor fans out flat again. 404 when the monitor has no policy.",
         "responses": {
-          "204": { "description": "Deleted" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}/rules/dry-run": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Dry-run a rule against historical events",
@@ -309,11 +409,17 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["type"],
+                "required": [
+                  "type"
+                ],
                 "properties": {
                   "type": {
                     "type": "string",
-                    "enum": ["event_emitted", "value_threshold", "token_event"],
+                    "enum": [
+                      "event_emitted",
+                      "value_threshold",
+                      "token_event"
+                    ],
                     "description": "Rule type to evaluate"
                   },
                   "params": {
@@ -342,18 +448,26 @@
             "description": "Dry-run results",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/DryRunResult" }
+                "schema": {
+                  "$ref": "#/components/schemas/DryRunResult"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}/rules": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Add a rule to a monitor",
@@ -361,7 +475,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/RuleInput" }
+              "schema": {
+                "$ref": "#/components/schemas/RuleInput"
+              }
             }
           }
         },
@@ -370,12 +486,18 @@
             "description": "Created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Rule" }
+                "schema": {
+                  "$ref": "#/components/schemas/Rule"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "get": {
@@ -387,19 +509,27 @@
               "application/json": {
                 "schema": {
                   "type": "array",
-                  "items": { "$ref": "#/components/schemas/Rule" }
+                  "items": {
+                    "$ref": "#/components/schemas/Rule"
+                  }
                 }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/monitors/{id}/rules/{ruleID}": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" },
-        { "$ref": "#/components/parameters/RuleID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "$ref": "#/components/parameters/RuleID"
+        }
       ],
       "patch": {
         "summary": "Update a rule",
@@ -407,7 +537,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/RuleInput" }
+              "schema": {
+                "$ref": "#/components/schemas/RuleInput"
+              }
             }
           }
         },
@@ -416,18 +548,26 @@
             "description": "Updated",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Rule" }
+                "schema": {
+                  "$ref": "#/components/schemas/Rule"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "delete": {
         "summary": "Delete a rule",
         "responses": {
-          "204": { "description": "Deleted" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -438,7 +578,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/ChannelInput" }
+              "schema": {
+                "$ref": "#/components/schemas/ChannelInput"
+              }
             }
           }
         },
@@ -447,11 +589,15 @@
             "description": "Created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Channel" }
+                "schema": {
+                  "$ref": "#/components/schemas/Channel"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "get": {
@@ -460,18 +606,27 @@
           {
             "name": "enabled",
             "in": "query",
-            "schema": { "type": "boolean" },
+            "schema": {
+              "type": "boolean"
+            },
             "description": "When true, only enabled channels are returned"
           },
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
           },
           {
             "name": "cursor",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Opaque continuation cursor from a previous page"
           }
         ],
@@ -480,7 +635,9 @@
             "description": "Channels",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/ChannelPage" }
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelPage"
+                }
               }
             }
           }
@@ -489,7 +646,9 @@
     },
     "/channels/{id}": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "get": {
         "summary": "Fetch one channel",
@@ -498,11 +657,15 @@
             "description": "Channel",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Channel" }
+                "schema": {
+                  "$ref": "#/components/schemas/Channel"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "patch": {
@@ -512,7 +675,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/ChannelInput" }
+              "schema": {
+                "$ref": "#/components/schemas/ChannelInput"
+              }
             }
           }
         },
@@ -521,18 +686,65 @@
             "description": "Updated",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Channel" }
+                "schema": {
+                  "$ref": "#/components/schemas/Channel"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "delete": {
         "summary": "Delete a channel",
         "responses": {
-          "204": { "description": "Deleted" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/channels/{id}/stats": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "name": "window",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "default": "24h"
+          },
+          "description": "How far back to aggregate delivery attempts, as a Go duration (\"24h\", \"90m\"; \"7d\" is not valid — use \"168h\"). Defaults to 24h when omitted. Must be greater than zero and at most 2160h (90 days); anything else is 400. The effective value is echoed in the response's window field."
+        }
+      ],
+      "get": {
+        "summary": "Per-channel delivery statistics",
+        "description": "Delivery attempts for one channel aggregated in the database over the requested window: total tries, successes, failures, success rate and the last success/failure timestamps. Every recorded attempt is terminal (success or failed), so total is succeeded plus failed; retries count as separate attempts. A channel with no attempts in the window returns 200 with zero counts, null timestamps and no success_rate — an undefined rate is never rendered as 0% or 100%. An unknown channel is 404. No channel configuration is returned.",
+        "responses": {
+          "200": {
+            "description": "ChannelDeliveryStats",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelDeliveryStats"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -544,7 +756,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/BulkMonitorInput" }
+              "schema": {
+                "$ref": "#/components/schemas/BulkMonitorInput"
+              }
             }
           }
         },
@@ -553,17 +767,23 @@
             "description": "Applied",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/BulkMonitorResult" }
+                "schema": {
+                  "$ref": "#/components/schemas/BulkMonitorResult"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/channels/{id}/duplicate": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Duplicate a channel",
@@ -573,25 +793,39 @@
             "description": "Created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Channel" }
+                "schema": {
+                  "$ref": "#/components/schemas/Channel"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/channels/{id}/test": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Send a test notification through a channel",
         "responses": {
-          "200": { "description": "Test sent" },
-          "404": { "$ref": "#/components/responses/Error" },
-          "502": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Test sent"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -603,7 +837,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+              "schema": {
+                "$ref": "#/components/schemas/MaintenanceWindowInput"
+              }
             }
           }
         },
@@ -612,11 +848,15 @@
             "description": "Created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceWindow"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "get": {
@@ -625,19 +865,28 @@
           {
             "name": "active",
             "in": "query",
-            "schema": { "type": "boolean" },
+            "schema": {
+              "type": "boolean"
+            },
             "description": "Restrict to windows containing the current time"
           },
           {
             "name": "upcoming",
             "in": "query",
-            "schema": { "type": "boolean" },
+            "schema": {
+              "type": "boolean"
+            },
             "description": "Restrict to windows starting in the future"
           },
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 50
+            }
           }
         ],
         "responses": {
@@ -645,17 +894,23 @@
             "description": "Maintenance windows",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MaintenanceWindowPage" }
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceWindowPage"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/maintenance-windows/{id}": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "get": {
         "summary": "Fetch one maintenance window",
@@ -664,11 +919,15 @@
             "description": "Maintenance window",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceWindow"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "patch": {
@@ -677,7 +936,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/MaintenanceWindowInput" }
+              "schema": {
+                "$ref": "#/components/schemas/MaintenanceWindowInput"
+              }
             }
           }
         },
@@ -686,19 +947,29 @@
             "description": "Updated",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/MaintenanceWindow" }
+                "schema": {
+                  "$ref": "#/components/schemas/MaintenanceWindow"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "delete": {
         "summary": "Delete a maintenance window",
         "responses": {
-          "204": { "description": "Deleted" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -710,7 +981,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/InhibitionInput" }
+              "schema": {
+                "$ref": "#/components/schemas/InhibitionInput"
+              }
             }
           }
         },
@@ -719,12 +992,18 @@
             "description": "Created",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Inhibition" }
+                "schema": {
+                  "$ref": "#/components/schemas/Inhibition"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "get": {
@@ -739,7 +1018,9 @@
                   "properties": {
                     "inhibitions": {
                       "type": "array",
-                      "items": { "$ref": "#/components/schemas/Inhibition" }
+                      "items": {
+                        "$ref": "#/components/schemas/Inhibition"
+                      }
                     }
                   }
                 }
@@ -757,19 +1038,31 @@
             "name": "sourceID",
             "in": "path",
             "required": true,
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
           {
             "name": "targetID",
             "in": "path",
             "required": true,
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
-          "204": { "description": "Deleted" },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -780,52 +1073,83 @@
           {
             "name": "monitor_id",
             "in": "query",
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
           {
             "name": "rule_id",
             "in": "query",
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
           {
             "name": "contract_id",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Exact match on payload.contract_id"
           },
           {
             "name": "q",
             "in": "query",
-            "schema": { "type": "string", "maxLength": 256 },
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            },
             "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
           },
           {
             "name": "sort",
             "in": "query",
-            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "schema": {
+              "type": "string",
+              "enum": [
+                "created_at_desc",
+                "created_at_asc"
+              ],
+              "default": "created_at_desc"
+            },
             "description": "Keyset order; anything else is 400"
           },
           {
             "name": "from",
             "in": "query",
-            "schema": { "type": "string", "format": "date-time" },
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
             "description": "RFC 3339 lower bound on alert creation, inclusive"
           },
           {
             "name": "to",
             "in": "query",
-            "schema": { "type": "string", "format": "date-time" },
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
             "description": "RFC 3339 upper bound on alert creation, exclusive"
           },
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
           },
           {
             "name": "cursor",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Opaque continuation cursor from a previous page"
           }
         ],
@@ -834,7 +1158,9 @@
             "description": "Alerts",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/AlertPage" }
+                "schema": {
+                  "$ref": "#/components/schemas/AlertPage"
+                }
               }
             }
           }
@@ -849,7 +1175,10 @@
           {
             "name": "monitor_id",
             "in": "query",
-            "schema": { "type": "integer", "format": "int64" },
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            },
             "description": "Only stream alerts created by this monitor"
           }
         ],
@@ -858,11 +1187,15 @@
             "description": "Server-Sent Events stream; each `alert` event's data is one alert object",
             "content": {
               "text/event-stream": {
-                "schema": { "$ref": "#/components/schemas/Alert" }
+                "schema": {
+                  "$ref": "#/components/schemas/Alert"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -874,53 +1207,84 @@
           {
             "name": "monitor_id",
             "in": "query",
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
           {
             "name": "rule_id",
             "in": "query",
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
           {
             "name": "contract_id",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Exact match on payload.contract_id"
           },
           {
             "name": "q",
             "in": "query",
-            "schema": { "type": "string", "maxLength": 256 },
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            },
             "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
           },
           {
             "name": "from",
             "in": "query",
-            "schema": { "type": "string", "format": "date-time" },
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
             "description": "RFC 3339 lower bound on alert creation"
           },
           {
             "name": "to",
             "in": "query",
-            "schema": { "type": "string", "format": "date-time" },
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
             "description": "RFC 3339 upper bound on alert creation"
           },
           {
             "name": "sort",
             "in": "query",
-            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "schema": {
+              "type": "string",
+              "enum": [
+                "created_at_desc",
+                "created_at_asc"
+              ],
+              "default": "created_at_desc"
+            },
             "description": "Keyset order; anything else is 400"
           },
           {
             "name": "network",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Only alerts whose event came from this Stellar chain. Omitted means every chain."
           },
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "minimum": 1, "default": 10000, "maximum": 10000 },
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10000,
+              "maximum": 10000
+            },
             "description": "Maximum rows to export; the endpoint caps at 10000"
           }
         ],
@@ -929,11 +1293,15 @@
             "description": "Alerts as CSV",
             "content": {
               "text/csv": {
-                "schema": { "type": "string" }
+                "schema": {
+                  "type": "string"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -945,47 +1313,76 @@
           {
             "name": "monitor_id",
             "in": "query",
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
           {
             "name": "rule_id",
             "in": "query",
-            "schema": { "type": "integer", "format": "int64" }
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
           {
             "name": "contract_id",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Exact match on payload.contract_id"
           },
           {
             "name": "q",
             "in": "query",
-            "schema": { "type": "string", "maxLength": 256 },
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            },
             "description": "Case-insensitive substring of the source event id or of the payload text, which is where contract_id and event_name live. Wildcards in the term are literal. Blank or whitespace-only means no search; over 256 characters is 400"
           },
           {
             "name": "from",
             "in": "query",
-            "schema": { "type": "string", "format": "date-time" },
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
             "description": "RFC 3339 lower bound on alert creation"
           },
           {
             "name": "to",
             "in": "query",
-            "schema": { "type": "string", "format": "date-time" },
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
             "description": "RFC 3339 upper bound on alert creation"
           },
           {
             "name": "sort",
             "in": "query",
-            "schema": { "type": "string", "enum": ["created_at_desc", "created_at_asc"], "default": "created_at_desc" },
+            "schema": {
+              "type": "string",
+              "enum": [
+                "created_at_desc",
+                "created_at_asc"
+              ],
+              "default": "created_at_desc"
+            },
             "description": "Keyset order; anything else is 400"
           },
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "minimum": 1, "default": 10000, "maximum": 10000 },
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10000,
+              "maximum": 10000
+            },
             "description": "Maximum rows to export; the endpoint caps at 10000"
           }
         ],
@@ -994,17 +1391,23 @@
             "description": "Alerts as NDJSON stream",
             "content": {
               "application/x-ndjson": {
-                "schema": { "type": "string" }
+                "schema": {
+                  "type": "string"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/alerts/{id}/acknowledge": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Acknowledge an alert",
@@ -1014,17 +1417,23 @@
             "description": "The acknowledged alert",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Alert" }
+                "schema": {
+                  "$ref": "#/components/schemas/Alert"
+                }
               }
             }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/alerts/{id}/deliveries": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "get": {
         "summary": "List one alert's delivery attempts",
@@ -1033,7 +1442,13 @@
             "name": "status",
             "in": "query",
             "description": "Restrict to persisted statuses: success or failed. Omit for all. Unknown values are 400.",
-            "schema": { "type": "string", "enum": ["success", "failed"] }
+            "schema": {
+              "type": "string",
+              "enum": [
+                "success",
+                "failed"
+              ]
+            }
           }
         ],
         "responses": {
@@ -1043,20 +1458,30 @@
               "application/json": {
                 "schema": {
                   "type": "array",
-                  "items": { "$ref": "#/components/schemas/DeliveryAttempt" }
+                  "items": {
+                    "$ref": "#/components/schemas/DeliveryAttempt"
+                  }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/alerts/{id}/deliveries/{channelID}/retry": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" },
-        { "$ref": "#/components/parameters/ChannelID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        },
+        {
+          "$ref": "#/components/parameters/ChannelID"
+        }
       ],
       "post": {
         "summary": "Retry a failed delivery",
@@ -1066,14 +1491,24 @@
             "description": "New delivery attempt (success or failed)",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/DeliveryAttempt" }
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryAttempt"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" },
-          "409": { "$ref": "#/components/responses/Error" },
-          "429": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -1084,7 +1519,12 @@
           {
             "name": "limit",
             "in": "query",
-            "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
           }
         ],
         "responses": {
@@ -1095,7 +1535,12 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "dead_letters": { "type": "array", "items": { "type": "object" } }
+                    "dead_letters": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
                   }
                 }
               }
@@ -1106,31 +1551,50 @@
     },
     "/dead-letters/{id}/redrive": {
       "parameters": [
-        { "$ref": "#/components/parameters/ID" }
+        {
+          "$ref": "#/components/parameters/ID"
+        }
       ],
       "post": {
         "summary": "Re-drive a dead-letter delivery",
         "responses": {
-          "200": { "description": "Re-driven successfully" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "200": {
+            "description": "Re-driven successfully"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/ingest": {
       "post": {
         "summary": "Receive a federated alert from another SoroBeacon instance",
-        "description": "Stores an alert forwarded by another instance without re-evaluating rules. The alert is stamped with its origin and hop count for loop prevention. Requires authentication.",
+        "description": "Stores an alert forwarded by another instance without re-evaluating rules. The monitor and rule ids in the payload belong to the sending instance: they are kept as the alert's source ids, and the stored alert is attached to no local monitor and no local rule. It lands in the workspace of the credential that delivered it. The alert is stamped with its origin and hop count for loop prevention. Requires authentication.",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["alert", "origin"],
+                "required": [
+                  "alert",
+                  "origin"
+                ],
                 "properties": {
-                  "alert": { "$ref": "#/components/schemas/Alert" },
-                  "origin": { "type": "string", "description": "Instance identifier of the originating SoroBeacon" },
-                  "hop_count": { "type": "integer", "minimum": 0, "maximum": 8, "description": "Number of hops this alert has traversed" }
+                  "alert": {
+                    "$ref": "#/components/schemas/Alert"
+                  },
+                  "origin": {
+                    "type": "string",
+                    "description": "Instance identifier of the originating SoroBeacon"
+                  },
+                  "hop_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 8,
+                    "description": "Number of hops this alert has traversed"
+                  }
                 }
               }
             }
@@ -1144,28 +1608,115 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "outcome": { "type": "string", "enum": ["created", "duplicate", "suppressed"] },
-                    "alert_id": { "type": "integer", "format": "int64" },
-                    "origin": { "type": "string" }
+                    "outcome": {
+                      "type": "string",
+                      "enum": [
+                        "created",
+                        "duplicate",
+                        "suppressed"
+                      ]
+                    },
+                    "alert_id": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "origin": {
+                      "type": "string"
+                    }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "401": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/triggers": {
+      "post": {
+        "summary": "Trigger alert evaluation from an external event",
+        "description": "Accepts an external event and asks the instance to evaluate it into an alert. Requires authentication.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "monitor_id"
+                ],
+                "properties": {
+                  "monitor_id": {
+                    "type": "integer",
+                    "format": "int64",
+                    "description": "Monitor the event applies to"
+                  },
+                  "event": {
+                    "type": "string",
+                    "format": "byte",
+                    "description": "Event payload, base64-encoded by JSON"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "Where the event came from"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Trigger accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "alert_id": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "note": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/health": {
       "get": {
         "summary": "Combined health report",
-        "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. Reports `leader` (whether this instance holds the poller lease), `leader_election` (whether a lease exists to hold at all; false for a single-node/ SQLite deployment) and `leader_since`. A follower is healthy: it serves the API and dashboard and returns 200.",
         "description": "Legacy combined check; prefer /livez and /readyz. Exempt from authentication so probes and the docker-compose healthcheck keep working. On an instance that polls several Stellar networks the body adds a `networks` array — per chain: source state, last processed ledger, chain tip, lag and last successful poll — and answers 503 `degraded` when any chain's source is failing. The top-level `rpc` field is only ever the primary chain's source, which is why the array exists.",
         "security": [],
         "responses": {
-          "200": { "description": "Healthy" },
-          "503": { "description": "Degraded" }
+          "200": {
+            "description": "Healthy"
+          },
+          "503": {
+            "description": "Degraded"
+          }
         }
       }
     },
@@ -1175,7 +1726,9 @@
         "description": "Answers 200 whenever the process can respond; checks no dependencies. Wire to livenessProbe. Exempt from authentication.",
         "security": [],
         "responses": {
-          "200": { "description": "Alive" }
+          "200": {
+            "description": "Alive"
+          }
         }
       }
     },
@@ -1185,8 +1738,12 @@
         "description": "Checks the database and the event source concurrently, bounded by a 3s timeout each, reporting per-dependency detail. On an instance that polls several Stellar networks each chain gets its own check (`rpc_testnet`, `rpc_mainnet`, ...) alongside the primary chain's `rpc`, so a node that is down on one chain cannot read as ready. Wire to readinessProbe. Exempt from authentication, so its per-dependency detail is readable without a token — do not expose it to the public internet.",
         "security": [],
         "responses": {
-          "200": { "description": "Ready" },
-          "503": { "description": "At least one dependency unhealthy" }
+          "200": {
+            "description": "Ready"
+          },
+          "503": {
+            "description": "At least one dependency unhealthy"
+          }
         }
       }
     },
@@ -1199,11 +1756,15 @@
             "description": "Poller status",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/PollerStatus" }
+                "schema": {
+                  "$ref": "#/components/schemas/PollerStatus"
+                }
               }
             }
           },
-          "503": { "description": "Poller is not configured" }
+          "503": {
+            "description": "Poller is not configured"
+          }
         }
       }
     },
@@ -1215,7 +1776,9 @@
             "description": "Version, commit and build date baked in via ldflags",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Version" }
+                "schema": {
+                  "$ref": "#/components/schemas/Version"
+                }
               }
             }
           }
@@ -1230,7 +1793,9 @@
             "description": "Registered rule types",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/RuleTypesResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/RuleTypesResponse"
+                }
               }
             }
           }
@@ -1245,7 +1810,9 @@
             "description": "Counts of monitors, rules, alerts and deliveries",
             "content": {
               "application/json": {
-                "schema": { "type": "object" }
+                "schema": {
+                  "type": "object"
+                }
               }
             }
           }
@@ -1263,17 +1830,33 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "required": ["timezone", "days"],
+                  "required": [
+                    "timezone",
+                    "days"
+                  ],
                   "properties": {
-                    "timezone": { "type": "string", "example": "UTC" },
+                    "timezone": {
+                      "type": "string",
+                      "example": "UTC"
+                    },
                     "days": {
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "required": ["day", "count"],
+                        "required": [
+                          "day",
+                          "count"
+                        ],
                         "properties": {
-                          "day": { "type": "string", "format": "date", "description": "UTC calendar day (YYYY-MM-DD)" },
-                          "count": { "type": "integer", "format": "int64" }
+                          "day": {
+                            "type": "string",
+                            "format": "date",
+                            "description": "UTC calendar day (YYYY-MM-DD)"
+                          },
+                          "count": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
                         }
                       }
                     }
@@ -1290,11 +1873,51 @@
         "summary": "Audit log of configuration changes",
         "description": "Append-only entries for monitor, rule and channel create, update and delete. diff records field names only, never values.",
         "parameters": [
-          { "name": "target_type", "in": "query", "schema": { "type": "string", "enum": ["monitor", "rule", "channel"] } },
-          { "name": "target_id", "in": "query", "schema": { "type": "integer", "format": "int64" } },
-          { "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" } },
-          { "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" } },
-          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500 } }
+          {
+            "name": "target_type",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "monitor",
+                "rule",
+                "channel"
+              ]
+            }
+          },
+          {
+            "name": "target_id",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
         ],
         "responses": {
           "200": {
@@ -1303,21 +1926,57 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "required": ["entries"],
+                  "required": [
+                    "entries"
+                  ],
                   "properties": {
                     "entries": {
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "required": ["id", "actor", "action", "target_type", "target_id", "created_at"],
+                        "required": [
+                          "id",
+                          "actor",
+                          "action",
+                          "target_type",
+                          "target_id",
+                          "created_at"
+                        ],
                         "properties": {
-                          "id": { "type": "integer", "format": "int64" },
-                          "actor": { "type": "string" },
-                          "action": { "type": "string", "enum": ["create", "update", "delete"] },
-                          "target_type": { "type": "string", "enum": ["monitor", "rule", "channel"] },
-                          "target_id": { "type": "integer", "format": "int64" },
-                          "diff": { "type": "object" },
-                          "created_at": { "type": "string", "format": "date-time" }
+                          "id": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "actor": {
+                            "type": "string"
+                          },
+                          "action": {
+                            "type": "string",
+                            "enum": [
+                              "create",
+                              "update",
+                              "delete"
+                            ]
+                          },
+                          "target_type": {
+                            "type": "string",
+                            "enum": [
+                              "monitor",
+                              "rule",
+                              "channel"
+                            ]
+                          },
+                          "target_id": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "diff": {
+                            "type": "object"
+                          },
+                          "created_at": {
+                            "type": "string",
+                            "format": "date-time"
+                          }
                         }
                       }
                     }
@@ -1326,7 +1985,9 @@
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -1337,16 +1998,26 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/MonitorTemplateInput" }
+              "schema": {
+                "$ref": "#/components/schemas/MonitorTemplateInput"
+              }
             }
           }
         },
         "responses": {
           "201": {
             "description": "Created",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorTemplate"
+                }
+              }
+            }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "get": {
@@ -1359,7 +2030,12 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "templates": { "type": "array", "items": { "$ref": "#/components/schemas/MonitorTemplate" } }
+                    "templates": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MonitorTemplate"
+                      }
+                    }
                   }
                 }
               }
@@ -1369,78 +2045,137 @@
       }
     },
     "/templates/{id}": {
-      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
       "get": {
         "summary": "Get a monitor template",
         "responses": {
           "200": {
             "description": "OK",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorTemplate"
+                }
+              }
+            }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "patch": {
         "summary": "Update a monitor template",
         "requestBody": {
           "required": true,
-          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplateInput" } } }
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MonitorTemplateInput"
+              }
+            }
+          }
         },
         "responses": {
           "200": {
             "description": "Updated",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MonitorTemplate" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorTemplate"
+                }
+              }
+            }
           },
-          "404": { "$ref": "#/components/responses/Error" }
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       },
       "delete": {
         "summary": "Delete a monitor template",
         "description": "Existing monitors created from this template are unaffected.",
         "responses": {
-          "204": { "description": "Deleted" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
     "/templates/{id}/instantiate": {
-      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
       "post": {
         "summary": "Create a monitor from a template",
+        "description": "The template's rules are checked after the request's parameters are substituted, and its channel ids are checked against the caller's channels, before anything is written. The monitor, its rules and its channel links are then created in one transaction, so a monitor that exists has every rule it was supposed to have.",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/InstantiateInput" }
+              "schema": {
+                "$ref": "#/components/schemas/InstantiateInput"
+              }
             }
           }
         },
         "responses": {
           "201": {
             "description": "Created",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Monitor" } } }
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Monitor"
+                }
+              }
+            }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
         }
       }
     },
     "/templates/{id}/instantiate/bulk": {
-      "parameters": [{ "$ref": "#/components/parameters/ID" }],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ID"
+        }
+      ],
       "post": {
         "summary": "Bulk create monitors from a template",
+        "description": "Every instance is validated before any of them is written, so a request with one bad instance creates nothing. Each instance is then written in its own transaction, so an instance is never half written. The request as a whole is not one transaction: if an instance fails, the ones before it stay and the response names the instance that failed.",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["instances"],
+                "required": [
+                  "instances"
+                ],
                 "properties": {
                   "instances": {
                     "type": "array",
                     "maxItems": 100,
-                    "items": { "$ref": "#/components/schemas/InstantiateInput" }
+                    "items": {
+                      "$ref": "#/components/schemas/InstantiateInput"
+                    }
                   }
                 }
               }
@@ -1460,8 +2195,13 @@
                       "items": {
                         "type": "object",
                         "properties": {
-                          "name": { "type": "string" },
-                          "id": { "type": "integer", "format": "int64" }
+                          "name": {
+                            "type": "string"
+                          },
+                          "id": {
+                            "type": "integer",
+                            "format": "int64"
+                          }
                         }
                       }
                     }
@@ -1470,8 +2210,15 @@
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          }
         }
       }
     },
@@ -1483,10 +2230,15 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/ImportInput" }
+              "schema": {
+                "$ref": "#/components/schemas/ImportInput"
+              }
             },
             "text/csv": {
-              "schema": { "type": "string", "description": "One contract ID per line" }
+              "schema": {
+                "type": "string",
+                "description": "One contract ID per line"
+              }
             }
           }
         },
@@ -1494,7 +2246,9 @@
           {
             "name": "name",
             "in": "query",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "description": "Monitor name prefix (CSV mode only, defaults to 'imported')"
           }
         ],
@@ -1506,17 +2260,23 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "total": { "type": "integer" },
+                    "total": {
+                      "type": "integer"
+                    },
                     "results": {
                       "type": "array",
-                      "items": { "$ref": "#/components/schemas/ImportRowResult" }
+                      "items": {
+                        "$ref": "#/components/schemas/ImportRowResult"
+                      }
                     }
                   }
                 }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     },
@@ -1528,7 +2288,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/TokenInput" }
+              "schema": {
+                "$ref": "#/components/schemas/TokenInput"
+              }
             }
           }
         },
@@ -1537,13 +2299,21 @@
             "description": "Minted. The only response in the API that contains a token secret.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/CreatedAPIToken" }
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedAPIToken"
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/Error" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
         }
       },
       "get": {
@@ -1559,15 +2329,21 @@
                   "properties": {
                     "tokens": {
                       "type": "array",
-                      "items": { "$ref": "#/components/schemas/APIToken" }
+                      "items": {
+                        "$ref": "#/components/schemas/APIToken"
+                      }
                     }
                   }
                 }
               }
             }
           },
-          "403": { "$ref": "#/components/responses/Error" },
-          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
         }
       }
     },
@@ -1575,12 +2351,107 @@
       "post": {
         "summary": "Revoke an API token",
         "description": "Stops a token immediately: the next request with it authenticates as no credential at all. The row survives with its `revoked_at` set, so the audit trail (name, prefix, scopes, last use) outlives the credential. Revoking twice is idempotent and keeps the first `revoked_at`. A token can only be revoked by the workspace that owns it; another workspace's id and a nonexistent id get the same 404.",
-        "parameters": [{ "$ref": "#/components/parameters/ID" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ID"
+          }
+        ],
         "responses": {
-          "204": { "description": "Revoked" },
-          "403": { "$ref": "#/components/responses/Error" },
-          "404": { "$ref": "#/components/responses/Error" },
-          "503": { "$ref": "#/components/responses/TokenManagementDisabled" }
+          "204": {
+            "description": "Revoked"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/TokenManagementDisabled"
+          }
+        }
+      }
+    },
+    "/monitors/trash": {
+      "get": {
+        "summary": "List deleted monitors (trash)",
+        "description": "Required role: viewer",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Query"
+          },
+          {
+            "$ref": "#/components/parameters/Enabled"
+          },
+          {
+            "$ref": "#/components/parameters/Sort"
+          },
+          {
+            "$ref": "#/components/parameters/Network"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted monitors",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MonitorPage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/monitors/{id}/soft-delete": {
+      "post": {
+        "summary": "Soft-delete a monitor",
+        "description": "Required role: editor. Moves the monitor to trash; it can be restored within 30 days.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ID"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Soft-deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/monitors/{id}/restore": {
+      "post": {
+        "summary": "Restore a soft-deleted monitor",
+        "description": "Required role: editor. Restores a monitor from trash.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ID"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restored monitor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Monitor"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
         }
       }
     }
@@ -1598,19 +2469,28 @@
         "name": "id",
         "in": "path",
         "required": true,
-        "schema": { "type": "integer", "format": "int64" }
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        }
       },
       "RuleID": {
         "name": "ruleID",
         "in": "path",
         "required": true,
-        "schema": { "type": "integer", "format": "int64" }
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        }
       },
       "ChannelID": {
         "name": "channelID",
         "in": "path",
         "required": true,
-        "schema": { "type": "integer", "format": "int64" }
+        "schema": {
+          "type": "integer",
+          "format": "int64"
+        }
       }
     },
     "responses": {
@@ -1618,7 +2498,9 @@
         "description": "Token management is not configured on this instance: it needs a database-backed store, so an unset deployment answers this way rather than pretending to mint.",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" }
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
           }
         }
       },
@@ -1626,7 +2508,19 @@
         "description": "Error envelope",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" }
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "The request was understood but cannot be turned into a valid result. The details array lists every problem, keyed by the field, the rule index or the parameter it belongs to, so a caller can see all of them at once.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
           }
         }
       }
@@ -1634,40 +2528,80 @@
     "schemas": {
       "RuleTypesResponse": {
         "type": "object",
-        "required": ["rule_types"],
+        "required": [
+          "rule_types"
+        ],
         "properties": {
           "rule_types": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/RuleType" }
+            "items": {
+              "$ref": "#/components/schemas/RuleType"
+            }
           }
         }
       },
       "RuleType": {
         "type": "object",
-        "required": ["type", "parameters"],
+        "required": [
+          "type",
+          "parameters"
+        ],
         "properties": {
-          "type": { "type": "string" },
+          "type": {
+            "type": "string"
+          },
           "parameters": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/RuleParameter" }
+            "items": {
+              "$ref": "#/components/schemas/RuleParameter"
+            }
           }
         }
       },
       "RuleParameter": {
         "type": "object",
-        "required": ["name", "type", "required", "default", "description"],
+        "required": [
+          "name",
+          "type",
+          "required",
+          "default",
+          "description"
+        ],
         "properties": {
-          "name": { "type": "string" },
-          "type": { "type": "string", "enum": ["string", "number", "object", "select"] },
-          "required": { "type": "boolean" },
-          "default": { "type": "string" },
-          "description": { "type": "string" },
-          "options": { "type": "array", "items": { "type": "string" } }
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "string",
+              "number",
+              "object",
+              "select"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "default": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       },
       "Error": {
         "type": "object",
-        "required": ["error"],
+        "required": [
+          "error"
+        ],
         "properties": {
           "error": {
             "type": "string",
@@ -1684,13 +2618,18 @@
           "details": {
             "type": "array",
             "description": "Field-level validation problems. Omitted when there are none so existing clients keep working. Each entry names a JSON path and why it failed; all problems in one request are listed together.",
-            "items": { "$ref": "#/components/schemas/ErrorDetail" }
+            "items": {
+              "$ref": "#/components/schemas/ErrorDetail"
+            }
           }
         }
       },
       "ErrorDetail": {
         "type": "object",
-        "required": ["field", "reason"],
+        "required": [
+          "field",
+          "reason"
+        ],
         "properties": {
           "field": {
             "type": "string",
@@ -1705,37 +2644,115 @@
       "Monitor": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "name": { "type": "string" },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
           "contract_ids": {
             "type": "array",
-            "items": { "type": "string" },
+            "items": {
+              "type": "string"
+            },
             "description": "Soroban contract strkeys (C...)"
           },
-          "enabled": { "type": "boolean" },
+          "enabled": {
+            "type": "boolean"
+          },
           "network": {
             "type": "string",
             "description": "Stellar chain this monitor watches. Empty on rows created before multi-network ingestion, which startup labels with the primary network."
           },
           "channel_ids": {
             "type": "array",
-            "items": { "type": "integer", "format": "int64" }
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        }
+      },
+      "ChannelDeliveryStats": {
+        "type": "object",
+        "description": "One channel's delivery outcomes over the requested window. Attempts are counted, not unique alerts: a retry is another attempt.",
+        "properties": {
+          "channel_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "window": {
+            "type": "string",
+            "description": "The window this response covers, as requested (\"24h\" when the parameter was omitted)"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Every delivery attempt inside the window, successful or not"
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "success_rate": {
+            "type": "number",
+            "format": "double",
+            "description": "succeeded / total as a ratio in [0, 1]. Omitted when there were no attempts in the window — an undefined rate is not 0 or 1."
+          },
+          "last_success_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Null when the window holds no successful attempt"
+          },
+          "last_failure_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Null when the window holds no failed attempt"
           }
         }
       },
       "MonitorStats": {
         "type": "object",
         "properties": {
-          "monitor_id": { "type": "integer", "format": "int64" },
-          "alerts": { "type": "integer", "format": "int64" },
-          "alerts_last_24h": { "type": "integer", "format": "int64" },
-          "alerts_last_7d": { "type": "integer", "format": "int64" },
-          "last_alert_at": { "type": "string", "format": "date-time", "description": "Absent when the monitor has never alerted" },
-          "deliveries_succeeded": { "type": "integer", "format": "int64" },
-          "deliveries_failed": { "type": "integer", "format": "int64" },
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "alerts": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "alerts_last_24h": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "alerts_last_7d": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_alert_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Absent when the monitor has never alerted"
+          },
+          "deliveries_succeeded": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "deliveries_failed": {
+            "type": "integer",
+            "format": "int64"
+          },
           "rules": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/RuleMatchCount" },
+            "items": {
+              "$ref": "#/components/schemas/RuleMatchCount"
+            },
             "description": "Every rule of the monitor, matched or not"
           }
         }
@@ -1743,88 +2760,166 @@
       "RuleMatchCount": {
         "type": "object",
         "properties": {
-          "rule_id": { "type": "integer", "format": "int64" },
-          "type": { "type": "string" },
-          "alerts": { "type": "integer", "format": "int64" }
+          "rule_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "type": {
+            "type": "string"
+          },
+          "alerts": {
+            "type": "integer",
+            "format": "int64"
+          }
         }
       },
       "MonitorInput": {
         "type": "object",
-        "required": ["name", "contract_ids"],
+        "required": [
+          "name",
+          "contract_ids"
+        ],
         "properties": {
-          "name": { "type": "string", "minLength": 1 },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
           "contract_ids": {
             "type": "array",
             "minItems": 1,
-            "items": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" }
+            "items": {
+              "type": "string",
+              "pattern": "^C[A-Z2-7]{55}$"
+            }
           },
-          "enabled": { "type": "boolean", "default": true },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
           "network": {
             "type": "string",
             "description": "Stellar chain these contract ids live on, chosen at creation. Omitted means the instance's primary network (the first entry in NETWORKS, or NETWORK when unset). A name this instance does not poll is rejected: the monitor would match nothing forever. A monitor's network cannot be changed afterwards — a contract id resolves to a different contract on another chain, and the alerts already stored keep their old label — so moving one means deleting and recreating it."
           },
           "channel_ids": {
             "type": "array",
-            "items": { "type": "integer", "format": "int64" }
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         }
       },
       "BulkMonitorInput": {
         "type": "object",
-        "required": ["ids", "enabled"],
+        "required": [
+          "ids",
+          "enabled"
+        ],
         "properties": {
           "ids": {
             "type": "array",
             "minItems": 1,
             "maxItems": 100,
-            "items": { "type": "integer", "format": "int64" }
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
-          "enabled": { "type": "boolean" }
+          "enabled": {
+            "type": "boolean"
+          }
         }
       },
       "BulkMonitorResult": {
         "type": "object",
-        "required": ["updated", "unknown_ids", "enabled"],
+        "required": [
+          "updated",
+          "unknown_ids",
+          "enabled"
+        ],
         "properties": {
-          "updated": { "type": "integer", "description": "How many existing monitors changed state" },
+          "updated": {
+            "type": "integer",
+            "description": "How many existing monitors changed state"
+          },
           "unknown_ids": {
             "type": "array",
-            "items": { "type": "integer", "format": "int64" }
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           },
-          "enabled": { "type": "boolean" }
+          "enabled": {
+            "type": "boolean"
+          }
         }
       },
       "Rule": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "monitor_id": { "type": "integer", "format": "int64" },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window", "absence_of_event"]
+            "enum": [
+              "event_emitted",
+              "value_threshold",
+              "token_event",
+              "self_transfer",
+              "time_window",
+              "absence_of_event"
+            ]
           },
-          "params": { "type": "object" },
-          "enabled": { "type": "boolean" }
+          "params": {
+            "type": "object"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
         }
       },
       "Inhibition": {
         "type": "object",
         "properties": {
-          "source_rule_id": { "type": "integer", "format": "int64" },
-          "target_rule_id": { "type": "integer", "format": "int64" },
+          "source_rule_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "target_rule_id": {
+            "type": "integer",
+            "format": "int64"
+          },
           "firing_window_seconds": {
             "type": "integer",
             "description": "Source counts as firing with an alert inside this window"
           },
-          "created_at": { "type": "string", "format": "date-time" }
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "InhibitionInput": {
         "type": "object",
-        "required": ["source_rule_id", "target_rule_id"],
+        "required": [
+          "source_rule_id",
+          "target_rule_id"
+        ],
         "properties": {
-          "source_rule_id": { "type": "integer", "format": "int64" },
-          "target_rule_id": { "type": "integer", "format": "int64" },
+          "source_rule_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "target_rule_id": {
+            "type": "integer",
+            "format": "int64"
+          },
           "firing_window_seconds": {
             "type": "integer",
             "minimum": 1,
@@ -1834,30 +2929,59 @@
       },
       "RuleInput": {
         "type": "object",
-        "required": ["type", "params"],
+        "required": [
+          "type",
+          "params"
+        ],
         "properties": {
           "type": {
             "type": "string",
-            "enum": ["event_emitted", "value_threshold", "token_event", "self_transfer", "time_window", "absence_of_event"]
+            "enum": [
+              "event_emitted",
+              "value_threshold",
+              "token_event",
+              "self_transfer",
+              "time_window",
+              "absence_of_event"
+            ]
           },
           "params": {
             "type": "object",
             "description": "Type-specific; validated against the rule type"
           },
-          "enabled": { "type": "boolean", "default": true }
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          }
         }
       },
       "Channel": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "name": { "type": "string" },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
+            "enum": [
+              "discord",
+              "slack",
+              "telegram",
+              "email",
+              "webhook",
+              "ntfy"
+            ]
           },
-          "config": { "type": "object" },
-          "enabled": { "type": "boolean" },
+          "config": {
+            "type": "object"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
           "timeout": {
             "type": "integer",
             "description": "HTTP delivery timeout in seconds (default: 15, range 1-60)"
@@ -1895,21 +3019,41 @@
       },
       "ChannelInput": {
         "type": "object",
-        "required": ["name", "type", "config"],
+        "required": [
+          "name",
+          "type",
+          "config"
+        ],
         "properties": {
-          "name": { "type": "string", "minLength": 1 },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
           "type": {
             "type": "string",
-            "enum": ["discord", "slack", "telegram", "email", "webhook", "ntfy"]
+            "enum": [
+              "discord",
+              "slack",
+              "telegram",
+              "email",
+              "webhook",
+              "ntfy"
+            ]
           },
           "config": {
             "type": "object",
             "description": "Type-specific; the channel reference documents each"
           },
-          "enabled": { "type": "boolean", "default": true },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
           "digest_mode": {
             "type": "string",
-            "enum": ["", "window"],
+            "enum": [
+              "",
+              "window"
+            ],
             "default": "",
             "description": "Empty delivers immediately; window batches into one summary per digest_window_seconds"
           },
@@ -1930,7 +3074,9 @@
         "properties": {
           "monitors": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/Monitor" }
+            "items": {
+              "$ref": "#/components/schemas/Monitor"
+            }
           },
           "next_cursor": {
             "type": "string",
@@ -1943,7 +3089,9 @@
         "properties": {
           "channels": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/Channel" }
+            "items": {
+              "$ref": "#/components/schemas/Channel"
+            }
           },
           "next_cursor": {
             "type": "string",
@@ -1956,7 +3104,9 @@
         "properties": {
           "alerts": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/Alert" }
+            "items": {
+              "$ref": "#/components/schemas/Alert"
+            }
           },
           "next_cursor": {
             "type": "string",
@@ -1967,45 +3117,143 @@
       "Alert": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "monitor_id": { "type": "integer", "format": "int64" },
-          "monitor_name": { "type": "string" },
-          "rule_id": { "type": "integer", "format": "int64" },
-          "event_id": { "type": "string" },
-          "event_name": { "type": "string" },
-          "payload": { "type": "object" },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "monitor_name": {
+            "type": "string"
+          },
+          "rule_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "event_name": {
+            "type": "string"
+          },
+          "payload": {
+            "type": "object"
+          },
           "network": {
             "type": "string",
             "description": "Stellar chain the matching event came from. Taken from the monitor, never from the caller: it is what a reorg on that chain may retract and no other chain's."
           },
-          "created_at": { "type": "string", "format": "date-time" },
-          "suppressed": { "type": "boolean", "description": "True when a maintenance window silenced delivery" },
-          "suppression_reason": { "type": "string" }
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "suppressed": {
+            "type": "boolean",
+            "description": "True when a maintenance window silenced delivery"
+          },
+          "suppression_reason": {
+            "type": "string"
+          },
+          "federated": {
+            "type": "boolean",
+            "description": "True when another SoroBeacon instance forwarded this alert. A federated alert belongs to no local monitor and no local rule, so its monitor_id and rule_id are zero."
+          },
+          "federation_origin": {
+            "type": "string",
+            "description": "The instance that forwarded the alert. Empty for a local one."
+          },
+          "source_monitor_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The monitor id on the sending instance. Never a local key."
+          },
+          "source_rule_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The rule id on the sending instance. Never a local key."
+          }
         }
       },
       "MaintenanceWindow": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "reason": { "type": "string" },
-          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
-          "monitor_id": { "type": "integer", "format": "int64" },
-          "contract_id": { "type": "string" },
-          "start_at": { "type": "string", "format": "date-time" },
-          "end_at": { "type": "string", "format": "date-time" },
-          "created_at": { "type": "string", "format": "date-time" }
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "global",
+              "monitor",
+              "contract"
+            ]
+          },
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "contract_id": {
+            "type": "string"
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "MaintenanceWindowInput": {
         "type": "object",
-        "required": ["reason", "scope", "start_at", "end_at"],
+        "required": [
+          "reason",
+          "scope",
+          "start_at",
+          "end_at"
+        ],
         "properties": {
-          "reason": { "type": "string", "minLength": 1 },
-          "scope": { "type": "string", "enum": ["global", "monitor", "contract"] },
-          "monitor_id": { "type": "integer", "format": "int64", "description": "Required when scope is monitor" },
-          "contract_id": { "type": "string", "description": "Required when scope is contract" },
-          "start_at": { "type": "string", "format": "date-time" },
-          "end_at": { "type": "string", "format": "date-time", "description": "Must be after start_at; open-ended windows are rejected" }
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "global",
+              "monitor",
+              "contract"
+            ]
+          },
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Required when scope is monitor"
+          },
+          "contract_id": {
+            "type": "string",
+            "description": "Required when scope is contract"
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "end_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Must be after start_at; open-ended windows are rejected"
+          }
         }
       },
       "MaintenanceWindowPage": {
@@ -2013,50 +3261,91 @@
         "properties": {
           "maintenance_windows": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/MaintenanceWindow" }
+            "items": {
+              "$ref": "#/components/schemas/MaintenanceWindow"
+            }
           }
         }
       },
       "DeliveryAttempt": {
         "type": "object",
         "properties": {
-          "alert_id": { "type": "integer", "format": "int64" },
-          "channel_id": { "type": "integer", "format": "int64" },
+          "alert_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "channel_id": {
+            "type": "integer",
+            "format": "int64"
+          },
           "status": {
             "type": "string",
-            "enum": ["success", "failed"]
+            "enum": [
+              "success",
+              "failed"
+            ]
           },
-          "response_snippet": { "type": "string" },
-          "attempted_at": { "type": "string", "format": "date-time" }
+          "response_snippet": {
+            "type": "string"
+          },
+          "attempted_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "EscalationStep": {
         "type": "object",
         "properties": {
-          "position": { "type": "integer", "description": "0-based place in the policy" },
-          "delay": { "type": "string", "description": "Go duration before this step fires, e.g. 5m" },
+          "position": {
+            "type": "integer",
+            "description": "0-based place in the policy"
+          },
+          "delay": {
+            "type": "string",
+            "description": "Go duration before this step fires, e.g. 5m"
+          },
           "channel_ids": {
             "type": "array",
-            "items": { "type": "integer", "format": "int64" }
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         }
       },
       "EscalationPolicy": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "monitor_id": { "type": "integer", "format": "int64" },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
           "steps": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/EscalationStep" }
+            "items": {
+              "$ref": "#/components/schemas/EscalationStep"
+            }
           },
-          "created_at": { "type": "string", "format": "date-time" },
-          "updated_at": { "type": "string", "format": "date-time" }
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "EscalationInput": {
         "type": "object",
-        "required": ["steps"],
+        "required": [
+          "steps"
+        ],
         "properties": {
           "steps": {
             "type": "array",
@@ -2064,13 +3353,21 @@
             "description": "Ordered escalation steps. The first fires immediately; each later step waits its delay after the previous one fired.",
             "items": {
               "type": "object",
-              "required": ["channel_ids"],
+              "required": [
+                "channel_ids"
+              ],
               "properties": {
-                "delay": { "type": "string", "description": "Go duration, e.g. 5m. Omitted or empty fires immediately." },
+                "delay": {
+                  "type": "string",
+                  "description": "Go duration, e.g. 5m. Omitted or empty fires immediately."
+                },
                 "channel_ids": {
                   "type": "array",
                   "minItems": 1,
-                  "items": { "type": "integer", "format": "int64" }
+                  "items": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
                 }
               }
             }
@@ -2080,81 +3377,162 @@
       "Version": {
         "type": "object",
         "properties": {
-          "version": { "type": "string" },
-          "commit": { "type": "string" },
-          "build_date": { "type": "string" }
+          "version": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "build_date": {
+            "type": "string"
+          }
         }
       },
       "PollerStatus": {
         "type": "object",
-        "required": ["status", "backing_off"],
+        "required": [
+          "status",
+          "backing_off"
+        ],
         "properties": {
-          "status": { "type": "string", "enum": ["waiting", "ok"] },
-          "last_processed_ledger": { "type": "integer", "format": "int64" },
-          "latest_chain_ledger": { "type": "integer", "format": "int64" },
-          "ledger_lag": { "type": "integer", "format": "int64" },
-          "last_successful_poll": { "type": "string", "format": "date-time" },
-          "backing_off": { "type": "boolean" }
+          "status": {
+            "type": "string",
+            "enum": [
+              "waiting",
+              "ok"
+            ]
+          },
+          "last_processed_ledger": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "latest_chain_ledger": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ledger_lag": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_successful_poll": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "backing_off": {
+            "type": "boolean"
+          }
         }
       },
       "MonitorTemplate": {
         "type": "object",
         "properties": {
-          "id": { "type": "integer", "format": "int64" },
-          "name": { "type": "string" },
-          "description": { "type": "string" },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
           "rules": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "type": { "type": "string" },
-                "params": { "type": "object" }
+                "type": {
+                  "type": "string"
+                },
+                "params": {
+                  "type": "object"
+                }
               }
             }
           },
-          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "channel_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
           "parameters": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "name": { "type": "string" },
-                "description": { "type": "string" },
-                "required": { "type": "boolean" },
-                "default": { "type": "string" }
+                "name": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "required": {
+                  "type": "boolean"
+                },
+                "default": {
+                  "type": "string"
+                }
               }
             }
           },
-          "created_at": { "type": "string", "format": "date-time" }
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "MonitorTemplateInput": {
         "type": "object",
-        "required": ["name"],
+        "required": [
+          "name"
+        ],
         "properties": {
-          "name": { "type": "string" },
-          "description": { "type": "string" },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
           "rules": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "type": { "type": "string" },
-                "params": { "type": "object" }
+                "type": {
+                  "type": "string"
+                },
+                "params": {
+                  "type": "object"
+                }
               }
             }
           },
-          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
+          "channel_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
           "parameters": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "name": { "type": "string" },
-                "description": { "type": "string" },
-                "required": { "type": "boolean" },
-                "default": { "type": "string" }
+                "name": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "required": {
+                  "type": "boolean"
+                },
+                "default": {
+                  "type": "string"
+                }
               }
             }
           }
@@ -2162,13 +3540,25 @@
       },
       "InstantiateInput": {
         "type": "object",
-        "required": ["name", "contract_ids"],
+        "required": [
+          "name",
+          "contract_ids"
+        ],
         "properties": {
-          "name": { "type": "string" },
-          "contract_ids": { "type": "array", "items": { "type": "string" } },
+          "name": {
+            "type": "string"
+          },
+          "contract_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "parameters": {
             "type": "object",
-            "additionalProperties": { "type": "string" }
+            "additionalProperties": {
+              "type": "string"
+            }
           },
           "network": {
             "type": "string",
@@ -2178,12 +3568,33 @@
       },
       "ImportInput": {
         "type": "object",
-        "required": ["name", "contract_ids"],
+        "required": [
+          "name",
+          "contract_ids"
+        ],
         "properties": {
-          "name": { "type": "string", "description": "Monitor name prefix" },
-          "contract_ids": { "type": "array", "items": { "type": "string" }, "maxItems": 500 },
-          "channel_ids": { "type": "array", "items": { "type": "integer", "format": "int64" } },
-          "enabled": { "type": "boolean", "default": true },
+          "name": {
+            "type": "string",
+            "description": "Monitor name prefix"
+          },
+          "contract_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500
+          },
+          "channel_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
           "network": {
             "type": "string",
             "description": "Chain every monitor in this batch watches. Omitted means the primary. The already-monitored check is per network: the same id on another chain is a different contract, and watching it there is normal."
@@ -2193,16 +3604,37 @@
       "ImportRowResult": {
         "type": "object",
         "properties": {
-          "row": { "type": "integer" },
-          "contract_id": { "type": "string" },
-          "monitor_id": { "type": "integer", "format": "int64" },
-          "status": { "type": "string", "enum": ["created", "skipped", "error"] },
-          "error": { "type": "string" }
+          "row": {
+            "type": "integer"
+          },
+          "contract_id": {
+            "type": "string"
+          },
+          "monitor_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "created",
+              "skipped",
+              "error"
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
         }
       },
       "DryRunResult": {
         "type": "object",
-        "required": ["count", "matches", "total_evaluated", "note"],
+        "required": [
+          "count",
+          "matches",
+          "total_evaluated",
+          "note"
+        ],
         "properties": {
           "count": {
             "type": "integer",
@@ -2214,10 +3646,19 @@
             "items": {
               "type": "object",
               "properties": {
-                "event_id": { "type": "string" },
-                "contract_id": { "type": "string" },
-                "event_name": { "type": "string" },
-                "ledger": { "type": "integer", "format": "uint32" }
+                "event_id": {
+                  "type": "string"
+                },
+                "contract_id": {
+                  "type": "string"
+                },
+                "event_name": {
+                  "type": "string"
+                },
+                "ledger": {
+                  "type": "integer",
+                  "format": "uint32"
+                }
               }
             }
           },

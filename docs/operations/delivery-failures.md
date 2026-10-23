@@ -194,12 +194,223 @@ The retry endpoint creates a **new delivery attempt** for the same alert/channel
 
 ---
 
+## Dead-Letter Queue and Redrive
+
+When a channel's automatic retries are exhausted, SoroBeacon does not throw the
+alert away. It writes a **dead letter**: a durable row that records what could
+not be delivered, so an operator can fix the destination and send it again
+without reconstructing the alert by hand.
+
+### When a delivery is dead-lettered
+
+Every direct delivery is tried up to **`MaxAttempts`** times (default **3**),
+with exponential backoff between attempts (`BaseBackoff`, default 1s, doubling:
+1s, then 2s). If the last attempt still fails, the dispatcher writes one dead
+letter for that alert/channel pair and stops.
+
+The dead letter is written **after the final attempt**, so a row means the
+automatic budget is gone; there is no background process that retries it later.
+
+These outcomes do **not** produce a dead letter:
+
+* **Invalid channel config.** If the notifier cannot be constructed, the
+  dispatcher records one failed attempt and returns immediately. A broken
+  config cannot be fixed by retrying, and the channel is counted as a
+  permanent failure instead. Edit the channel and use the channel test
+  endpoint before relying on it again.
+* **Circuit breaker open.** The delivery is skipped before an attempt is made
+  (the channel is already known to be failing), so there is no failed attempt
+  to dead-letter.
+* **Shutdown or breaker trip between attempts.** The loop returns without
+  writing a dead letter; the delivery is incomplete rather than permanently
+  failed.
+* **Permanent HTTP errors still retry.** A 401/403/404 does not shorten the
+  `MaxAttempts` loop. It marks the channel's health as a permanent failure
+  (which can trigger `CHANNEL_DISABLE_AFTER_FAILURES`), but the remaining
+  attempts still run before the dead letter is written.
+
+### What is stored
+
+A dead letter carries `alert_id`, `channel_id`, `last_error`, `attempt_count`,
+`last_status` and `created_at`:
+
+* `last_error` is sanitized - webhook URLs and tokens are redacted - so it is
+  safe to read in the dashboard and logs.
+* `last_status` is the HTTP status of the final attempt, or `0` for a
+  transport error (DNS failure, connection refused, timeout).
+* `attempt_count` is the attempt that exhausted the budget, normally 3.
+
+The rows are held in the `dead_letters` table in either store backend. They
+are **kept until one of these happens**:
+
+* a redrive succeeds and deletes the row;
+* the parent alert is removed (alert retention or monitor deletion), which
+  cascades;
+* the channel is deleted, which also cascades.
+
+There is no separate dead-letter TTL: a row that is never redriven and whose
+alert is never expired stays in the queue.
+
+### Finding the queue
+
+**Dashboard:** the **Dead letters** page (`/dead-letters`) lists the queue in
+oldest-first order and gives every row a **Redrive** button. It accepts
+`channel_id` and `alert_id` query parameters and shows up to 100 rows.
+
+**API:**
+
+```
+GET /api/v1/dead-letters?channel_id={id}&alert_id={id}&limit=50&after_id={id}
+```
+
+The response is an array of dead-letter objects:
+
+```json
+[
+  {
+    "id": 17,
+    "alert_id": 412,
+    "channel_id": 3,
+    "last_error": "status 404: Not Found",
+    "attempt_count": 3,
+    "last_status": 404,
+    "created_at": "2026-10-20T07:15:02Z"
+  }
+]
+```
+
+`limit` defaults to 50; `after_id` is the keyset cursor (rows are ordered by
+`id`). Reading the queue needs the `alerts:read` scope, and redriving needs
+`alerts:write`.
+
+### Redrive
+
+```
+POST /api/v1/dead-letters/{id}/redrive
+```
+
+A redrive sends the **stored alert** to the **stored channel** once. It does
+not re-evaluate rules, does not create a new alert, and does not use the
+automatic retry loop - it is one delivery attempt. On success the endpoint
+returns `204`, records a successful delivery attempt, and deletes the dead
+letter. On failure it returns `502`, records the failed attempt, and leaves
+the dead letter in place so it can be tried again.
+
+The dashboard performs the same operation and redirects back to
+`/dead-letters` on success. The dashboard path also decrements the
+dead-letter gauge; the API path does not update it today (see the known
+differences below).
+
+Before redriving, fix the destination. A redrive against the same broken
+destination just fails again and keeps the row.
+
+### Worked recovery: a webhook URL was wrong for an hour
+
+A channel's webhook URL pointed at a typo'd host for an hour. The poller kept
+firing alerts, every delivery attempt failed, and the queue filled up. Here is
+the recovery, in order:
+
+1. **Confirm the failure mode.** Read the channel's health and recent
+   attempts; the last error on a DNS failure is a transport error with
+   `last_status: 0`, while a wrong path is a 404:
+
+   ```
+   GET /api/v1/channels/{id}
+   GET /api/v1/alerts/{alert_id}/deliveries
+   ```
+
+2. **Fix the channel.** `GET /channels` never returns `config`, so send the
+   corrected URL with `PATCH`:
+
+   ```sh
+   curl -s -X PATCH localhost:8080/api/v1/channels/3 \
+     -H "Authorization: Bearer $API_TOKEN" \
+     -d '{"config":{"url":"https://hooks.example.com/correct-path"},"enabled":true}'
+   ```
+
+   Setting `enabled: true` is also what clears an auto-disable (when
+   `CHANNEL_DISABLE_AFTER_FAILURES` is set) and resets its failure counters.
+
+3. **Prove the channel works** before touching the backlog:
+
+   ```sh
+   curl -s -X POST localhost:8080/api/v1/channels/3/test \
+     -H "Authorization: Bearer $API_TOKEN"
+   # {"status":"sent"}
+   ```
+
+4. **Redrive the backlog, oldest first.** The queue is in id order, so page
+   it and call each row:
+
+   ```sh
+   curl -s 'localhost:8080/api/v1/dead-letters?channel_id=3&limit=100' \
+     -H "Authorization: Bearer $API_TOKEN"
+   curl -s -X POST localhost:8080/api/v1/dead-letters/17/redrive \
+     -H "Authorization: Bearer $API_TOKEN"
+   ```
+
+   A `204` deletes that row; a `502` leaves it queued. Fix anything the
+   failures reveal before retrying the rest, rather than replaying an hour of
+   alerts into a destination that is still unhealthy.
+
+5. **Verify.** The queue empties, and `GET /api/v1/alerts/{alert_id}/deliveries`
+   shows a new `success` attempt per redriven alert. When you redrive from
+   the dashboard, `sorobeacon_dead_letters_total` falls as rows are cleared;
+   the API redrive path does not update the gauge, and the gauge is
+   process-local, so use the queue endpoint as the source of truth (see the
+   [metrics reference](../reference/metrics.md#the-metrics)).
+
+### Manual retry versus redrive
+
+They look similar but operate on different objects:
+
+| | Manual retry | Redrive |
+| --- | --- | --- |
+| Endpoint | `POST /alerts/{alert_id}/deliveries/{channel_id}/retry` | `POST /dead-letters/{id}/redrive` |
+| Identifies | An alert/channel pair | One dead-letter row |
+| Requires a delivery attempt first | Yes; no prior attempt is `404` | A dead letter exists; unknown id is `404` |
+| Removes a dead letter on success | No | Yes |
+| Uses the retry cooldown | Yes (`429` while cooling down) | No |
+| Re-runs the automatic retry loop | No, one attempt | No, one attempt |
+| Re-evaluates rules or creates an alert | No | No |
+
+Use **retry** when you want to re-send an alert that may not have a dead
+letter (for example after a one-off timeout), and **redrive** when you are
+working through the queue of permanently failed deliveries.
+
+### Known difference between the API and dashboard redrive paths
+
+The two entry points do not yet behave identically. This is documented as it
+works today rather than glossed over:
+
+* **Disabled channel.** Both paths refuse to redrive a disabled channel, so
+  re-enable it first. The dashboard reports `502`; the API reports `400`.
+* **Already succeeded.** Both paths delete the dead letter first. The
+  dashboard then returns `502`, because the dispatcher treats "already
+  succeeded" as an error it surfaces after cleanup; the API returns `409`, and
+  a repeat request is `404` because the row is gone. Neither path sends the
+  alert again.
+* **Unbuildable channel config.** The API reports `500`; the dashboard reports
+  `502`.
+* **Missing channel.** The API returns `404`; the dashboard returns `502`.
+  A missing alert or dead letter is `404` on both paths.
+* **Dead-letter gauge.** The dashboard path decrements
+  `sorobeacon_dead_letters_total` after a successful redrive; the API path
+  deletes the row without touching the gauge.
+
+None of these differences changes the safe recovery order above: fix the
+channel, verify it with the test endpoint, then redrive.
+
+---
+
 ## API Reference
 
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /api/v1/alerts/{id}/deliveries` | List all delivery attempts for an alert |
 | `POST /api/v1/alerts/{id}/deliveries/{channel_id}/retry` | Retry one failed delivery |
+| `GET /api/v1/dead-letters` | List dead-lettered deliveries, filtered by `channel_id` / `alert_id` |
+| `POST /api/v1/dead-letters/{id}/redrive` | Redrive one dead letter; deletes it on success |
 | `GET /api/v1/channels` | List channels with health counters |
 | `GET /api/v1/monitors/{id}` | Verify monitor has channels attached |
 
@@ -212,6 +423,7 @@ The retry endpoint creates a **new delivery attempt** for the same alert/channel
 | **Alert Detail** | Delivery attempts table with status, response code, snippet |
 | **Channel List** | Health counters, `disabled_at`, last error |
 | **Monitor Detail** | Attached channels, last matched time |
+| **Dead Letters** | Permanently failed deliveries with a per-row **Redrive** button |
 
 ---
 
@@ -233,4 +445,6 @@ The retry endpoint creates a **new delivery attempt** for the same alert/channel
 - [ ] Fix root cause (rotate credential, recreate webhook, etc.)
 - [ ] Channel health shows `enabled: true` (or re-enable via PATCH)
 - [ ] Retry delivery via `POST /api/v1/alerts/{id}/deliveries/{channel_id}/retry`
+- [ ] If retries are exhausted, check `/api/v1/dead-letters` (or the dashboard's **Dead letters** page)
+- [ ] Redrive the dead letter after the destination is fixed, then confirm the row disappeared
 - [ ] Verify new attempt shows `status: sent` with 2xx response
