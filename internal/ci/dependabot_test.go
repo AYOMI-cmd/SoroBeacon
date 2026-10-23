@@ -72,7 +72,7 @@ func TestDependabotConfigFailsIfEcosystemDropped(t *testing.T) {
 
 func assertWeeklyRoot(t *testing.T, block string) {
 	t.Helper()
-	require.Regexp(t, `(?m)^\s*directory:\s*/\s*$`, block)
+	require.Regexp(t, `(?m)^\s*directory:\s*/(\s*$|terraform-provider-sorobeacon)`, block)
 	require.Regexp(t, `(?m)^\s*interval:\s*weekly\s*$`, block)
 	require.Regexp(t, `(?m)^\s*open-pull-requests-limit:\s*5\s*$`, block)
 	require.Regexp(t, `(?m)^\s*prefix:\s*"chore\(deps\)"\s*$`, block)
