@@ -4,6 +4,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -91,7 +92,6 @@ type Server struct {
 	// tokens mints and resolves scoped API tokens. Nil leaves the /tokens
 	// endpoints off and only static credentials authenticating.
 	tokens *auth.Manager
-	roles  *auth.RoleEnforcer
 }
 
 // New wires an API server. Rate limiting stays off until WithRateLimit, and
@@ -205,42 +205,58 @@ func (s *Server) WithTokens(m *auth.Manager) *Server {
 	return s
 }
 
-// WithRoles attaches role enforcement to the API router.
-func (s *Server) WithRoles(re *auth.RoleEnforcer) *Server {
-	s.roles = re
-	return s
-}
+// WithRoles attached role enforcement to the API router.
+//
+// It is gone: the roles are enforced by the router itself, from the table in
+// internal/api/roles.go, and there is one enforcement path rather than three
+// that have to be kept in step.
 
 // Routes returns the API router. Mounted under /api/v1 by cmd/sorobeacon.
 //
-// Middleware order: auth before the rate limiter, so a flood of requests
-// with no credential costs one constant-time compare and returns 401
-// without allocating a limiter bucket or touching a store. The limiter then
-// only has to protect the served (authenticated) traffic.
+// Middleware order: auth before the role check, so a request's credential is
+// resolved once and the role check reads it from there. The role check comes
+// before the rate limiter, so a flood of requests from a credential that is
+// not allowed here costs one role comparison and returns 403 without
+// allocating a limiter bucket. The limiter then only has to protect the
+// served (authenticated and authorised) traffic.
 func (s *Server) Routes() chi.Router {
-	r := chi.NewRouter()
-	r.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
-	r.Use(AuthMiddleware(s.auth, s.log))
-	r.Use(auth.RoleMiddleware(s.roles, auth.RoleViewer))
-	r.Use(RateLimitMiddleware(s.rateLimit))
+	mux := chi.NewRouter()
+	mux.Use(middleware.Recoverer, MaxBodyMiddleware(s.maxBodyBytes))
+	mux.Use(AuthMiddleware(s.auth, s.log))
+	mux.Use(auth.RoleCheck{
+		Authenticator: s.auth,
+		Table:         routeRoles,
+		RoutePath:     routePath,
+		RouteExists: func(method, path string) bool {
+			// The router is the authority on which routes exist, so a
+			// request for a path that does not exist is left to the 404
+			// handler instead of being answered 403.
+			return mux.Match(chi.NewRouteContext(), method, path)
+		},
+		Deny: s.denyRole,
+	}.Middleware())
+	mux.Use(RateLimitMiddleware(s.rateLimit))
 	// Innermost, so only authenticated, rate-limited requests are audited
 	// and an audit failure never blocks the request.
-	r.Use(AuditMiddleware(s.store, s.log))
+	mux.Use(AuditMiddleware(s.store, s.log))
 	// JSON clients hitting a typo'd path or the wrong method should get
 	// the same envelope as every other API error, not chi's plain-text
 	// 404/405. The dashboard mux is a different router and is untouched.
-	r.NotFound(s.notFound)
-	r.MethodNotAllowed(s.methodNotAllowed)
+	mux.NotFound(s.notFound)
+	mux.MethodNotAllowed(s.methodNotAllowed)
 
-	r.Route("/monitors", func(r chi.Router) {
+	mux.Route("/monitors", func(r chi.Router) {
 		r.Post("/", s.createMonitor)
 		r.With(conditionalGET).Get("/", s.listMonitors)
 		r.Post("/bulk", s.bulkMonitors)
+		r.Get("/trash", s.listDeletedMonitors)
 		r.Route("/{id}", func(r chi.Router) {
 			r.Get("/", s.getMonitor)
 			r.Get("/stats", s.monitorStats)
 			r.Patch("/", s.updateMonitor)
 			r.Delete("/", s.deleteMonitor)
+			r.Post("/soft-delete", s.softDeleteMonitor)
+			r.Post("/restore", s.restoreMonitor)
 			r.Post("/duplicate", s.duplicateMonitor)
 			r.Post("/rules/dry-run", s.dryRun)
 			r.Post("/rules", s.createRule)
@@ -254,18 +270,21 @@ func (s *Server) Routes() chi.Router {
 		})
 	})
 
-	r.Route("/channels", func(r chi.Router) {
+	mux.Route("/channels", func(r chi.Router) {
 		r.Post("/", s.createChannel)
 		r.With(conditionalGET).Get("/", s.listChannels)
 		r.Post("/bulk", s.bulkChannels)
 		r.Post("/{id}/duplicate", s.duplicateChannel)
 		r.Get("/{id}", s.getChannel)
+		// Registered under the channel's own id rather than under /stats:
+		// the statistics are one channel's, not the instance's.
+		r.Get("/{id}/stats", s.channelStats)
 		r.Patch("/{id}", s.updateChannel)
 		r.Delete("/{id}", s.deleteChannel)
 		r.Post("/{id}/test", s.testChannel)
 	})
 
-	r.Route("/maintenance-windows", func(r chi.Router) {
+	mux.Route("/maintenance-windows", func(r chi.Router) {
 		r.Post("/", s.createMaintenanceWindow)
 		r.Get("/", s.listMaintenanceWindows)
 		r.Get("/{id}", s.getMaintenanceWindow)
@@ -273,13 +292,13 @@ func (s *Server) Routes() chi.Router {
 		r.Delete("/{id}", s.deleteMaintenanceWindow)
 	})
 
-	r.Route("/inhibitions", func(r chi.Router) {
+	mux.Route("/inhibitions", func(r chi.Router) {
 		r.Post("/", s.createInhibition)
 		r.Get("/", s.listInhibitions)
 		r.Delete("/{sourceID}/{targetID}", s.deleteInhibition)
 	})
 
-	r.Route("/templates", func(r chi.Router) {
+	mux.Route("/templates", func(r chi.Router) {
 		r.Post("/", s.createTemplate)
 		r.Get("/", s.listTemplates)
 		r.Route("/{id}", func(r chi.Router) {
@@ -291,37 +310,40 @@ func (s *Server) Routes() chi.Router {
 		})
 	})
 
-	r.Post("/monitors/import", s.importContracts)
-	r.Post("/ingest", s.ingest)
+	mux.Post("/monitors/import", s.importContracts)
+	mux.Post("/ingest", s.ingest)
+	// Trigger endpoint: accept external events and create alerts via rule
+	// evaluation.
+	mux.Post("/triggers", s.triggerHandler)
 
-	r.Route("/tokens", func(r chi.Router) {
+	mux.Route("/tokens", func(r chi.Router) {
 		r.Post("/", s.createToken)
 		r.Get("/", s.listTokens)
 		r.Post("/{id}/revoke", s.revokeToken)
 	})
 
-	r.Get("/alerts", s.listAlerts)
+	mux.Get("/alerts", s.listAlerts)
 	// Registered before /alerts.csv and the /alerts/{id}/... routes for
 	// readability; chi matches the static segment either way.
-	r.Get("/alerts/stream", s.streamAlerts)
-	r.Get("/alerts.csv", s.exportAlertsCSV)
-	r.Get("/alerts/export", s.exportAlertsNDJSON)
-	r.Get("/alerts/{id}/deliveries", s.listDeliveries)
-	r.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
-	r.Get("/dead-letters", s.listDeadLetters)
-	r.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
-	r.Post("/alerts/{id}/acknowledge", s.acknowledgeAlert)
-	r.Get("/health", s.health)
-	r.Get("/livez", s.livez)
-	r.Get("/readyz", s.readyz)
-	r.Get("/poller", s.pollerStatus)
-	r.Get("/version", s.version)
-	r.Get("/rule-types", s.listRuleTypes)
-	r.Get("/stats", s.stats)
-	r.Get("/stats/alerts-daily", s.alertsDaily)
-	r.Get("/audit", s.listAudit)
+	mux.Get("/alerts/stream", s.streamAlerts)
+	mux.Get("/alerts.csv", s.exportAlertsCSV)
+	mux.Get("/alerts/export", s.exportAlertsNDJSON)
+	mux.Get("/alerts/{id}/deliveries", s.listDeliveries)
+	mux.Post("/alerts/{id}/deliveries/{channelID}/retry", s.retryDelivery)
+	mux.Get("/dead-letters", s.listDeadLetters)
+	mux.Post("/dead-letters/{id}/redrive", s.redriveDeadLetter)
+	mux.Post("/alerts/{id}/acknowledge", s.acknowledgeAlert)
+	mux.Get("/health", s.health)
+	mux.Get("/livez", s.livez)
+	mux.Get("/readyz", s.readyz)
+	mux.Get("/poller", s.pollerStatus)
+	mux.Get("/version", s.version)
+	mux.Get("/rule-types", s.listRuleTypes)
+	mux.Get("/stats", s.stats)
+	mux.Get("/stats/alerts-daily", s.alertsDaily)
+	mux.Get("/audit", s.listAudit)
 
-	return r
+	return mux
 }
 
 // --- helpers ---
@@ -440,6 +462,18 @@ func writeValidation(w http.ResponseWriter, r *http.Request, details []FieldErro
 	writeErr(w, r, http.StatusBadRequest, msg, details...)
 }
 
+// writeUnprocessable reports problems that make a well-formed request
+// impossible to satisfy: the request was understood, and what it carries
+// cannot be turned into a valid result. The details list every problem,
+// keyed by the field, rule index or parameter it belongs to, so a caller can
+// see all of them at once instead of fixing one per round trip.
+func writeUnprocessable(w http.ResponseWriter, r *http.Request, details []FieldError) {
+	if len(details) == 0 {
+		return
+	}
+	writeErr(w, r, http.StatusUnprocessableEntity, "validation failed", details...)
+}
+
 // detailsFromErr turns a Validate / constructor error into envelope
 // details. FieldErrors from the rules registry keep their paths, prefixed
 // so nested params show up as params.min_amount rather than a flattened
@@ -516,6 +550,15 @@ func allowHeader(r *http.Request) string {
 
 // fail maps store errors to HTTP responses.
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	// A constraint violation is the request's fault, not the server's: it
+	// named a record that does not exist, or a value the database refuses.
+	// Answering 500 would tell the sender the failure is transient, and a
+	// federated sender retries a request that cannot succeed — three times,
+	// and then into the dead-letter queue.
+	if errors.Is(err, store.ErrConstraint) {
+		writeErr(w, r, http.StatusUnprocessableEntity, constraintMessage(err))
+		return
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, r, http.StatusNotFound, "not found")
 		return
@@ -524,13 +567,38 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	writeErr(w, r, http.StatusInternalServerError, "internal error")
 }
 
+// constraintMessage describes a constraint violation in the caller's terms.
+// It never quotes the statement that failed or the constraint's name: the
+// caller needs to know what to change, not what the database said about it.
+func constraintMessage(err error) string {
+	kind, ok := store.ConstraintKindOf(err)
+	if !ok {
+		return "the request violates a database constraint"
+	}
+	switch kind {
+	case store.ConstraintForeignKey:
+		return "the request references a record that does not exist"
+	case store.ConstraintCheck:
+		return "the request contains a value the database refuses"
+	case store.ConstraintUnique:
+		return "the request conflicts with an existing record"
+	default:
+		return "the request violates a database constraint"
+	}
+}
+
 func readJSON(w http.ResponseWriter, r *http.Request, v any) bool {
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeErr(w, r, http.StatusRequestEntityTooLarge, "request body too large")
 			return false
 		}
+		writeErr(w, r, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return false
+	}
+	if err := json.Unmarshal(data, v); err != nil {
 		writeErr(w, r, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return false
 	}

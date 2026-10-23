@@ -72,8 +72,9 @@ See [capacity and scaling](docs/operations/scaling.md).
 
 ## Configuration
 
-All configuration comes from environment variables. The complete
-operator reference — every variable `internal/config` reads, grouped by
+Configuration comes from environment variables and, optionally, a YAML file
+selected by `CONFIG_FILE`. The complete operator reference — every variable
+`internal/config` reads, grouped by
 database / RPC / HTTP / polling / logging, with types, defaults, required
 vs optional, secrets, and `SOURCE_MODE`-only notes — is
 [docs/configuration.md](docs/configuration.md).
@@ -99,6 +100,9 @@ vs optional, secrets, and `SOURCE_MODE`-only notes — is
 | `CORS_ALLOWED_ORIGINS` | _(empty, CORS off)_             | Comma-separated browser Origins; empty disables CORS |
 | `MONITOR_SILENT_AFTER` | `24h`                            | Mark monitors silent on the dashboard after this much time since last match |
 | `ALERT_RETENTION` | _(unset, keep forever)_             | How long to keep alerts; `90d`, `24h`. Postgres drops whole expired partitions |
+| `ALERT_ENRICHMENT_URL` | _(unset, off)_                  | HTTP JSON endpoint called on every alert to attach operator context; see the [enrichment guide](docs/guides/alert-enrichment.md) |
+| `ALERT_ENRICHMENT_TIMEOUT` | `2s`                        | Budget for one enrichment call; slow service costs the enrichment, not the alert |
+| `ALERT_ENRICHMENT_CACHE_TTL` | `5m`                     | How long an enrichment response is reused per contract (in-memory) |
 | `ARCHIVE_URL`   | _(unset, off)_                         | Archive expired alerts before deletion (directory or `s3://bucket/prefix`) |
 | `REORG_TRACKING_WINDOW` | `128`                        | Recent ledger hashes tracked for reorg detection; `0` disables |
 | `REORG_CONFIRMATION_DEPTH` | `0`                       | Ledgers an event must be buried before it may alert |
@@ -317,6 +321,8 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 }'
 ```
 
+See [docs/rules/event_emitted.md](docs/rules/event_emitted.md).
+
 **`value_threshold`** — numeric comparison on the event's decoded value.
 `value_path` is a dot path into the value (map keys / array indexes); omit it
 when the value itself is the number. Use a string threshold for integers
@@ -334,13 +340,15 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 }'
 ```
 
-`comparison` is one of `gt`, `gte`, `lt`, `lte`, `eq`, `neq`.
+`comparison` is one of `gt`, `gte`, `lt`, `lte`, `eq`, `neq`. See [docs/rules/value_threshold.md](docs/rules/value_threshold.md).
 
 **`token_event`** — SEP-41 token events, with the interface's topic layout
 built in. `event` is one of `transfer`, `mint`, `burn`, `clawback`,
 `set_admin`, or `*` for any of them; `from`/`to` match the semantic address
 slots (from is the holder on burn/clawback, the sender on transfer), and
 `min_amount`/`max_amount` are inclusive i128 bounds as decimal strings:
+See the [token_event rule reference](docs/rules/token_event.md) for topic
+positions, decimals, validation, and more examples.
 
 ```sh
 curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
@@ -438,6 +446,24 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
 }'
 ```
 
+**`event_name_glob`** — match the event's **name** (the first topic) against a
+glob pattern, for the families a glob says better than a regex: `swap_*`
+covers `swap_exact_in`, `swap_exact_out` and everything else in the family.
+Patterns use Go's `path.Match` syntax (`*`, `?`, `[a-z]`), several patterns
+are ORed, and the match is anchored at both ends and case-sensitive — `swap`
+does not match `swap_exact_in`, `swap_*` does:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "event_name_glob",
+  "params": {
+    "patterns": ["swap_*", "pool_deposit"]
+  }
+}'
+```
+
+See [docs/rules/event-name-glob.md](docs/rules/event-name-glob.md).
+
 **`address_watchlist`** — match any SEP-41 token event whose from or to
 address is on a configured list. "Did these specific addresses move anything"
 becomes one rule instead of one `token_event` rule per address. `match` is
@@ -455,6 +481,24 @@ curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
   }
 }'
 ```
+
+**`contract_allowlist`** — match the **contract** an event came from against
+a list of contract IDs, or — with `exclude` — against everything else. A
+monitor can watch a whole protocol's contracts while a rule narrows it to
+one of them, so the rule is at its best inside a `composite`, AND-combined
+with a rule that looks at the payload. The set is built once, so the list
+costs no more per event than a single entry:
+
+```sh
+curl -s -X POST localhost:8080/api/v1/monitors/1/rules -d '{
+  "type": "contract_allowlist",
+  "params": {
+    "contract_ids": ["CA7Q...TREASURY"]
+  }
+}'
+```
+
+See [docs/rules/contract-allowlist.md](docs/rules/contract-allowlist.md).
 
 **`topic_position`** — match when the decoded topic at a fixed position
 exactly equals a configured value. Custom (non-SEP-41) contracts put

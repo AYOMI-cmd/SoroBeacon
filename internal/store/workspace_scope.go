@@ -30,10 +30,11 @@ import (
 //   - The WorkspaceIsolation case in the conformance suite
 //     (testWorkspaceIsolation, run against both backends) asserts that no
 //     listing, lookup or id-addressed mutation reaches another tenant's row.
-//   - TestEveryScopedQueryCarriesWorkspace scans the SQL literals in
-//     postgres.go and sqlite.go and fails if one touches a tenant table
+//   - TestEveryScopedQueryCarriesWorkspace scans the SQL literals in every
+//     non-test file in this package and fails if one touches a tenant table
 //     without scoping it, which catches a method the conformance suite has
-//     not been taught about yet.
+//     not been taught about yet. It reads the directory rather than a list,
+//     so a new store file is covered the moment it exists.
 //
 // Resolution defaults rather than errors. A context carrying no workspace
 // resolves to workspace.Default, so an instance that never configured
