@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -36,7 +36,7 @@ jobs:
       # TEST_DATABASE_URL set so it runs against Postgres too instead of
       # skipping. Both backends must pass identical assertions.
   test-db:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
       postgres:
@@ -174,7 +174,7 @@ jobs:
           version: v2.12.2
 
   terraform-provider:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
