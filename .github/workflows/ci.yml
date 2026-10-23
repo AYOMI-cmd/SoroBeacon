@@ -173,6 +173,34 @@ jobs:
         with:
           version: v2.12.2
 
+  terraform-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: terraform-provider-sorobeacon/go.mod
+          cache-dependency-path: terraform-provider-sorobeacon/go.sum
+      - name: Build
+        working-directory: terraform-provider-sorobeacon
+        run: go build ./...
+      - name: Vet
+        working-directory: terraform-provider-sorobeacon
+        run: go vet ./...
+      - name: Test
+        working-directory: terraform-provider-sorobeacon
+        run: go test ./...
+      - name: Verify tidy
+        working-directory: terraform-provider-sorobeacon
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.12.2
+          working-directory: terraform-provider-sorobeacon
+
   # The Helm chart is a deployment artifact like any other, so it is linted and
   # rendered on every change instead of rotting until someone tries to install
   # it. Mirrors the job in the sibling SoroTrail repository.
