@@ -174,7 +174,7 @@ jobs:
           version: v2.12.2
 
   terraform-provider:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
