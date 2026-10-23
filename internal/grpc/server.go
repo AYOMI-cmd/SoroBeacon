@@ -63,7 +63,15 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	if err != nil {
 		return fmt.Errorf("grpc listen: %w", err)
 	}
-	s.log.Info("grpc server listening", "addr", addr)
+	return s.ServeListener(ctx, lis)
+}
+
+// ServeListener serves on an already-bound listener. Startup binds the
+// listener itself so a port conflict is a startup error and the caller can
+// report the address that was actually assigned (port zero). It blocks until
+// the server stops or ctx is cancelled.
+func (s *Server) ServeListener(ctx context.Context, lis net.Listener) error {
+	s.log.Info("grpc server listening", "addr", lis.Addr().String())
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.srv.Serve(lis) }()

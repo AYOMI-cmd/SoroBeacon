@@ -87,6 +87,7 @@ type fakeStore struct {
 	// legacy single row above is what an unscoped poller writes, and the two
 	// are kept apart so a test can prove a scoped poller never touches it.
 	namedState map[string]store.IngestState
+	cursors    map[string]store.ContractCursor
 	alerts     []store.Alert
 	dedup      map[string]bool // "ruleID/eventID"
 	channels   []store.Channel
@@ -111,13 +112,15 @@ type fakeStore struct {
 	// absence holds the absence rules' last-seen clocks, keyed like the
 	// table's primary key. It lives on the store, not the poller, so a test
 	// can throw the poller away and prove the clock survived "a restart".
-	absence map[string]time.Time
+	absence     map[string]time.Time
+	alertErrors map[string]error
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		rules:        map[int64][]store.Rule{},
 		namedState:   map[string]store.IngestState{},
+		cursors:      map[string]store.ContractCursor{},
 		dedup:        map[string]bool{},
 		attached:     map[int64][]int64{},
 		now:          time.Now,
@@ -128,6 +131,7 @@ func newFakeStore() *fakeStore {
 		groupStates:  map[string]int64{},
 		inhibitions:  []store.Inhibition{},
 		absence:      map[string]time.Time{},
+		alertErrors:  map[string]error{},
 	}
 }
 
@@ -281,6 +285,18 @@ func (f *fakeStore) RuleFiredWithin(_ context.Context, ruleID int64, window time
 	return false, nil
 }
 
+func (f *fakeStore) ListRuleAlertTimes(_ context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var times []time.Time
+	for _, alert := range f.alerts {
+		if alert.RuleID == ruleID && !alert.CreatedAt.Before(since) {
+			times = append(times, alert.CreatedAt)
+		}
+	}
+	return times, nil
+}
+
 // MarkAlertInhibited marks an alert as inhibited by a source rule.
 func (f *fakeStore) MarkAlertInhibited(_ context.Context, alertID, sourceRuleID int64) error {
 	return nil // no-op for tests
@@ -289,6 +305,9 @@ func (f *fakeStore) MarkAlertInhibited(_ context.Context, alertID, sourceRuleID 
 func (f *fakeStore) CreateAlert(_ context.Context, a *store.Alert) (store.AlertOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.alertErrors[a.EventID]; err != nil {
+		return "", err
+	}
 	key := fmt.Sprintf("%d/%s", a.RuleID, a.EventID)
 	if f.dedup[key] {
 		return store.AlertDuplicate, nil // replay, not a fresh match
@@ -350,6 +369,57 @@ func (f *fakeStore) SetIngestState(_ context.Context, network string, s store.In
 		return nil
 	}
 	f.namedState[network] = s
+	return nil
+}
+
+func contractCursorKey(network, contractID string) string {
+	return network + "/" + contractID
+}
+
+func (f *fakeStore) ListContractCursors(_ context.Context, network string) ([]store.ContractCursor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.ContractCursor
+	for _, cursor := range f.cursors {
+		if cursor.Network == network {
+			out = append(out, cursor)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) InitializeContractCursor(_ context.Context, network, contractID string, lastLedger uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.cursors[contractCursorKey(network, contractID)]; exists {
+		return nil
+	}
+	f.cursors[contractCursorKey(network, contractID)] = store.ContractCursor{
+		Network: network, ContractID: contractID, LastLedger: lastLedger,
+	}
+	return nil
+}
+
+func (f *fakeStore) AdvanceContractCursor(_ context.Context, network, contractID string, lastLedger uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := contractCursorKey(network, contractID)
+	if cursor, exists := f.cursors[key]; exists && lastLedger > cursor.LastLedger {
+		cursor.LastLedger = lastLedger
+		f.cursors[key] = cursor
+	}
+	return nil
+}
+
+func (f *fakeStore) RewindContractCursors(_ context.Context, network string, lastLedger uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for key, cursor := range f.cursors {
+		if cursor.Network == network && cursor.LastLedger > lastLedger {
+			cursor.LastLedger = lastLedger
+			f.cursors[key] = cursor
+		}
+	}
 	return nil
 }
 

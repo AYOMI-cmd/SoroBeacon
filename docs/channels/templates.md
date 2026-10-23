@@ -47,6 +47,7 @@ the exported `notify.Alert` fields.
 | `.Ledger` | integer | Ledger the event was in. |
 | `.TxHash` | string | Transaction hash. |
 | `.Payload` | string | The stored alert payload as raw JSON. |
+| `.Enrichment` | string | The [enrichment](../guides/alert-enrichment.md) object fetched from `ALERT_ENRICHMENT_URL`, as raw JSON; empty when enrichment is off or its fetch failed. |
 | `.CreatedAt` | time | When the alert was created (`time.Time`; use `.CreatedAt.UTC.Format "2006-01-02 15:04:05"` for a timestamp). |
 
 Standard Go `text/template` syntax and built-in functions (`printf`, `index`,
