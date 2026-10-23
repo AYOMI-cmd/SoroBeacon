@@ -64,7 +64,7 @@ func checkPostgresSchema(ctx context.Context, databaseURL string, status SchemaS
 	if err != nil {
 		return status, fmt.Errorf("open database: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := db.PingContext(ctx); err != nil {
 		return status, fmt.Errorf("database is unreachable: %w", err)
 	}
@@ -102,7 +102,7 @@ func checkSQLiteSchema(ctx context.Context, databaseURL string, status SchemaSta
 	if err != nil {
 		return status, fmt.Errorf("open database: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := db.PingContext(ctx); err != nil {
 		return status, fmt.Errorf("database is unreachable: %w", err)
 	}

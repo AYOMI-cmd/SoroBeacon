@@ -41,14 +41,6 @@ func NewKeyTable() *KeyTable {
 	return &KeyTable{channels: make(map[string]keyMap)}
 }
 
-// keyTable is the global key table used for webhook signature verification.
-var keyTable *KeyTable
-
-// initKeyTable initializes the global key table used for webhook signature verification.
-func init() {
-	keyTable = NewKeyTable()
-}
-
 // AddKey adds a new signing key for a channel identified by its webhook URL.
 // The key is stored encrypted at rest (the existing crypto path handles this).
 // If a key with the same ID already exists, it is replaced.
@@ -188,10 +180,4 @@ func (kt *KeyTable) VerifySignature(url, timestamp string, rawBody []byte, signa
 	}
 
 	return "", false
-}
-
-// rotateKeyID generates a deterministic key ID from a timestamp, used as part
-// of the rotation procedure so callers can identify which key was used.
-func rotateKeyID(timestamp time.Time) string {
-	return fmt.Sprintf("rot-%d", timestamp.Unix())
 }

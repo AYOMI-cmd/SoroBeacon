@@ -2,7 +2,6 @@ package api
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -23,7 +22,7 @@ import (
 // closed on anything unmapped, so forgetting this table is a broken integration
 // a reviewer sees, not a silent hole. TestScopeTableCoversEveryRoute
 // is what keeps the table and the router from drifting apart in either direction.
-var routeScopes = map[string][]auth.Scope{
+var routeScopes = auth.NewRouteTable(map[string][]auth.Scope{
 	"POST /monitors":                       {auth.ScopeMonitorsWrite},
 	"GET /monitors":                        {auth.ScopeMonitorsRead},
 	"POST /monitors/bulk":                  {auth.ScopeMonitorsWrite},
@@ -95,6 +94,9 @@ var routeScopes = map[string][]auth.Scope{
 	"GET /audit": {auth.ScopeMonitorsRead},
 	// Ingest writes alerts: it is the push counterpart of the poller.
 	"POST /ingest": {auth.ScopeAlertsWrite},
+	// A trigger asks the instance to evaluate an external event into an
+	// alert, so it writes alerts too.
+	"POST /triggers": {auth.ScopeAlertsWrite},
 	// Inhibitions and maintenance windows decide whether an alert is
 	// delivered, so they are alert writes rather than monitor edits.
 	"POST /inhibitions":                         {auth.ScopeAlertsWrite},
@@ -123,66 +125,15 @@ var routeScopes = map[string][]auth.Scope{
 	// alert write, not a channel edit.
 	"GET /dead-letters":               {auth.ScopeAlertsRead},
 	"POST /dead-letters/{id}/redrive": {auth.ScopeAlertsWrite},
-}
+})
 
 // requiredScopes resolves the permissions a request needs. ok false means the
 // route is not in the table, which the caller treats as a denial.
+//
+// The matching lives in the auth package, because the role table resolves
+// paths the same way and the two must not disagree about what a route is.
 func requiredScopes(method, path string) (scopes []auth.Scope, ok bool) {
-	// Exact key first: it covers every literal pattern and costs nothing.
-	if s, hit := routeScopes[method+" "+normalizeRoute(path)]; hit {
-		return s, true
-	}
-	// Parameterised patterns need segment matching, so the table stays the
-	// single list a reviewer reads rather than becoming a set of regexes.
-	for key, s := range routeScopes {
-		m, pattern, _ := strings.Cut(key, " ")
-		if m != method || !patternMatches(pattern, path) {
-			continue
-		}
-		return s, true
-	}
-	return nil, false
-}
-
-// patternMatches reports whether a chi route pattern ("monitors/{id}/rules")
-// selects the request path ("/monitors/7/rules"). A {param} segment matches any
-// single segment: patterns are matched segment by segment rather than by prefix
-// so "/monitors/{id}" cannot also select "/monitors/7/rules", which is a
-// different route with (here) a different write scope.
-func patternMatches(pattern, path string) bool {
-	p := splitSegments(pattern)
-	q := splitSegments(path)
-	if len(p) != len(q) {
-		return false
-	}
-	for i := range p {
-		if strings.HasPrefix(p[i], "{") && strings.HasSuffix(p[i], "}") {
-			continue
-		}
-		if p[i] != q[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func splitSegments(s string) []string {
-	return strings.Split(strings.Trim(normalizeRoute(s), "/"), "/")
-}
-
-// normalizeRoute makes "/monitors", "/monitors/" and "monitors" one key, so a
-// pattern as chi reports it (which carries the trailing slash a Mount leaves)
-// and a path as the router received it agree. The canonical form is the one
-// routeScopes is written in: a leading slash, no trailing one, "/" for the root.
-func normalizeRoute(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" || s == "/" {
-		return "/"
-	}
-	if !strings.HasPrefix(s, "/") {
-		s = "/" + s
-	}
-	return strings.TrimSuffix(s, "/")
+	return routeScopes.Lookup(method, path)
 }
 
 // routePath is the path to match against the table: what the mounted router

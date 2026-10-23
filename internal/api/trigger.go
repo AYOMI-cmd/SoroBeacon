@@ -45,10 +45,3 @@ func (s *Server) triggerHandler(w http.ResponseWriter, r *http.Request) {
 		Note: "trigger received (rule evaluation pending)",
 	})
 }
-
-// triggerRateLimitConfig is a small rate limit just for the trigger endpoint.
-var triggerRateLimit = RateLimitConfig{
-	RPS:            0.1,
-	Burst:          1,
-	TrustForwarded: false,
-}

@@ -295,10 +295,11 @@ func TestPostgresSurvivesDatabaseGoingAway(t *testing.T) {
 	}, 15*time.Second, 100*time.Millisecond, "the store did not recover after the database returned")
 	assert.False(t, st.Degraded(), "a successful ping must clear the degraded state")
 
-	// And it still serves reads.
-	monitors, err := st.ListMonitors(ctx, true)
+	// And it still serves reads. The database is shared with the rest of the
+	// suite, so this asserts the query succeeds rather than that the table is
+	// empty.
+	_, err = st.ListMonitors(ctx, true)
 	require.NoError(t, err)
-	assert.Empty(t, monitors)
 }
 
 // TestPostgresStartRefusesFastOnPermanentFailure proves a wrong password is

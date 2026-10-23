@@ -43,13 +43,23 @@ func builderFields(schema []rules.FieldSchema, values map[string]string) string 
 		if f.Required {
 			req = " required"
 		}
+		// A field with a documented default starts there instead of on the
+		// empty option, so the form shows the same value the evaluator will
+		// use when the user leaves it alone. A submitted value wins.
 		value := values[f.Name]
+		if value == "" && f.Default != "" {
+			value = f.Default
+		}
 		switch f.Type {
-		case "select":
+		case "select", "boolean":
+			options := f.Options
+			if f.Type == "boolean" {
+				options = []string{"true", "false"}
+			}
 			fmt.Fprintf(&b, `<label for="param_%s">%s</label>`, f.Name, f.Description)
 			fmt.Fprintf(&b, `<select id="param_%s" name="param_%s"%s>`, f.Name, f.Name, req)
 			fmt.Fprint(&b, `<option value="">--</option>`)
-			for _, opt := range f.Options {
+			for _, opt := range options {
 				sel := ""
 				if opt == value {
 					sel = " selected"

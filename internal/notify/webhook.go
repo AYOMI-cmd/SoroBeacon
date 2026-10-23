@@ -4,10 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -27,12 +24,14 @@ const SignaturePreviousHeader = "X-SoroBeacon-Signature-Previous"
 // who captures one request replay it forever.
 const TimestampHeader = "X-SoroBeacon-Timestamp"
 
-// webhookConfig: {"url": "https://example.com/hook", "secret": "shared-secret"}
-// PreviousSecret, when set, is used to emit a second signature so a
-// receiver can roll over without dropping deliveries mid-rotation.
+// webhookConfig: {"url": "https://example.com/hook", "secret": "shared-secret",
+// "previous_secret": "the-secret-we-are-rotating-from"}
 type webhookConfig struct {
-	URL          string `json:"url"`
-	Secret       string `json:"secret"`
+	URL string `json:"url"`
+	// Secret signs every request; it is the key a receiver should hold.
+	Secret string `json:"secret"`
+	// PreviousSecret, when set, is used to emit a second signature so a
+	// receiver can roll over without dropping deliveries mid-rotation.
 	PreviousSecret string `json:"previous_secret"`
 }
 
@@ -66,60 +65,16 @@ func (w *Webhook) Send(ctx context.Context, a Alert) error {
 	// The timestamp is computed once and reused for both signatures; a
 	// receiver validates each header against the same signed string.
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-
-	// Sign with all active keys so receivers using any key during rotation
-	// can verify the delivery. The first active key is used as the primary.
-	activeKeys := keyTable.GetActiveKeys(w.cfg.URL)
-	if len(activeKeys) == 0 {
-		return fmt.Errorf("webhook: no active signing keys configured")
-	}
-
-	// Use the first (oldest) active key as the primary for the main signature
-	primarySig := Sign(activeKeys[0].Key, timestamp, body)
-
 	headers := map[string]string{
 		TimestampHeader: timestamp,
-		SignatureHeader: primarySig,
+		SignatureHeader: Sign([]byte(w.cfg.Secret), timestamp, body),
+	}
+	if w.cfg.PreviousSecret != "" {
+		headers[SignaturePreviousHeader] = Sign([]byte(w.cfg.PreviousSecret), timestamp, body)
 	}
 
-	// If there are multiple active keys or a previous secret is configured,
-	// also send the previous signature so receivers still on the old key
-	// can verify the delivery.
-	if len(activeKeys) > 1 || w.cfg.PreviousSecret != "" {
-		// Determine which key to use for the previous signature
-		var prevSig string
-		if w.cfg.PreviousSecret != "" {
-			prevSig = Sign([]byte(w.cfg.PreviousSecret), timestamp, body)
-		} else if len(activeKeys) > 1 {
-			// Use the second oldest active key as the previous key
-			prevSig = Sign(activeKeys[1].Key, timestamp, body)
-		} else {
-			prevSig = ""
-		}
-		if prevSig != "" {
-			headers[SignaturePreviousHeader] = prevSig
-		}
+	if err := postJSON(ctx, w.cfg.URL, body, headers); err != nil {
+		return fmt.Errorf("webhook: %w", err)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.cfg.URL, strings.NewReader(string(body)))
-	if err != nil {
-		return fmt.Errorf("webhook: failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("webhook: delivery failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("webhook: %s body: %s", resp.Status, string(bodyBytes))
-	}
-
 	return nil
 }
