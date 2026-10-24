@@ -7,6 +7,43 @@ at startup, before the service accepts traffic.** This page describes what
 that means in practice, the order to upgrade in, and what rollback honestly
 looks like.
 
+## Preflight before deployment
+
+Run the new binary's preflight command with the same environment and config
+file the deployment will use:
+
+```sh
+./bin/sorobeacon preflight
+./bin/sorobeacon preflight --json
+./bin/sorobeacon preflight --only database,source
+```
+
+It validates configuration, reads the existing migration version without
+applying migrations, checks the configured event source and Stellar network,
+resolves every saved channel's secret references, validates channel configs,
+and checks the three-month Postgres alert-partition runway. Checks run
+concurrently under one shared deadline. SQLite is opened read-only; preflight
+never creates a database or applies schema changes.
+
+SMTP channels are checked by connecting, negotiating configured TLS and
+authenticating, then quitting before `MAIL`, `RCPT` or `DATA`. Telegram bot
+credentials use the read-only `getMe` endpoint. A channel whose provider has no
+non-delivering validation API is reported as incomplete; it is never probed by
+sending a message. Horizon and SoroTrail network identity is checked when the
+upstream includes a `network_passphrase` in its root or stats response. Older
+upstreams that omit it are reported as incomplete. Use `--send-tests` only when delivering a
+synthetic alert to every enabled channel is explicitly acceptable.
+
+The process exit codes are `0` for verified checks, `2` for command-line
+usage, `4` for invalid configuration, `5` for an unreachable or unhealthy
+dependency, and `6` when a check could not be completed safely. The JSON form
+includes each check's status, detail and remediation. Check errors redact
+database, endpoint and channel-config values.
+
+Startup reuses configuration, source-network and channel config/secret
+validation. Startup still applies migrations and creates the normal partition
+runway; preflight only inspects them.
+
 ## Migrations run on startup
 
 On every start, the process applies any pending schema migrations, then

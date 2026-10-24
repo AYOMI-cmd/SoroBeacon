@@ -106,6 +106,8 @@ curl -s -X PATCH localhost:8080/api/v1/monitors/1 -d '{"enabled": false}'
 
 Params for the built-in types: [`event_emitted`](../rules/event-emitted.md), [`value_threshold`](../rules/value-threshold.md), [`token_event`](../rules/token-event.md), [`self_transfer`](../rules/self-transfer.md), [`time_window`](../rules/time-window.md), [`absence_of_event`](../rules/absence-of-event.md). Invalid params are rejected with `400` at create/update time.
 
+`GET /rule-types` returns the parameter schema the dashboard's rule builder renders. Each field has a `type` (`string`, `number`, `boolean`, `object`, or `select`), `required`, `description`, and, where applicable, `default` and `options`. A `boolean` field is a JSON boolean in `params`; the builder renders it as a true/false select and starts it at `default` when one is declared. `select` is reserved for genuine enumerations such as `comparison`, `direction`, `match`, and `op`.
+
 ## Monitor templates
 
 A template is a reusable monitor shape: a name, a list of rules whose params may

@@ -5,48 +5,53 @@ that talks to SoroBeacon itself rather than to a chat service, a mailbox or
 an endpoint of your own: the sending instance decides what matched, and the
 receiving instance is handed the result.
 
-## Status: the origin is still empty on the wire
+## Status
 
-One open bug stops an alert from arriving, and it is visible in the first
-delivery attempt:
+Federation delivers when the sending instance has `INSTANCE_NAME` set. The
+sender stamps that value as the `origin` on every alert; the receiving
+instance requires a non-empty origin and answers `201` when it accepts the
+payload.
 
-1. **The sender sends an empty `origin`**
-   ([#506](https://github.com/sorotrail/SoroBeacon/issues/506)). The
-   receiving instance requires an origin and answers
-   `400 {"error":"origin is required"}`.
+If `INSTANCE_NAME` is unset, creating a federation channel fails closed with
+an actionable error. The rest of the instance keeps running; only the
+federation channel is unavailable. This is deliberate: sending a payload with
+an empty origin would be rejected by the receiver on every attempt.
 
-So this page describes the configuration and the wire format, and says
-plainly what works and what does not. It is not a description of a feature
-you can rely on today.
-
-The second bug on this list used to be here: the receiver stored the alert
-against the sender's monitor and rule ids, which do not exist in its own
-database, so the insert failed and the receiver answered `404`
+A related receiver bug used to store the alert against the sender's monitor
+and rule ids, which do not exist in its own database, so the insert failed and
+the receiver answered `404`
 ([#526](https://github.com/sorotrail/SoroBeacon/issues/526)). The receiver now
 stores a federated alert as what it is — an alert from another instance,
 belonging to no local monitor and no local rule — and answers `201`.
 
 ## What works
 
-* The channel is created and its configuration is checked: a missing `url` or
-  `token` is a `400` at create time, not a failure at delivery time.
+* The channel is created and its configuration is checked: a missing `url`,
+  `token` or `INSTANCE_NAME` is a `400` at create time, not a failure at
+  delivery time.
+* The sender stamps `origin` with its `INSTANCE_NAME`, so the receiving
+  instance can attribute and loop-check the alert.
 * The sender builds the right request: `POST <url>/api/v1/ingest` with
   `Authorization: Bearer <token>` and the alert wrapped in the federated
   envelope.
-* The receiving instance authenticates the caller, enforces the hop limit
-  and stamps the alert with its origin, and refuses a payload that is not a
-  federated alert.
+* The receiving instance authenticates the caller, enforces the hop limit,
+  stores the sender's origin with the alert, and refuses a payload that is not
+  a federated alert.
 * The failure is visible: the delivery attempt is recorded, and the channel's
   health (`consecutive_failures`, `last_error`) says what the other instance
   answered.
 
 ## Setup
 
-1. On the **receiving** instance, take a token that may write alerts. An
+1. On the **sending** instance, set `INSTANCE_NAME` to a stable name that is
+   unique across the instances that federate with each other, for example
+   `beacon-a`, and restart the process. The value is stamped as the alert's
+   `origin`; changing it changes how the receiver attributes later alerts.
+2. On the **receiving** instance, take a token that may write alerts. An
    instance-wide `API_TOKEN` works; a scoped token needs the `alerts:write`
    scope (see [Authorization](../reference/authorization.md)). Give the sender
    its own token, not the operator's.
-2. On the **sending** instance, create the channel:
+3. On the **sending** instance, create the channel:
 
 ```sh
 curl -s -X POST localhost:8080/api/v1/channels -d '{
@@ -56,18 +61,15 @@ curl -s -X POST localhost:8080/api/v1/channels -d '{
 }'
 ```
 
-3. Verify — and read the answer, because today it is the bug report:
+4. Verify:
 
 ```sh
 curl -s -X POST localhost:8080/api/v1/channels/4/test
 ```
 
-A working federation answers `{"status":"sent"}`. Today it answers
-`502` with the receiving instance's complaint inside it:
-
-```json
-{"status":"failed","error":"federation: status 400: {\"code\":\"Bad Request\",\"error\":\"origin is required\",\"request_id\":\"…\"}"}
-```
+A working federation answers `{"status":"sent"}`. If it answers a `502`,
+read the receiving instance's error inside it; the troubleshooting table
+below maps the common ones.
 
 ## Config
 
@@ -102,7 +104,7 @@ in an envelope that carries the origin and the hop count:
     "payload": {"topics": ["transfer", "..."], "value": "..."},
     "created_at": "2026-07-21T09:41:32Z"
   },
-  "origin": "http://beacon-a.internal:8080",
+  "origin": "beacon-a",
   "hop_count": 1
 }
 ```
@@ -155,7 +157,7 @@ receiver's dashboard and API can tell where it came from:
 {
   "contract_id": "CA7QYNF7…",
   "_federated": true,
-  "_federation_origin": "http://beacon-a.internal:8080",
+  "_federation_origin": "beacon-a",
   "_federation_hops": 1,
   "_federation_monitor_id": 1,
   "_federation_rule_id": 3
@@ -167,23 +169,23 @@ receiver's dashboard and API can tell where it came from:
 `MaxHopCount` is 8 (`internal/notify/federation.go`). It exists so a chain
 of instances forwarding to each other terminates instead of amplifying an
 alert forever: the receiver refuses any alert whose `hop_count` has reached
-the limit, and `notify.ForwardFederatedAlert` refuses to send one.
+the limit.
 
 The counter does not move today. The sender always sends `hop_count: 1`, and
-nothing re-forwards a federated alert: `ForwardFederatedAlert` exists and is
-not called by the ingest path, so a received alert is stored and stops there.
-The limit is enforced on the receiving side and is ready for the forwarding
-that has not been built.
+nothing re-forwards a federated alert: a received alert is stored and stops
+there. The limit is enforced on the receiving side and is ready for the
+forwarding that has not been built.
 
 ## Troubleshooting
 
 | Symptom | What it means |
 | --- | --- |
 | `400 {"details":[{"field":"config","reason":"federation: token is required"}]}` at create time | The channel config is incomplete. `url` and `token` are both required. |
-| `502` with `federation: status 400: …"origin is required"` | The delivery reached the other instance and was refused: the sender's empty-origin bug ([#506](https://github.com/sorotrail/SoroBeacon/issues/506)). |
+| `400` with `federation: INSTANCE_NAME is required` at create time | Set `INSTANCE_NAME` on the sending instance and restart before creating the federation channel. |
+| `502` with `federation: INSTANCE_NAME is required` on an existing channel | The channel predates `INSTANCE_NAME`, or the process restarted without it. Set it and restart; the existing channel uses the new value on its next delivery. |
 | `502` with `federation: status 422: …` | The other instance could not store the alert: the payload violates one of its constraints. A 422 is permanent, so the delivery is dead-lettered rather than retried. |
 | `502` with a connection error | The other instance is not reachable at the `url` you configured, or it is behind TLS and the URL says `http://`. The path is `<url>/api/v1/ingest` — configure the base URL, not the full path. |
-| The channel's `consecutive_failures` climbs | Every attempt failed; `last_error` carries the other instance's answer, which is the fastest way to tell the two bugs apart. |
+| The channel's `consecutive_failures` climbs | Every attempt failed; `last_error` carries the other instance's answer, which is the fastest way to tell a transport problem from a payload problem. |
 
 The delivery attempt itself is on the sender:
 `GET /api/v1/alerts/{id}/deliveries` lists the attempts for the alert that

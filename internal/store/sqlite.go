@@ -99,6 +99,26 @@ func NewSQLite(ctx context.Context, databaseURL string) (*SQLite, error) {
 	return &SQLite{db: db}, nil
 }
 
+// NewSQLiteReadOnly opens an existing SQLite database without creating files
+// or allowing a statement through this handle to modify the database.
+func NewSQLiteReadOnly(ctx context.Context, databaseURL string) (*SQLite, error) {
+	dsn, err := sqliteReadOnlyDSN(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open(sqliteDriver, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite read-only: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite: %w", err)
+	}
+	return &SQLite{db: db}, nil
+}
+
 func (s *SQLite) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 func (s *SQLite) Close()                         { _ = s.db.Close() }
 
@@ -199,6 +219,18 @@ func sqliteDSN(databaseURL string) (string, error) {
 	q.Add("_pragma", "synchronous(NORMAL)")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Set("_txlock", "immediate")
+	return "file:" + path + "?" + q.Encode(), nil
+}
+
+func sqliteReadOnlyDSN(databaseURL string) (string, error) {
+	path, err := sqliteFilePath(databaseURL)
+	if err != nil {
+		return "", err
+	}
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "query_only(1)")
 	return "file:" + path + "?" + q.Encode(), nil
 }
 
@@ -1758,14 +1790,21 @@ func (s *SQLite) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
 	return err
 }
 
-// GetDeadLetter returns one dead-letter record by id.
+// GetDeadLetter returns one dead-letter record by id. dead_letters carries no
+// workspace_id of its own, so the tenant predicate reaches it through the
+// alert it belongs to; a caller without a tenant reads by id alone.
 func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
 	var d DeadLetter
 	var created string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
-		 FROM dead_letters WHERE id = ?`, id,
-	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created)
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE id = ?`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
+		args = append(args, ws)
+	}
+	err := s.db.QueryRowContext(ctx, q, args...).
+		Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &created)
 	if err != nil {
 		return nil, mapSQLiteErr(err)
 	}
@@ -1777,11 +1816,16 @@ func (s *SQLite) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, erro
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters.
+// optional channel, alert, and pagination filters. A tenant sees only records
+// whose alert belongs to it; the dispatcher's system context sees every row.
 func (s *SQLite) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
 		FROM dead_letters WHERE 1 = 1`
 	args := []any{}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ?)`
+		args = append(args, ws)
+	}
 	if f.ChannelID != 0 {
 		q += ` AND channel_id = ?`
 		args = append(args, f.ChannelID)
@@ -2359,6 +2403,35 @@ func (s *SQLite) RuleFiredWithin(ctx context.Context, ruleID int64, window time.
 		return false, mapSQLiteErr(err)
 	}
 	return fired != 0, nil
+}
+
+func (s *SQLite) ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	query := `SELECT created_at FROM alerts WHERE rule_id = ? AND created_at >= ?`
+	args := []any{ruleID, sqliteTimeString(since.UTC())}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		query += ` AND workspace_id = ?`
+		args = append(args, ws)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, mapSQLiteErr(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var times []time.Time
+	for rows.Next() {
+		var stored string
+		if err := rows.Scan(&stored); err != nil {
+			return nil, err
+		}
+		at, err := time.Parse(sqliteTimeLayout, stored)
+		if err != nil {
+			return nil, err
+		}
+		times = append(times, at)
+	}
+	return times, rows.Err()
 }
 
 func (s *SQLite) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {

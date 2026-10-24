@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -47,6 +48,18 @@ type PoolSettings struct {
 	// Nil records nothing, which is what tests pass and what an embedder with
 	// no instrumentation wants; every method is nil-safe, see internal/metrics.
 	Metrics *metrics.Metrics
+	// Log receives the degraded-state transitions. Nil uses the default
+	// logger.
+	Log *slog.Logger
+	// ConnectAttempts is how many times the store tries to reach the
+	// database at startup, the first attempt included. Zero means
+	// DefaultConnectAttempts. A managed database that is being restarted
+	// refuses connections for tens of seconds, and a process that gives up
+	// on the first refusal turns that pause into an outage.
+	ConnectAttempts int
+	// ConnectDelay is the base delay between those attempts; it doubles
+	// after every failure, with jitter. Zero means DefaultConnectDelay.
+	ConnectDelay time.Duration
 }
 
 // Postgres implements Store on top of a pgx connection pool.
@@ -64,6 +77,11 @@ type Postgres struct {
 	telemetry *telemetry.Provider
 	// metrics is optional instrumentation for routed reads; nil-safe.
 	metrics *metrics.Metrics
+	// health tracks whether the database is reachable and logs the
+	// transition into and out of that state once.
+	health *DatabaseHealth
+	// retry is the policy used for reads that failed transiently.
+	retry RetryPolicy
 }
 
 // WithTelemetry attaches tracing to the store's write paths. Only ids go
@@ -100,16 +118,45 @@ func NewPostgres(ctx context.Context, databaseURL string, settings PoolSettings)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
+	health := NewDatabaseHealth(settings.Log)
+	// The first ping is retried: the pool is lazy, so this is the first
+	// real connection, and a database that is still starting up is exactly
+	// the case the retry exists for. A refusal that is not transient (a
+	// wrong password, a missing database) is reported at once, because
+	// repeating it cannot help.
+	connectPolicy := ConnectPolicy(settings.ConnectAttempts, settings.ConnectDelay)
+	if err := connectPolicy.Do(ctx, func(ctx context.Context) error {
+		return pool.Ping(ctx)
+	}); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	p := &Postgres{pool: pool, metrics: settings.Metrics}
+	p := &Postgres{pool: pool, metrics: settings.Metrics, health: health, retry: ReadPolicy()}
 	if err := p.connectReplica(ctx, settings); err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return p, nil
+}
+
+// NewPostgresReadOnly opens a primary pool whose transactions default to
+// read-only. It intentionally does not open the optional replica pool because
+// preflight inspection uses only the primary database.
+func NewPostgresReadOnly(ctx context.Context, databaseURL string, settings PoolSettings) (*Postgres, error) {
+	cfg, err := buildPoolConfig(databaseURL, settings)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect postgres: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	return &Postgres{pool: pool}, nil
 }
 
 // buildPoolConfig parses databaseURL and overlays any non-zero pool
@@ -142,7 +189,59 @@ func buildPoolConfig(databaseURL string, settings PoolSettings) (*pgxpool.Config
 // out of rotation over a read replica, turning a degradable condition into an
 // outage. A replica that is failing shows up as
 // sorobeacon_store_replica_fallbacks_total instead.
-func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
+func (p *Postgres) Ping(ctx context.Context) error {
+	err := p.pool.Ping(ctx)
+	// The ping is the store's own view of the database, so it is where the
+	// degraded state is observed: an operator learns that the database is
+	// gone from the readiness probe's own dependency check.
+	p.observe(err)
+	return err
+}
+
+// Degraded reports whether the database was unreachable the last time the
+// store talked to it.
+//
+// It is deliberately not part of the Store interface: a backend that cannot
+// lose its database (the SQLite file) has nothing to report, and adding the
+// method to the interface would force every fake store in the tests to
+// answer for a condition that does not apply to them.
+func (p *Postgres) Degraded() bool { return p.health != nil && p.health.Degraded() }
+
+// DegradedSince reports when the database became unreachable, and whether it
+// is unreachable now.
+func (p *Postgres) DegradedSince() (time.Time, bool) {
+	if p.health == nil {
+		return time.Time{}, false
+	}
+	return p.health.DegradedSince()
+}
+
+// read runs a read-only operation, repeating it when the failure was
+// transient.
+//
+// Only reads are repeated. A write that failed may have been applied
+// before the connection broke, so repeating it can duplicate what it did —
+// the alert write carries its own dedup guard, but the general rule is that
+// the caller decides what a repeated write means.
+func (p *Postgres) read(ctx context.Context, fn func(context.Context) error) error {
+	return p.retry.Do(ctx, func(ctx context.Context) error {
+		err := fn(ctx)
+		// Every attempt is observed, so a database that goes away mid-read
+		// is reported even when the retry then succeeds.
+		p.observe(err)
+		return err
+	})
+}
+
+// observe hands the outcome of a database operation to the health tracker.
+// A store built without one — the tests that exercise routing — has no
+// database state to report.
+func (p *Postgres) observe(err error) {
+	if p.health == nil {
+		return
+	}
+	p.health.Observe(err)
+}
 
 // Close releases both pools. The replica goes first so a query cannot be
 // issued against a pool that is being torn down mid-shutdown.
@@ -241,31 +340,42 @@ func (p *Postgres) monitorChannelIDs(ctx context.Context, monitorID int64) ([]in
 // workspace's enabled monitors or monitors in a second tenant would silently
 // stop being polled.
 func (p *Postgres) ListMonitors(ctx context.Context, enabledOnly bool) ([]Monitor, error) {
-	q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE deleted_at IS NULL`
-	args := []any{}
-	ws, scoped := tenantWorkspace(ctx)
-	if scoped {
-		args = append(args, ws)
-		q += ` AND workspace_id = $1`
-	}
-	if enabledOnly {
-		q += ` AND enabled`
-	}
-	q += ` ORDER BY id`
-	rows, err := p.pool.Query(ctx, q, args...)
+	var out []Monitor
+	err := p.read(ctx, func(ctx context.Context) error {
+		q := `SELECT id, name, contract_ids, enabled, created_at, last_matched_at, priority, network, deleted_at FROM monitors WHERE deleted_at IS NULL`
+		args := []any{}
+		ws, scoped := tenantWorkspace(ctx)
+		if scoped {
+			args = append(args, ws)
+			q += ` AND workspace_id = $1`
+		}
+		if enabledOnly {
+			q += ` AND enabled`
+		}
+		q += ` ORDER BY id`
+		rows, err := p.pool.Query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var page []Monitor
+		for rows.Next() {
+			m, err := scanMonitor(rows)
+			if err != nil {
+				return err
+			}
+			page = append(page, *m)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []Monitor
-	for rows.Next() {
-		m, err := scanMonitor(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *m)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (p *Postgres) ListMonitorsPage(ctx context.Context, f ListFilter) ([]Monitor, error) {
@@ -862,31 +972,43 @@ func (p *Postgres) GetRule(ctx context.Context, id int64) (*Rule, error) {
 }
 
 func (p *Postgres) ListRules(ctx context.Context, monitorID int64, enabledOnly bool) ([]Rule, error) {
-	// The predicate is conditional because ListRules serves two callers with
-	// different scopes: the API (one workspace) and the poller's per-monitor
-	// rule loading, which runs under the cross-tenant system scope and would
-	// otherwise find no rules for a monitor outside the default workspace.
-	q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
-	         JOIN monitors m ON m.id = r.monitor_id
-	        WHERE r.monitor_id = $1`
-	args := []any{monitorID}
-	if ws, scoped := tenantWorkspace(ctx); scoped {
-		q += ` AND m.workspace_id = $2`
-		args = append(args, ws)
-	}
-	if enabledOnly {
-		q += ` AND r.enabled`
-	}
-	q += ` ORDER BY r.id`
-	rows, err := p.pool.Query(ctx, q, args...)
+	var out []Rule
+	err := p.read(ctx, func(ctx context.Context) error {
+		// The predicate is conditional because ListRules serves two callers with
+		// different scopes: the API (one workspace) and the poller's per-monitor
+		// rule loading, which runs under the cross-tenant system scope and would
+		// otherwise find no rules for a monitor outside the default workspace.
+		q := `SELECT r.id, r.monitor_id, r.type, r.params, r.enabled FROM rules r
+		         JOIN monitors m ON m.id = r.monitor_id
+		        WHERE r.monitor_id = $1`
+		args := []any{monitorID}
+		if ws, scoped := tenantWorkspace(ctx); scoped {
+			q += ` AND m.workspace_id = $2`
+			args = append(args, ws)
+		}
+		if enabledOnly {
+			q += ` AND r.enabled`
+		}
+		q += ` ORDER BY r.id`
+		rows, err := p.pool.Query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Rule, error) {
+			var r Rule
+			err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
+			return r, err
+		})
+		if err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (Rule, error) {
-		var r Rule
-		err := row.Scan(&r.ID, &r.MonitorID, &r.Type, &r.Params, &r.Enabled)
-		return r, err
-	})
+	return out, nil
 }
 
 func (p *Postgres) UpdateRule(ctx context.Context, r *Rule) error {
@@ -920,16 +1042,28 @@ func (p *Postgres) DeleteRule(ctx context.Context, id int64) error {
 // --- absence-of-event state ---
 
 func (p *Postgres) ListAbsenceState(ctx context.Context) ([]AbsenceState, error) {
-	rows, err := p.pool.Query(ctx,
-		`SELECT rule_id, event_name, last_seen_at FROM rule_absence_state`)
+	var out []AbsenceState
+	err := p.read(ctx, func(ctx context.Context) error {
+		rows, err := p.pool.Query(ctx,
+			`SELECT rule_id, event_name, last_seen_at FROM rule_absence_state`)
+		if err != nil {
+			return err
+		}
+		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (AbsenceState, error) {
+			var s AbsenceState
+			err := row.Scan(&s.RuleID, &s.EventName, &s.LastSeen)
+			return s, err
+		})
+		if err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (AbsenceState, error) {
-		var s AbsenceState
-		err := row.Scan(&s.RuleID, &s.EventName, &s.LastSeen)
-		return s, err
-	})
+	return out, nil
 }
 
 func (p *Postgres) RecordAbsenceSeen(ctx context.Context, ruleID int64, eventName string, at time.Time) error {
@@ -1644,13 +1778,20 @@ func (p *Postgres) CreateDeadLetter(ctx context.Context, d *DeadLetter) error {
 	).Scan(&d.ID, &d.CreatedAt))
 }
 
-// GetDeadLetter returns one dead-letter record by id.
+// GetDeadLetter returns one dead-letter record by id. dead_letters carries no
+// workspace_id of its own, so the tenant predicate reaches it through the
+// alert it belongs to; a caller without a tenant reads by id alone.
 func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, error) {
 	var d DeadLetter
-	err := p.pool.QueryRow(ctx,
-		`SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
-		 FROM dead_letters WHERE id = $1`, id,
-	).Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
+	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
+		FROM dead_letters WHERE id = $1`
+	args := []any{id}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = $2)`
+		args = append(args, ws)
+	}
+	err := p.pool.QueryRow(ctx, q, args...).
+		Scan(&d.ID, &d.AlertID, &d.ChannelID, &d.LastError, &d.AttemptCount, &d.LastStatus, &d.CreatedAt)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -1658,7 +1799,8 @@ func (p *Postgres) GetDeadLetter(ctx context.Context, id int64) (*DeadLetter, er
 }
 
 // ListDeadLetters returns dead-letter records in id order, applying the
-// optional channel, alert, and pagination filters.
+// optional channel, alert, and pagination filters. A tenant sees only records
+// whose alert belongs to it; the dispatcher's system context sees every row.
 func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]DeadLetter, error) {
 	q := `SELECT id, alert_id, channel_id, last_error, attempt_count, last_status, created_at
 		FROM dead_letters WHERE TRUE`
@@ -1668,6 +1810,9 @@ func (p *Postgres) ListDeadLetters(ctx context.Context, f DeadLetterFilter) ([]D
 		n++
 		args = append(args, v)
 		return fmt.Sprintf("$%d", n)
+	}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		q += ` AND EXISTS (SELECT 1 FROM alerts a WHERE a.id = dead_letters.alert_id AND a.workspace_id = ` + arg(ws) + `)`
 	}
 	if f.ChannelID != 0 {
 		q += ` AND channel_id = ` + arg(f.ChannelID)
@@ -1881,23 +2026,35 @@ func (p *Postgres) RecordLedgerHashes(ctx context.Context, network string, hashe
 }
 
 func (p *Postgres) LedgerHashes(ctx context.Context, network string, from, to uint32) ([]LedgerHash, error) {
-	query := `SELECT ledger, hash FROM network_ledger_hashes WHERE network = $1 AND ledger >= $2 AND ledger <= $3 ORDER BY ledger`
-	args := []any{network, int64(from), int64(to)}
-	if network == "" {
-		query = `SELECT ledger, hash FROM ledger_hashes WHERE ledger >= $1 AND ledger <= $2 ORDER BY ledger`
-		args = args[1:]
-	}
-	rows, err := p.pool.Query(ctx, query, args...)
+	var out []LedgerHash
+	err := p.read(ctx, func(ctx context.Context) error {
+		query := `SELECT ledger, hash FROM network_ledger_hashes WHERE network = $1 AND ledger >= $2 AND ledger <= $3 ORDER BY ledger`
+		args := []any{network, int64(from), int64(to)}
+		if network == "" {
+			query = `SELECT ledger, hash FROM ledger_hashes WHERE ledger >= $1 AND ledger <= $2 ORDER BY ledger`
+			args = args[1:]
+		}
+		rows, err := p.pool.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		page, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (LedgerHash, error) {
+			var h LedgerHash
+			var ledger int64
+			err := row.Scan(&ledger, &h.Hash)
+			h.Ledger = uint32(ledger)
+			return h, err
+		})
+		if err != nil {
+			return err
+		}
+		out = page
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (LedgerHash, error) {
-		var h LedgerHash
-		var ledger int64
-		err := row.Scan(&ledger, &h.Hash)
-		h.Ledger = uint32(ledger)
-		return h, err
-	})
+	return out, nil
 }
 
 func (p *Postgres) PruneLedgerHashes(ctx context.Context, network string, before uint32) error {
@@ -2163,6 +2320,31 @@ func (p *Postgres) RuleFiredWithin(ctx context.Context, ruleID int64, window tim
 		`SELECT EXISTS(SELECT 1 FROM alerts WHERE rule_id = $1 AND created_at >= $2)`,
 		ruleID, cutoff).Scan(&fired)
 	return fired, err
+}
+
+func (p *Postgres) ListRuleAlertTimes(ctx context.Context, ruleID int64, since time.Time) ([]time.Time, error) {
+	query := `SELECT created_at FROM alerts WHERE rule_id = $1 AND created_at >= $2`
+	args := []any{ruleID, since.UTC()}
+	if ws, scoped := tenantWorkspace(ctx); scoped {
+		query += ` AND workspace_id = $3`
+		args = append(args, ws)
+	}
+	query += ` ORDER BY created_at`
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var times []time.Time
+	for rows.Next() {
+		var at time.Time
+		if err := rows.Scan(&at); err != nil {
+			return nil, err
+		}
+		times = append(times, at)
+	}
+	return times, rows.Err()
 }
 
 func (p *Postgres) MarkAlertInhibited(ctx context.Context, alertID, sourceRuleID int64) error {

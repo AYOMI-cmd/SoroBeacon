@@ -63,6 +63,13 @@ func main() {
 		}
 		return
 	}
+	if len(args) > 0 && args[0] == "preflight" {
+		if err := runPreflightCLI(context.Background(), args[1:], os.Stdout); err != nil {
+			reportCLIError(os.Stderr, err)
+			os.Exit(exitCodeFor(err))
+		}
+		return
+	}
 	if len(args) > 0 {
 		switch args[0] {
 		case "backup":
@@ -77,6 +84,12 @@ func main() {
 				os.Exit(exitCodeFor(err))
 			}
 			return
+		}
+		// `sorobeacon validate` checks the configuration and exits with a
+		// code a deployment pipeline can branch on, so it is dispatched
+		// before the client: it talks to no instance and starts no server.
+		if ok, rest := validateRequested(args); ok {
+			os.Exit(runValidate(context.Background(), rest, os.Stdout))
 		}
 		if err := runCLI(context.Background(), args, os.Stdout); err != nil {
 			reportCLIError(os.Stderr, err)
@@ -95,7 +108,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	// The handler reads its minimum level through a LevelVar — an atomic
+	// under the hood — so a SIGHUP reload can raise verbosity on a running
+	// process without rebuilding the logger every goroutine already holds.
+	var level slog.LevelVar
+	level.Set(cfg.LogLevel)
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &level}))
 	slog.SetDefault(log)
 	log.LogAttrs(context.Background(), slog.LevelInfo, "configuration loaded", cfg.LogAttrs()...)
 
@@ -107,7 +125,62 @@ func run() error {
 		return err
 	}
 	defer srv.Close()
+
+	// SIGHUP means "reload the settings that can change at runtime", not
+	// "exit": shutdown keeps its SIGINT/SIGTERM from the NotifyContext above.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGHUP)
+	defer signal.Stop(sigs)
+	go reloadLoop(ctx, sigs, config.NewReloader(cfg), &level, srv.poller, log)
+
 	return srv.run(ctx)
+}
+
+// reloadLoop applies one reload per SIGHUP until ctx is cancelled. It is a
+// loop rather than a one-shot handler so a burst of signals is drained one
+// reload at a time instead of being collapsed by the signal coalescing a
+// channel-based Notify performs.
+func reloadLoop(ctx context.Context, sigs <-chan os.Signal, reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigs:
+			applyReload(reloader, level, p, log)
+		}
+	}
+}
+
+// applyReload runs one SIGHUP-triggered reload: re-read and validate the
+// configuration, then apply the settings that are safe to change at runtime
+// and log what changed, old value to new value. A rejected reload logs the
+// reasons and changes nothing — a bad reload must never leave the process
+// half-configured.
+func applyReload(reloader *config.Reloader, level *slog.LevelVar, p *poller.Poller, log *slog.Logger) {
+	changed, err := reloader.Reload()
+	if err != nil {
+		log.Error("configuration reload rejected", "err", err)
+		return
+	}
+	// The reload applied the reloadable settings to its own copy only after
+	// the whole configuration validated, so reading them back here cannot
+	// observe a half-applied reload. Consumers see the new values on their
+	// next read: the handler on its next record, the poller on its next
+	// cycle.
+	cfg := reloader.Current()
+	level.Set(cfg.LogLevel)
+	p.SetInterval(cfg.PollInterval)
+	for _, c := range changed.Applied {
+		log.Info("configuration reloaded", "setting", c.Setting, "old", c.Old, "new", c.New)
+	}
+	// Skipped settings did change but need a restart; saying so beats an
+	// operator sending SIGHUP repeatedly and wondering why nothing happened.
+	for _, c := range changed.Skipped {
+		log.Warn("reload skipped a changed setting; it takes effect after a restart", "setting", c.Setting, "old", c.Old, "new", c.New)
+	}
+	if len(changed.Applied) == 0 && len(changed.Skipped) == 0 {
+		log.Info("configuration reload: nothing changed")
+	}
 }
 
 // leaderLease is the part of lease.Lease the startup path drives: the loop
@@ -272,6 +345,17 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		shutdownTelemetry(log, tel)
 		return nil, err
 	}
+	stateCtx, cancelState := context.WithTimeout(ctx, startupNetworkTimeout)
+	currentMigration, latestMigration, dirtyMigration, err := store.MigrationState(stateCtx, cfg.DatabaseURL)
+	cancelState()
+	if err != nil {
+		shutdownTelemetry(log, tel)
+		return nil, fmt.Errorf("verify database migration state: %w", err)
+	}
+	if dirtyMigration || currentMigration != latestMigration {
+		shutdownTelemetry(log, tel)
+		return nil, fmt.Errorf("verify database migration state: current=%d latest=%d dirty=%t", currentMigration, latestMigration, dirtyMigration)
+	}
 	// Metrics are built before the store now, because the store labels every
 	// routed read with the pool that served it. Nothing else about the order
 	// changes: m is still the same instance the poller, the dispatcher and the
@@ -284,6 +368,12 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 		MaxConnIdleTime: cfg.DatabaseMaxConnIdleTime,
 		ReplicaURL:      cfg.ReplicaDatabaseURL,
 		Metrics:         m,
+		// The connection retry is bounded and jittered: a database that is
+		// mid-failover refuses connections for a while, and that pause must
+		// not become a crash loop.
+		Log:             log,
+		ConnectAttempts: cfg.DatabaseConnectAttempts,
+		ConnectDelay:    cfg.DatabaseConnectDelay,
 	}, configCipher)
 	if err != nil {
 		shutdownTelemetry(log, tel)
@@ -334,6 +424,13 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 	if pe, ok := st.(store.PartitionEnsurer); ok {
 		if err := pe.EnsureAlertPartitions(ctx, time.Now().UTC(), 3); err != nil {
 			return nil, err
+		}
+		checker, ok := st.(store.PartitionRunwayChecker)
+		if !ok {
+			return nil, errors.New("partition backend does not support runway checks")
+		}
+		if err := checker.CheckAlertPartitionRunway(ctx, time.Now().UTC(), 3); err != nil {
+			return nil, fmt.Errorf("verify alert partition runway: %w", err)
 		}
 	}
 
@@ -392,21 +489,48 @@ func newServer(ctx context.Context, cfg config.Config, log *slog.Logger, deps st
 			}
 			return records, nil
 		})))
-	factory := notify.DefaultFactory()
+	factory := notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName)
 	// External secrets: when a provider is configured, ${secret:...}
 	// references in channel configs resolve when a notifier is built. The
 	// stored config keeps the reference.
 	if resolver := buildSecretResolver(cfg, log); resolver != nil {
 		factory.WithSecrets(resolver)
 	}
+	validationCtx, cancelValidation := context.WithTimeout(ctx, startupNetworkTimeout)
+	channels, err := st.ListChannels(workspace.WithSystem(validationCtx), false)
+	if err != nil {
+		cancelValidation()
+		return nil, fmt.Errorf("validate channel configurations: %w", err)
+	}
+	var channelErrors []error
+	for _, channel := range channels {
+		if _, err := validateChannelConfiguration(validationCtx, factory, channel, cfg.SecretsProvider); err != nil {
+			channelErrors = append(channelErrors, fmt.Errorf("channel %d (%s): %s", channel.ID, channel.Type, redactPreflightError(err, channelConfigValues(channel.Config)...)))
+		}
+	}
+	cancelValidation()
+	if len(channelErrors) > 0 {
+		return nil, fmt.Errorf("validate channel configurations: %w", errors.Join(channelErrors...))
+	}
 	// Channel health: delivery outcomes are folded into each channel so a
 	// revoked token surfaces as a broken channel instead of as silence. The
 	// threshold is off unless the operator sets it — auto-disabling a channel
 	// is a destructive answer to a temporary problem.
 	dispatcher := notify.NewDispatcher(st, factory, log).
+		WithRateLimits(notify.RateLimits{
+			SlackRPS:     cfg.NotifyRateLimitSlackRPS,
+			TelegramRPS:  cfg.NotifyRateLimitTelegramRPS,
+			PagerDutyRPS: cfg.NotifyRateLimitPagerDutyRPS,
+			DefaultRPS:   cfg.NotifyRateLimitDefaultRPS,
+		}).
 		WithMetrics(m).
 		WithDigestQueue(st).
-		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures)
+		WithDisableAfterFailures(cfg.ChannelDisableAfterFailures).
+		WithFlapping(alerts.FlappingConfig{
+			Episodes:   cfg.FlappingEpisodes,
+			Window:     cfg.FlappingWindow,
+			QuietAfter: cfg.FlappingQuietAfter,
+		})
 	enricher, err := alerts.NewEnricher(cfg.AlertEnrichmentURL, cfg.AlertEnrichmentTimeout, cfg.AlertEnrichmentCacheTTL)
 	if err != nil {
 		return nil, err
@@ -837,7 +961,7 @@ func runBackfill(args []string) error {
 	}
 
 	registry := rules.NewRegistry()
-	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory(), log)
+	dispatcher := notify.NewDispatcher(st, notify.DefaultFactory().WithFederationOrigin(cfg.InstanceName), log)
 	ingestor := poller.NewIngestor(st, registry, dispatcher, log)
 	job := backfill.New(src, st, registry, ingestor, log)
 
@@ -914,6 +1038,7 @@ func verifyNetworkEndpoints(ctx context.Context, log *slog.Logger, client *stell
 	ctx, cancel := context.WithTimeout(ctx, startupNetworkTimeout)
 	defer cancel()
 
+	var mismatches []error
 	for _, ep := range client.Endpoints() {
 		net, err := ep.Client.GetNetwork(ctx)
 		if err != nil {
@@ -921,10 +1046,10 @@ func verifyNetworkEndpoints(ctx context.Context, log *slog.Logger, client *stell
 			continue
 		}
 		if err := config.VerifyPassphrase(configured, net.Passphrase); err != nil {
-			return fmt.Errorf("rpc endpoint %s: %w", ep.URL, err)
+			mismatches = append(mismatches, fmt.Errorf("rpc endpoint %s: %w", ep.URL, err))
 		}
 	}
-	return nil
+	return errors.Join(mismatches...)
 }
 
 // startupHealthTimeout bounds the one-off health check logged at startup,
