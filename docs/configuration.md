@@ -17,6 +17,40 @@ returned by the API, or pasted into a ticket.
 authoritative source. If this page and the code disagree, the code wins
 and this page should be updated.
 
+## Checking a configuration before deploying
+
+`config.Load` runs at startup, so a typo in a variable is found when the
+process starts — in a deployment pipeline, after the old version has already
+been stopped. `sorobeacon validate` runs the same checks without starting
+anything:
+
+```sh
+sorobeacon validate                      # syntax only, no network
+sorobeacon validate --connectivity       # also reach the database and the RPC
+sorobeacon validate --json               # machine-readable
+```
+
+Every problem is reported in one run, not just the first, so an operator
+fixing four typos does not need four runs. The exit code tells a pipeline
+which kind of problem it is:
+
+| Exit code | Meaning | Fixed by |
+| --- | --- | --- |
+| `0` | the configuration is valid | — |
+| `1` | the configuration is invalid | editing the environment or the config file |
+| `2` | a dependency named by the configuration could not be reached | waiting for the database, or fixing the network |
+
+The connectivity checks are opt-in because they make the command slow and
+network-dependent: a configuration that names a database on another host
+cannot be checked from a machine that cannot route to it. When they run,
+they also report the database's migration version (a database behind the
+binary's migrations is reported as a problem, not silently accepted) and
+whether the RPC endpoint serves the configured network.
+
+No secret is ever printed: not the database password, not an API token, not
+the config encryption key. Values are redacted on the way out, in every
+output mode.
+
 ## Secrets
 
 | Variable | Secret? | Notes |
@@ -29,6 +63,7 @@ and this page should be updated.
 | `NETWORK_PASSPHRASE` | no (public nets) | SDF passphrases are public. For `NETWORK=custom` it identifies a private network — treat it as operational config, not a credential. |
 | `VAULT_TOKEN` | **yes** | Credential for the Vault secret provider. Never logged; a resolved secret is never returned by the API. |
 | `RPC_URL` / `RPC_URLS` / `SOROTRAIL_URL` | maybe | A URL is not a password, but provider URLs sometimes embed tokens in the path or query. Do not commit those. |
+| `ALERT_ENRICHMENT_URL` | maybe | Off by default and not a credential itself, but the enrichment service's token often rides in the userinfo or query string. If yours does, treat it like `API_TOKEN`: mode `0600`, a secret manager in production, never in a log line or ticket. |
 | `CORS_ALLOWED_ORIGINS` | no | An allow-list, not a credential. Think hard before allowing a third-party origin: whatever credential that origin's users hold can act through their browser. |
 | everything else | no | |
 
@@ -390,6 +425,7 @@ strands its alert history outside every filter.
 | --- | --- | --- | --- | --- |
 | `HTTP_ADDR` | listen address | `:8080` | optional | Bind address for the API and dashboard (and `/metrics`). |
 | `CORS_ALLOWED_ORIGINS` | comma-separated origins | empty (CORS disabled) | optional | Browser Origins allowed to call the API cross-origin. Empty disables CORS. The dashboard is same-origin and never needs this. Do not allow origins you do not control: whatever credential their users hold can act through their browser. |
+| `GRPC_ADDR` | listen address | empty (gRPC disabled) | optional | Bind address for the [gRPC API](reference/grpc.md). Empty binds nothing, so an existing deployment opens no new port until it opts in. Cleartext HTTP/2 only — there is no TLS option — so anything that can reach the port reads the traffic in the clear; terminate TLS in front of it. |
 
 ## Polling
 
@@ -422,6 +458,30 @@ at `warn` and counted in `sorobeacon_reorgs_total`.
 | `ARCHIVE_URL` | URL or path | empty (archiving off) | optional | Where retention copies a batch of expired alerts before deleting them. A local directory path, `file://`, `dir://`, or `s3://bucket/prefix` (region from `?region=` or `AWS_REGION`; credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`; `?endpoint=` for MinIO or a test server). A failed archive blocks that batch's delete, so nothing is dropped un-archived. Requires `ALERT_RETENTION` to have any effect. Archive objects are NDJSON, one alert per line, keyed by the batch's own id range so re-running is idempotent. |
 
 Archive objects contain only alert rows (contract id, event, payload, ledger); channel `config` — the webhook URLs, bot tokens and SMTP credentials — is never read by the archiver and can never appear in one.
+
+## Flapping detection
+
+Flapping is derived from persisted alert times, grouped into episodes separated
+by a quiet period. Alert rows remain in history. When the threshold is reached,
+the second alert in an episode is delivered as a cumulative summary and later
+alerts in that episode are marked suppressed; a later episode is delivered
+normally when the threshold is no longer met.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `FLAPPING_EPISODES` | positive integer | `3` | optional | Number of episodes in the window that trigger damping. |
+| `FLAPPING_WINDOW` | Go duration | `15m` | optional | Window used to count alert episodes. |
+| `FLAPPING_QUIET_AFTER` | Go duration | `2m` | optional | Gap greater than this starts a new episode. |
+
+## Alert enrichment
+
+Optional HTTP JSON context fetched for an alert as it is created, before delivery. The full contract, failure behaviour, caching and an example service are in the [alert enrichment guide](guides/alert-enrichment.md); the variables:
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `ALERT_ENRICHMENT_URL` | absolute `http(s)` URL | empty (off) | optional | Endpoint called with `?contract_id=<id>&event_name=<name>` on every alert. Must be an absolute HTTP(S) URL; anything else fails at startup. The response must be a 2xx JSON object of at most 64 KiB; anything else is a soft failure and the alert is delivered unenriched. |
+| `ALERT_ENRICHMENT_TIMEOUT` | duration | `2s` | optional | Budget for one enrichment call. The client's whole-request timeout; `<= 0` falls back to the default. |
+| `ALERT_ENRICHMENT_CACHE_TTL` | duration | `5m` | optional | How long a response is reused per contract (in-memory, per process; the cache key is the contract id, not the event). `<= 0` falls back to the default. |
 
 ## Logging
 
@@ -462,6 +522,31 @@ export OTLP_ENDPOINT=http://localhost:4318
 # OTLP_SERVICE_NAME=sorobeacon-staging   # optional
 # OTLP_SAMPLE_RATE=0.25                  # keep a quarter of traces
 ```
+
+## Notification rate limits
+
+The dispatcher keeps one token bucket per channel, keyed by channel ID, so two
+channels of the same type do not share a budget. These variables change the
+per-type defaults; they do not limit the API or the dashboard.
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `NOTIFY_RATE_LIMIT_SLACK_RPS` | float | `1` | optional | Maximum Slack deliveries per second. The default follows Slack's webhook guidance of roughly one message per second. |
+| `NOTIFY_RATE_LIMIT_TELEGRAM_RPS` | float | `30` | optional | Maximum Telegram deliveries per second, matching the Bot API's 30 messages-per-second limit. |
+| `NOTIFY_RATE_LIMIT_PAGERDUTY_RPS` | float | `2` | optional | Maximum PagerDuty deliveries per second, matching the Events API v2 rate limit. |
+| `NOTIFY_RATE_LIMIT_DEFAULT_RPS` | float | `5` | optional | Fallback for channel types without a dedicated limit (Discord, email, webhook, and any future type). |
+
+Unset or `0` keeps the built-in default; zero does **not** disable delivery.
+Negative, non-numeric, NaN and infinite values fail startup. These are
+client-side buckets, not a promise that the provider accepts every request: a
+provider-side `429` is still possible and is retried using its `Retry-After`
+when one is present.
+
+## Federation
+
+| Variable | Type | Default | Required | What it does |
+| --- | --- | --- | --- | --- |
+| `INSTANCE_NAME` | string | empty | optional | Stable identity for this deployment, stamped as the `origin` on every federated alert. It must be unique across instances that federate with each other. Empty is fine for a standalone instance, but creating a `federation` channel then fails with an actionable error; the process still starts. |
 
 ## Channel health
 

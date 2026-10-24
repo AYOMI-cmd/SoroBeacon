@@ -50,8 +50,7 @@ func authTestConn(t *testing.T) *grpc.ClientConn {
 		_ = listener.Close()
 		s.srv.Stop()
 	})
-	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+	conn, err := grpc.NewClient("passthrough:///bufnet", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 		return listener.Dial()
 	}), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.ForceCodec(gobCodec{})))
 	require.NoError(t, err)

@@ -24,7 +24,7 @@ func TestHealthUpdate(sendErr error, at time.Time) store.ChannelHealthUpdate {
 		u.Success = true
 		return u
 	}
-	u.Error = sendErr.Error()
+	u.Error = sanitizeDeliveryError(redactURLError(sendErr)).Error()
 	u.Permanent = IsPermanent(sendErr)
 	return u
 }
@@ -77,6 +77,54 @@ func IsPermanent(err error) bool {
 func permanentStatus(code int) bool {
 	switch code {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
+	}
+	return false
+}
+
+// Retryable reports whether another delivery attempt could plausibly succeed.
+//
+// It is a different question from IsPermanent, and the difference matters. A
+// 400 is the receiver saying "this request is wrong": it says nothing about
+// the channel's health — it is our payload, not its credential — but sending
+// the same request again fails the same way. Retrying it three times buys
+// nothing and fills the delivery history with identical failures.
+//
+// The exception is the 4xx that asks the client to come back later: 408, 425
+// and 429 are the receiver saying "not now", and those are worth another
+// attempt. Everything else — a 5xx, a timeout, a transport error — is
+// transient as well.
+//
+// Anything unrecognised is retryable, deliberately: an unknown failure is
+// more likely to be a bad moment than a verdict.
+func Retryable(err error) bool {
+	if err == nil {
+		return true
+	}
+	// Both status-carrying error types have to be recognised, for the same
+	// reason IsPermanent recognises both: the shared request helpers return
+	// *StatusError and the channels that build their own return
+	// *HTTPStatusError.
+	var httpErr *HTTPStatusError
+	if errors.As(err, &httpErr) {
+		return retryableStatus(httpErr.StatusCode)
+	}
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) {
+		return retryableStatus(statusErr.Code)
+	}
+	return true
+}
+
+// retryableStatus reports whether an HTTP status leaves room for another
+// attempt. A 4xx that is not a "come back later" answer is the receiver
+// rejecting the request itself, and repeating it unchanged changes nothing.
+func retryableStatus(code int) bool {
+	if code < 400 || code > 499 {
+		return true
+	}
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
 		return true
 	}
 	return false
