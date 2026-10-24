@@ -38,6 +38,8 @@ func newTestSQLite(t *testing.T) conformanceStore {
 func (s *SQLite) resetConformance(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM delivery_attempts;
+		 DELETE FROM contract_ingest_cursors;
+		 DELETE FROM api_tokens;
 		 DELETE FROM audit_log;
 		 DELETE FROM pending_digests;
 		 DELETE FROM alerts;
@@ -63,6 +65,11 @@ func (s *SQLite) resetConformance(ctx context.Context) error {
 
 func (s *SQLite) setAlertCreatedAt(ctx context.Context, id int64, at time.Time) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE alerts SET created_at = ? WHERE id = ?`, sqliteTimeString(at), id)
+	return err
+}
+
+func (s *SQLite) setDeliveryAttemptAt(ctx context.Context, id int64, at time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE delivery_attempts SET attempted_at = ? WHERE id = ?`, sqliteTimeString(at), id)
 	return err
 }
 

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"time"
 
 	"google.golang.org/grpc"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/sorotrail/sorobeacon/internal/auth"
 	"github.com/sorotrail/sorobeacon/internal/store"
+	"github.com/sorotrail/sorobeacon/internal/workspace"
 )
 
 // Server implements the gRPC MonitorService alongside the existing REST API.
@@ -61,7 +63,15 @@ func (s *Server) Serve(ctx context.Context, addr string) error {
 	if err != nil {
 		return fmt.Errorf("grpc listen: %w", err)
 	}
-	s.log.Info("grpc server listening", "addr", addr)
+	return s.ServeListener(ctx, lis)
+}
+
+// ServeListener serves on an already-bound listener. Startup binds the
+// listener itself so a port conflict is a startup error and the caller can
+// report the address that was actually assigned (port zero). It blocks until
+// the server stops or ctx is cancelled.
+func (s *Server) ServeListener(ctx context.Context, lis net.Listener) error {
+	s.log.Info("grpc server listening", "addr", lis.Addr().String())
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.srv.Serve(lis) }()
@@ -83,39 +93,56 @@ func (s *Server) Stop() {
 // --- auth interceptors ---
 
 func (s *Server) authUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	if err := s.checkAuth(ctx); err != nil {
+	callerCtx, err := s.authContext(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return handler(ctx, req)
+	return handler(callerCtx, req)
 }
 
 func (s *Server) authStream(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-	if err := s.checkAuth(ss.Context()); err != nil {
+	callerCtx, err := s.authContext(ss.Context())
+	if err != nil {
 		return err
 	}
-	return handler(srv, ss)
+	return handler(srv, &authenticatedServerStream{ServerStream: ss, ctx: callerCtx})
 }
 
+type authenticatedServerStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *authenticatedServerStream) Context() context.Context { return s.ctx }
+
 func (s *Server) checkAuth(ctx context.Context) error {
+	_, err := s.authContext(ctx)
+	return err
+}
+
+func (s *Server) authContext(ctx context.Context) (context.Context, error) {
 	if s.auth == nil || !s.auth.Enabled() {
-		return nil
+		return workspace.With(ctx, workspace.Default), nil
 	}
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return status.Error(codes.Unauthenticated, "missing metadata")
+		return nil, status.Error(codes.Unauthenticated, "missing metadata")
 	}
 	vals := md.Get("authorization")
 	if len(vals) == 0 {
-		return status.Error(codes.Unauthenticated, "missing authorization metadata")
+		return nil, status.Error(codes.Unauthenticated, "missing authorization metadata")
 	}
 	token, ok := auth.Bearer(vals[0])
 	if !ok {
-		return status.Error(codes.Unauthenticated, "invalid authorization header")
+		return nil, status.Error(codes.Unauthenticated, "invalid authorization header")
 	}
-	if !s.auth.Verify(token) {
-		return status.Error(codes.Unauthenticated, "invalid token")
+	req := (&http.Request{Header: make(http.Header)}).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+token)
+	principal, ok := s.auth.Principal(req)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "invalid token")
 	}
-	return nil
+	return workspace.With(ctx, principal.Workspace), nil
 }
 
 // --- service interface ---
@@ -207,28 +234,46 @@ type StreamAlertsRequest struct {
 
 // --- handler wrappers ---
 
-func getMonitorHandler(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+func getMonitorHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 	req := &GetMonitorRequest{}
 	if err := dec(req); err != nil {
 		return nil, err
 	}
-	return srv.(MonitorServiceServer).GetMonitor(ctx, req)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(MonitorServiceServer).GetMonitor(ctx, req.(*GetMonitorRequest))
+	}
+	if interceptor == nil {
+		return handler(ctx, req)
+	}
+	return interceptor(ctx, req, &grpc.UnaryServerInfo{Server: srv, FullMethod: "/sorobeacon.v1.MonitorService/GetMonitor"}, handler)
 }
 
-func listMonitorsHandler(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+func listMonitorsHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 	req := &ListMonitorsRequest{}
 	if err := dec(req); err != nil {
 		return nil, err
 	}
-	return srv.(MonitorServiceServer).ListMonitors(ctx, req)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(MonitorServiceServer).ListMonitors(ctx, req.(*ListMonitorsRequest))
+	}
+	if interceptor == nil {
+		return handler(ctx, req)
+	}
+	return interceptor(ctx, req, &grpc.UnaryServerInfo{Server: srv, FullMethod: "/sorobeacon.v1.MonitorService/ListMonitors"}, handler)
 }
 
-func listAlertsHandler(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+func listAlertsHandler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
 	req := &ListAlertsRequest{}
 	if err := dec(req); err != nil {
 		return nil, err
 	}
-	return srv.(MonitorServiceServer).ListAlerts(ctx, req)
+	handler := func(ctx context.Context, req any) (any, error) {
+		return srv.(MonitorServiceServer).ListAlerts(ctx, req.(*ListAlertsRequest))
+	}
+	if interceptor == nil {
+		return handler(ctx, req)
+	}
+	return interceptor(ctx, req, &grpc.UnaryServerInfo{Server: srv, FullMethod: "/sorobeacon.v1.MonitorService/ListAlerts"}, handler)
 }
 
 type streamAlertsStream struct {

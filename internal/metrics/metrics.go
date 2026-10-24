@@ -48,6 +48,11 @@ type Metrics struct {
 	eventsScanned   *prometheus.CounterVec
 	eventsMatched   *prometheus.CounterVec
 	ruleEvaluations *prometheus.CounterVec
+	// Per-rule-type metrics (cardinality bounded by rule type names)
+	ruleEvalsTotal    *prometheus.CounterVec
+	ruleMatchesTotal  *prometheus.CounterVec
+	ruleErrorsTotal   *prometheus.CounterVec
+	ruleDuration      *prometheus.HistogramVec
 	alertsFired     *prometheus.CounterVec
 	deliveries      *prometheus.CounterVec
 	throttles       *prometheus.CounterVec
@@ -69,6 +74,7 @@ const networkLabel = "network"
 // in tests) never collide on the default registry.
 func New() *Metrics {
 	networks := []string{networkLabel}
+	ruleTypes := []string{networkLabel, "rule_type"}
 	m := &Metrics{
 		registry: prometheus.NewRegistry(),
 
@@ -122,6 +128,27 @@ func New() *Metrics {
 			Name: "sorobeacon_rule_evaluations_total",
 			Help: "Rule evaluations: each event checked against each of its monitor's enabled rules, by network.",
 		}, networks),
+
+		ruleEvalsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_evals_total",
+			Help: "Rule evaluations per rule type, by network.",
+		}, ruleTypes),
+
+		ruleMatchesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_matches_total",
+			Help: "Rule matches per rule type, by network.",
+		}, ruleTypes),
+
+		ruleErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sorobeacon_rule_errors_total",
+			Help: "Rule evaluation errors per rule type, by network.",
+		}, ruleTypes),
+
+		ruleDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "sorobeacon_rule_duration_seconds",
+			Help:    "Rule evaluation duration per rule type, by network.",
+			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+		}, ruleTypes),
 
 		alertsFired: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sorobeacon_alerts_fired_total",
@@ -187,7 +214,8 @@ func New() *Metrics {
 		m.eventsScanned, m.eventsMatched, m.ruleEvaluations, m.alertsFired, m.deliveries, m.throttles,
 		m.httpDuration, m.lastPollAgoSec, m.pollPriorityContracts, m.pollPriorityLag,
 		m.reorgsTotal, m.lastReorgLedger, m.breakerStates, m.pollPanics,
-		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters)
+		m.storeReads, m.storeFallbacks, m.replicaEnabled, m.deadLetters,
+		m.ruleEvalsTotal, m.ruleMatchesTotal, m.ruleErrorsTotal, m.ruleDuration)
 	return m
 }
 
@@ -318,6 +346,21 @@ func (m *Metrics) RecordRuleEvaluations(n int) {
 		return
 	}
 	m.ruleEvaluations.WithLabelValues(m.lv()...).Add(float64(n))
+}
+
+// RecordRuleEval records one rule evaluation for a specific rule type.
+func (m *Metrics) RecordRuleEval(ruleType string, matched bool, err error, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.ruleEvalsTotal.WithLabelValues(m.lv(ruleType)...).Inc()
+	if matched {
+		m.ruleMatchesTotal.WithLabelValues(m.lv(ruleType)...).Inc()
+	}
+	if err != nil {
+		m.ruleErrorsTotal.WithLabelValues(m.lv(ruleType)...).Inc()
+	}
+	m.ruleDuration.WithLabelValues(m.lv(ruleType)...).Observe(duration.Seconds())
 }
 
 // RecordAlert counts one alert fired.

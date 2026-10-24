@@ -19,10 +19,6 @@ import (
 // logic is the same code either way.
 const testInterval = 50 * time.Millisecond
 
-// testKey keeps the integration tests off the production lock key, so a
-// SoroBeacon left running by `make up` cannot hold the lock these tests need.
-const testKey int64 = 0x746573742D6C6561 // "test-lea"
-
 func uniqueTestKey(t *testing.T) int64 {
 	t.Helper()
 	var b [8]byte
@@ -86,10 +82,6 @@ type electionNode struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
-}
-
-func newNode(t *testing.T, name, url string) *electionNode {
-	return newNodeWithKey(t, name, url, testKey)
 }
 
 func newNodeWithKey(t *testing.T, name, url string, key int64) *electionNode {

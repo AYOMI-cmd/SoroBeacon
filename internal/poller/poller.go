@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -62,6 +63,10 @@ type Store interface {
 	CreateAlertGroup(ctx context.Context, key string, windowStart time.Time) (int64, error)
 	GetIngestState(ctx context.Context, network string) (store.IngestState, error)
 	SetIngestState(ctx context.Context, network string, s store.IngestState) error
+	ListContractCursors(ctx context.Context, network string) ([]store.ContractCursor, error)
+	InitializeContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error
+	AdvanceContractCursor(ctx context.Context, network, contractID string, lastLedger uint32) error
+	RewindContractCursors(ctx context.Context, network string, lastLedger uint32) error
 	// The absence-of-event rules need a clock that outlives the process: see
 	// SweepAbsence.
 	ListAbsenceState(ctx context.Context) ([]store.AbsenceState, error)
@@ -86,7 +91,12 @@ type Poller struct {
 	source   EventSource
 	store    Store
 	registry *rules.Registry
-	interval time.Duration
+	// interval is how long the loop waits between cycles, stored as atomic
+	// nanoseconds rather than a plain Duration. A SIGHUP configuration
+	// reload changes POLL_INTERVAL while Run is sleeping, so the loop's
+	// reads and a reload's write must not race; Interval and SetInterval
+	// are the only accessors.
+	interval atomic.Int64
 	log      *slog.Logger
 	// network is the chain this poller reads, and the key its ingest row,
 	// ledger hashes and metrics are written under. Empty is the legacy
@@ -136,6 +146,9 @@ type Poller struct {
 	knownNetworks []string
 	// warnedOrphans latches that warning so it cannot repeat.
 	warnedOrphans bool
+	// slowRuleThreshold is the duration after which a rule evaluation is
+	// considered slow and logged. Zero disables slow rule logging.
+	slowRuleThreshold time.Duration
 }
 
 // Position returns the last successful poll snapshot. Safe to call from
@@ -148,9 +161,19 @@ func (p *Poller) Position() Position {
 	return Position{}
 }
 
-// Interval returns the configured poll interval. Exposed for tests.
+// Interval returns the configured poll interval. Safe to call from another goroutine.
 func (p *Poller) Interval() time.Duration {
-	return p.interval
+	return time.Duration(p.interval.Load())
+}
+
+// SetInterval changes the wait between poll cycles on a running poller. It
+// is how a SIGHUP configuration reload applies a new POLL_INTERVAL without a
+// restart — and therefore without dropping the checkpoint the loop would
+// otherwise have to rebuild. Run re-reads the interval after every cycle, so
+// the new value takes effect on the next tick: not mid-wait, and not
+// retroactively in a backoff already under way.
+func (p *Poller) SetInterval(d time.Duration) {
+	p.interval.Store(int64(d))
 }
 
 func (p *Poller) recordPosition(processed, latest uint32, at time.Time) {
@@ -171,17 +194,20 @@ func (p *Poller) recordBackoff(backingOff bool) {
 // New wires a Poller. src is where events come from: NewRPCSource for a
 // Stellar RPC node, or the SoroTrail source for upstream mode.
 func New(src EventSource, st Store, reg *rules.Registry, d Dispatcher, interval time.Duration, log *slog.Logger) *Poller {
-	return &Poller{
+	p := &Poller{
 		source:   src,
 		store:    st,
 		registry: reg,
-		interval: interval,
 		log:      log,
 		now:      time.Now,
 		dispatch: d,
 		ing:      NewIngestor(st, reg, d, log),
 		sched:    NewScheduler(),
 	}
+	// Written through the same atomic SetInterval uses, so construction and
+	// a later reload can never disagree about which value is live.
+	p.interval.Store(int64(interval))
+	return p
 }
 
 // WithMetrics attaches Prometheus instrumentation to the poll loop, labelled
@@ -258,11 +284,18 @@ func (p *Poller) WithReorg(window, depth uint32) *Poller {
 	return p
 }
 
+// WithSlowRuleThreshold sets the duration after which a rule evaluation is
+// considered slow and logged at warn level. Zero disables slow rule logging.
+func (p *Poller) WithSlowRuleThreshold(d time.Duration) *Poller {
+	p.slowRuleThreshold = d
+	return p
+}
+
 // Run polls until ctx is cancelled. RPC errors back off exponentially
 // (capped at 10x the poll interval) instead of hammering the node.
 func (p *Poller) Run(ctx context.Context) {
-	p.log.Info("poller started", "interval", p.interval)
-	delay := p.interval
+	p.log.Info("poller started", "interval", p.Interval())
+	delay := p.Interval()
 	for {
 		select {
 		case <-ctx.Done():
@@ -279,12 +312,12 @@ func (p *Poller) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				continue
 			}
-			delay = min(delay*2, 10*p.interval)
+			delay = min(delay*2, 10*p.Interval())
 			p.recordBackoff(true)
 			p.log.Error("poll failed", "err", err, "retry_in", delay)
 			continue
 		}
-		delay = p.interval
+		delay = p.Interval()
 		p.recordBackoff(false)
 
 		// The absence sweep rides the same tick, but only after a cycle that
@@ -450,17 +483,17 @@ func (p *Poller) Poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	startLedger := state.LastLedger + 1
-	if state.LastLedger == 0 {
-		// Cold start against an RPC source: the node only retains ~1-7
-		// days of events, so begin at the current tip. Upstream sources
-		// (SoroTrail) hold durable history and answer the same query.
+	coldStart := state.LastLedger == 0
+	coldStartLedger := uint32(0)
+	if coldStart {
+		// Cold start against an RPC source begins at the node's tip, preserving
+		// the existing behavior for contracts that have no global checkpoint.
 		latest, err := p.source.LatestLedger(ctx)
 		if err != nil {
 			return err
 		}
-		startLedger = latest
-		p.log.Info("cold start", "start_ledger", startLedger)
+		coldStartLedger = latest
+		p.log.Info("cold start", "start_ledger", latest)
 	}
 
 	// Detect a reorganisation before ingesting, so alerts derived from the
@@ -469,15 +502,53 @@ func (p *Poller) Poll(ctx context.Context) error {
 	// new chain is re-read even though the old one had advanced past it.
 	if divergence, err := p.detectReorg(ctx); err != nil {
 		p.log.Warn("reorg check failed", "err", err)
-	} else if divergence != 0 && divergence-1 < state.LastLedger {
-		state.LastLedger = divergence - 1
-		state.LastCursor = ""
-		if err := p.store.SetIngestState(ctx, p.network, state); err != nil {
+	} else if divergence != 0 {
+		if divergence-1 < state.LastLedger {
+			state.LastLedger = divergence - 1
+			state.LastCursor = ""
+			if err := p.store.SetIngestState(ctx, p.network, state); err != nil {
+				return err
+			}
+			p.log.Warn("rewinding checkpoint after reorg", "start_ledger", state.LastLedger+1)
+		}
+		if err := p.store.RewindContractCursors(ctx, p.network, divergence-1); err != nil {
 			return err
 		}
-		startLedger = state.LastLedger + 1
-		p.log.Warn("rewinding checkpoint after reorg", "start_ledger", startLedger)
 	}
+
+	storedCursors, err := p.store.ListContractCursors(ctx, p.network)
+	if err != nil {
+		return err
+	}
+	cursorByContract := make(map[string]uint32, len(storedCursors))
+	for _, cursor := range storedCursors {
+		cursorByContract[cursor.ContractID] = cursor.LastLedger
+	}
+	contractsByStart := make(map[uint32][]string)
+	contractSetByStart := make(map[uint32]map[string]bool)
+	watchByStart := make(map[uint32][]Watch)
+	starts := make([]uint32, 0)
+	for _, w := range watch {
+		lastLedger, exists := cursorByContract[w.ContractID]
+		if !exists {
+			lastLedger = state.LastLedger
+			if coldStart && state.LastLedger == 0 && coldStartLedger > 0 {
+				lastLedger = coldStartLedger - 1
+			}
+			if err := p.store.InitializeContractCursor(ctx, p.network, w.ContractID, lastLedger); err != nil {
+				return err
+			}
+		}
+		contractStart := lastLedger + 1
+		if _, ok := contractSetByStart[contractStart]; !ok {
+			contractSetByStart[contractStart] = make(map[string]bool)
+			starts = append(starts, contractStart)
+		}
+		contractSetByStart[contractStart][w.ContractID] = true
+		contractsByStart[contractStart] = append(contractsByStart[contractStart], w.ContractID)
+		watchByStart[contractStart] = append(watchByStart[contractStart], w)
+	}
+	sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
 
 	// Confirmation depth: hold events until they are `confirmDepth` ledgers
 	// behind the tip. Unconfirmed events are simply not evaluated now; the
@@ -494,63 +565,84 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 	}
 
-	// Page the source until it reports no more events for the cycle. The
-	// cursor is opaque; batching (the RPC caps filters per request) is the
-	// source's concern, encoded in its cursors.
+	// Page each compatible start position independently. The source still
+	// batches contracts that share a boundary, while one stalled contract
+	// cannot hold another contract's durable cursor back.
 	checkpoint := uint32(0) // min latestLedger across pages
 	tip := uint32(0)        // max latestLedger across pages
 	// tierLedger records the highest ledger at which an event was seen for
 	// each tier, so per-tier lag reflects how stale the newest data that tier
 	// has produced is. A tier with no events falls back to the checkpoint.
 	tierLedger := map[store.Priority]uint32{}
-	cursor := ""
-	for {
-		// One span per page covers both halves of the fetch: the RPC call
-		// (or indexer request) and the local decode of what came back. That
-		// is the "RPC fetch" stage of the slow-alert question; decode time
-		// is inside it by design, since the source owns decoding. The span
-		// ends before handleEvent so pages stay siblings under the cycle
-		// span — otherwise page two would parent to page one.
-		fetchCtx := ctx
-		// NoopSpan keeps the error/End calls below uniform when tracing is
-		// off — a nil interface would panic on End.
-		fetchSpan := telemetry.NoopSpan()
-		if p.telemetry != nil {
-			fetchCtx, fetchSpan = p.telemetry.WithRequestID(ctx, "poller.fetch_events",
-				trace.WithAttributes(
-					attribute.Int(telemetry.AttrStartLedger, int(startLedger)),
-					attribute.Int(telemetry.AttrContractsWatched, len(contracts)),
-				),
-			)
-		}
-		page, err := p.source.FetchEvents(fetchCtx, startLedger, watch, cursor, stellar.DefaultEventsLimit)
-		if err != nil {
-			telemetry.RecordError(fetchSpan, err)
+	for _, groupStart := range starts {
+		groupCheckpoint := uint32(0)
+		failedLedger := make(map[string]uint32)
+		cursor := ""
+		for {
+			fetchCtx := ctx
+			fetchSpan := telemetry.NoopSpan()
+			if p.telemetry != nil {
+				fetchCtx, fetchSpan = p.telemetry.WithRequestID(ctx, "poller.fetch_events",
+					trace.WithAttributes(
+						attribute.Int(telemetry.AttrStartLedger, int(groupStart)),
+						attribute.Int(telemetry.AttrContractsWatched, len(watchByStart[groupStart])),
+					),
+				)
+			}
+			page, err := p.source.FetchEvents(fetchCtx, groupStart, watchByStart[groupStart], cursor, stellar.DefaultEventsLimit)
+			if err != nil {
+				telemetry.RecordError(fetchSpan, err)
+				fetchSpan.End()
+				return err
+			}
 			fetchSpan.End()
-			return err
-		}
-		fetchSpan.End()
 
-		if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
-			checkpoint = page.LatestLedger
-		}
-		if page.LatestLedger > tip {
-			tip = page.LatestLedger
-		}
-		p.scanned += len(page.Events)
-		for _, ev := range page.Events {
-			if confirmActive && ev.Ledger > confirmedThrough {
-				continue // not yet buried deep enough; re-read once it is
+			if page.LatestLedger > 0 && (groupCheckpoint == 0 || page.LatestLedger < groupCheckpoint) {
+				groupCheckpoint = page.LatestLedger
 			}
-			if pr, ok := prioByContract[ev.ContractID]; ok && ev.Ledger > tierLedger[pr] {
-				tierLedger[pr] = ev.Ledger
+			if page.LatestLedger > 0 && (checkpoint == 0 || page.LatestLedger < checkpoint) {
+				checkpoint = page.LatestLedger
 			}
-			p.handleEvent(ctx, ev, byContract)
+			if page.LatestLedger > tip {
+				tip = page.LatestLedger
+			}
+			p.scanned += len(page.Events)
+			for _, ev := range page.Events {
+				if !contractSetByStart[groupStart][ev.ContractID] || (confirmActive && ev.Ledger > confirmedThrough) {
+					continue
+				}
+				if pr, ok := prioByContract[ev.ContractID]; ok && ev.Ledger > tierLedger[pr] {
+					tierLedger[pr] = ev.Ledger
+				}
+				if !p.handleEvent(ctx, ev, byContract) {
+					if prior, ok := failedLedger[ev.ContractID]; !ok || ev.Ledger < prior {
+						failedLedger[ev.ContractID] = ev.Ledger
+					}
+				}
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			cursor = page.NextCursor
 		}
-		if page.NextCursor == "" {
-			break
+
+		if confirmActive && groupCheckpoint > confirmedThrough {
+			groupCheckpoint = confirmedThrough
 		}
-		cursor = page.NextCursor
+		for _, contractID := range contractsByStart[groupStart] {
+			processed := groupCheckpoint
+			if processed == 0 {
+				continue
+			}
+			if failed, ok := failedLedger[contractID]; ok && failed <= processed {
+				processed = failed - 1
+				p.log.Warn("holding contract cursor before failed event",
+					"contract_id", contractID, "ledger", failed)
+			}
+			if err := p.store.AdvanceContractCursor(ctx, p.network, contractID, processed); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Lag: how far the checkpoint we reached trails the node's own tip.
@@ -593,16 +685,18 @@ func (p *Poller) Poll(ctx context.Context) error {
 // handleEvent runs every enabled rule of every monitor watching the event's
 // contract. Events arrive already decoded from the source; the shared
 // Ingestor owns evaluation, alert persistence and dispatch.
-func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent, byContract map[string][]store.Monitor) {
+func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent, byContract map[string][]store.Monitor) bool {
 	monitors, watched := byContract[decoded.ContractID]
 	if !watched {
-		return
+		return true
 	}
 
+	processed := true
 	for _, m := range monitors {
 		ruleList, err := p.store.ListRules(ctx, m.ID, true)
 		if err != nil {
 			p.log.Error("list rules", "monitor_id", m.ID, "err", err)
+			processed = false
 			continue
 		}
 		for _, rule := range ruleList {
@@ -610,16 +704,24 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 			// the sweep; evaluating it here would be asking the wrong
 			// question (and, for a rule with no event to see, always "no").
 			if abs, ok := p.registry.Absence(rule.Type); ok {
-				p.observeAbsence(ctx, rule, abs, decoded)
+				if !p.observeAbsence(ctx, rule, abs, decoded) {
+					processed = false
+				}
 				continue
 			}
 			// The rule id rides in the context so a stateful evaluator (the
 			// frequency rule) can key its per-rule state.
 			p.evaluations++
 			ruleCtx := rules.WithRuleID(ctx, rule.ID)
+			start := time.Now()
 			matched, err := p.registry.Evaluate(ruleCtx, rule.Type, decoded, rule.Params)
+			duration := time.Since(start)
+			if p.metrics != nil {
+				p.metrics.RecordRuleEval(rule.Type, matched, err, duration)
+			}
 			if err != nil {
 				p.log.Warn("rule evaluation failed", "rule_id", rule.ID, "event_id", decoded.ID, "err", err)
+				processed = false
 				continue
 			}
 			if matched {
@@ -631,10 +733,13 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 				if id := p.registry.AlertEventID(ruleCtx, rule.Type, decoded, rule.Params); id != "" {
 					eventID = id
 				}
-				p.fireAlert(ctx, m, rule, decoded, eventID)
+				if !p.fireAlert(ctx, m, rule, decoded, eventID) {
+					processed = false
+				}
 			}
 		}
 	}
+	return processed
 }
 
 // fireAlert persists a deduped, cooldown-gated alert and hands it to the
@@ -646,7 +751,7 @@ func (p *Poller) handleEvent(ctx context.Context, decoded *stellar.DecodedEvent,
 // span becomes a child of this alert's span — never a root. That parent
 // chain is what ties one alert's full path into one timeline, and the
 // poller test pins it.
-func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule, ev *stellar.DecodedEvent, eventID string) {
+func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule, ev *stellar.DecodedEvent, eventID string) bool {
 	if p.telemetry != nil {
 		var span trace.Span
 		ctx, span = p.telemetry.WithRequestID(ctx, "poller.create_alert",
@@ -676,7 +781,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 	payload, err := json.Marshal(body)
 	if err != nil {
 		p.log.Error("marshal alert payload", "event_id", ev.ID, "err", err)
-		return
+		return false
 	}
 
 	alert := &store.Alert{
@@ -692,17 +797,17 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 	outcome, err := p.store.CreateAlert(ctx, alert)
 	if err != nil {
 		p.log.Error("create alert", "rule_id", rule.ID, "event_id", ev.ID, "err", err)
-		return
+		return false
 	}
 	switch outcome {
 	case store.AlertDuplicate:
-		return // dedup: this rule already fired for this event
+		return true // dedup: this rule already fired for this event
 	case store.AlertSuppressed:
 		// Counted by the store; logged so an operator can see the rule is
 		// firing far more often than it is alerting.
 		p.log.Info("alert suppressed by cooldown",
 			"rule_id", rule.ID, "event_id", ev.ID, "cooldown", alert.Cooldown)
-		return
+		return true
 	}
 	logAttrs := []any{"alert_id", alert.ID, "monitor", m.Name, "rule_id", rule.ID, "event_id", ev.ID}
 	if alert.SuppressedSinceLast > 0 {
@@ -747,6 +852,7 @@ func (p *Poller) fireAlert(ctx context.Context, m store.Monitor, rule store.Rule
 		WindowStart: time.Time{},
 		WindowEnd:   time.Time{},
 	})
+	return true
 }
 
 // --- absence-of-event rules ---
@@ -841,18 +947,20 @@ func (p *Poller) SweepAbsence(ctx context.Context, now time.Time) error {
 // the sweep compares it with wall clock, and upstream mode (SOURCE_MODE=
 // sorotrail) never populates LedgerClosedAt, so the measurement must not
 // depend on which event source is wired.
-func (p *Poller) observeAbsence(ctx context.Context, rule store.Rule, abs rules.AbsenceEvaluator, ev *stellar.DecodedEvent) {
+func (p *Poller) observeAbsence(ctx context.Context, rule store.Rule, abs rules.AbsenceEvaluator, ev *stellar.DecodedEvent) bool {
 	spec, err := abs.Spec(rule.Params)
 	if err != nil {
 		p.log.Warn("absence rule has unusable params", "rule_id", rule.ID, "err", err)
-		return
+		return false
 	}
 	if !abs.Matches(ev, spec) {
-		return
+		return true
 	}
 	if err := p.store.RecordAbsenceSeen(ctx, rule.ID, spec.EventName, p.now()); err != nil {
 		p.log.Error("record absence seen", "rule_id", rule.ID, "event_name", spec.EventName, "err", err)
+		return false
 	}
+	return true
 }
 
 // fireAbsence persists one absence alert and hands it to the dispatcher.

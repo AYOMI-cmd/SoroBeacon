@@ -52,6 +52,13 @@ func (emptyStore) ListMonitorsPage(context.Context, store.ListFilter) ([]store.M
 func (emptyStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
 	return nil, nil
 }
+
+// The default is the "no attempts in the window" result, so every page test
+// that does not care about delivery health renders the neutral column without
+// a nil-interface panic; tests that do care override it.
+func (emptyStore) GetChannelDeliveryStats(context.Context, int64, time.Time) (store.ChannelDeliveryStats, error) {
+	return store.ChannelDeliveryStats{}, nil
+}
 func (emptyStore) ListSavedSearches(context.Context) ([]store.SavedSearch, error) { return nil, nil }
 func (emptyStore) CreateSavedSearch(context.Context, *store.SavedSearch) error    { return nil }
 func (emptyStore) GetSavedSearch(context.Context, int64) (*store.SavedSearch, error) {
@@ -178,6 +185,114 @@ func TestDeleteChannelConfirmationRejectsStaleAttachmentCount(t *testing.T) {
 	}
 	if st.deleted {
 		t.Fatal("channel deleted using stale attachment count")
+	}
+}
+
+type editChannelStore struct {
+	emptyStore
+	channel store.Channel
+	updated *store.Channel
+}
+
+func (s *editChannelStore) GetChannel(context.Context, int64) (*store.Channel, error) {
+	return &s.channel, nil
+}
+
+func (s *editChannelStore) ListChannelsPage(context.Context, store.ListFilter) ([]store.Channel, error) {
+	return []store.Channel{s.channel}, nil
+}
+
+func (s *editChannelStore) UpdateChannel(_ context.Context, ch *store.Channel) error {
+	s.updated = &store.Channel{ID: ch.ID, Name: ch.Name, Type: ch.Type, Config: append([]byte(nil), ch.Config...), Enabled: ch.Enabled}
+	return nil
+}
+
+func TestChannelsListShowsEditAction(t *testing.T) {
+	st := &editChannelStore{channel: store.Channel{ID: 7, Name: "webhook", Type: "webhook", Enabled: true}}
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	res, err := http.Get(srv.URL + "/channels")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /channels = %d, body=%s", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "/channels/7/edit") {
+		t.Fatalf("expected edit link in channel list, got:\n%s", body)
+	}
+}
+
+func TestEditChannelBlankConfigPreservesExistingConfig(t *testing.T) {
+	original := []byte(`{"url":"https://example.com","secret":"old-secret"}`)
+	st := &editChannelStore{channel: store.Channel{ID: 7, Name: "webhook", Type: "webhook", Config: original}}
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := client.PostForm(srv.URL+"/channels/7", url.Values{"name": {"webhook-renamed"}, "type": {"webhook"}, "config": {""}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST /channels/7 = %d, want redirect", res.StatusCode)
+	}
+	if st.updated == nil {
+		t.Fatal("expected update to persist")
+	}
+	if got := string(st.updated.Config); got != string(original) {
+		t.Fatalf("blank config should preserve the original config; got %s", got)
+	}
+	if st.updated.Name != "webhook-renamed" {
+		t.Fatalf("expected updated name to persist, got %s", st.updated.Name)
+	}
+}
+
+func TestEditChannelRejectsInvalidConfigAndLeavesChannelUntouched(t *testing.T) {
+	st := &editChannelStore{channel: store.Channel{ID: 7, Name: "webhook", Type: "webhook", Config: []byte(`{"url":"https://example.com","secret":"old-secret"}`)}}
+	s, err := New(st, rules.NewRegistry(), notify.DefaultFactory(), slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(s.Routes())
+	defer srv.Close()
+
+	form := url.Values{"name": {"webhook"}, "type": {"webhook"}, "config": {`{"url":"https://example.com","secret":""}`}}
+	res, err := http.PostForm(srv.URL+"/channels/7", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST /channels/7 = %d, body=%s", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "webhook: secret is required") {
+		t.Fatalf("expected invalid-config error in response, got:\n%s", body)
+	}
+	if st.updated != nil {
+		t.Fatalf("channel updated despite invalid config: %+v", st.updated)
+	}
+	if got := string(st.channel.Config); got != `{"url":"https://example.com","secret":"old-secret"}` {
+		t.Fatalf("channel config was mutated: %s", got)
 	}
 }
 

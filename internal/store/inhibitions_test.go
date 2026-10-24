@@ -29,9 +29,9 @@ func testInhibitionStore(t *testing.T, st conformanceStore) {
 	t.Helper()
 	ctx := context.Background()
 
-	setup := func(t *testing.T) (sourceID, targetID, alertID int64) {
+	setup := func(t *testing.T, name string) (sourceID, targetID, alertID int64) {
 		t.Helper()
-		m := &Monitor{Name: "inhib", ContractIDs: []string{"CABC"}, Enabled: true}
+		m := &Monitor{Name: name, ContractIDs: []string{"CABC"}, Enabled: true}
 		require.NoError(t, st.CreateMonitor(ctx, m))
 		source := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: []byte(`{"event_name":"transfer"}`), Enabled: true}
 		target := &Rule{MonitorID: m.ID, Type: "event_emitted", Params: []byte(`{"event_name":"mint"}`), Enabled: true}
@@ -48,7 +48,7 @@ func testInhibitionStore(t *testing.T, st conformanceStore) {
 	}
 
 	t.Run("CreateListDelete", func(t *testing.T) {
-		sourceID, targetID, _ := setup(t)
+		sourceID, targetID, _ := setup(t, "inhib-create")
 		in := &Inhibition{SourceRuleID: sourceID, TargetRuleID: targetID, FiringWindowSeconds: 60}
 		require.NoError(t, st.CreateInhibition(ctx, in))
 		require.False(t, in.CreatedAt.IsZero())
@@ -71,7 +71,7 @@ func testInhibitionStore(t *testing.T, st conformanceStore) {
 	})
 
 	t.Run("DefaultWindow", func(t *testing.T) {
-		sourceID, targetID, _ := setup(t)
+		sourceID, targetID, _ := setup(t, "inhib-default")
 		in := &Inhibition{SourceRuleID: sourceID, TargetRuleID: targetID}
 		require.NoError(t, st.CreateInhibition(ctx, in))
 		require.Equal(t, DefaultInhibitionWindowSeconds, in.FiringWindowSeconds)
@@ -79,7 +79,7 @@ func testInhibitionStore(t *testing.T, st conformanceStore) {
 	})
 
 	t.Run("DuplicateAndMissingRule", func(t *testing.T) {
-		sourceID, targetID, _ := setup(t)
+		sourceID, targetID, _ := setup(t, "inhib-dup")
 		require.NoError(t, st.CreateInhibition(ctx,
 			&Inhibition{SourceRuleID: sourceID, TargetRuleID: targetID}))
 		// Same pair twice violates the primary key.
@@ -92,7 +92,7 @@ func testInhibitionStore(t *testing.T, st conformanceStore) {
 	})
 
 	t.Run("FiringSignalAndSuppressionMark", func(t *testing.T) {
-		sourceID, targetID, alertID := setup(t)
+		sourceID, targetID, alertID := setup(t, "inhib-fire")
 
 		fired, err := st.RuleFiredWithin(ctx, sourceID, time.Minute)
 		require.NoError(t, err)
@@ -101,6 +101,14 @@ func testInhibitionStore(t *testing.T, st conformanceStore) {
 		fired, err = st.RuleFiredWithin(ctx, targetID, time.Minute)
 		require.NoError(t, err)
 		require.False(t, fired, "the target produced nothing")
+
+		times, err := st.ListRuleAlertTimes(ctx, sourceID, time.Now().Add(-time.Hour))
+		require.NoError(t, err)
+		require.Len(t, times, 1)
+		require.False(t, times[0].IsZero())
+		times, err = st.ListRuleAlertTimes(ctx, sourceID, time.Now().Add(time.Second))
+		require.NoError(t, err)
+		require.Empty(t, times, "alerts before since are excluded")
 
 		require.NoError(t, st.MarkAlertInhibited(ctx, alertID, sourceID))
 		got, err := st.GetAlert(ctx, alertID)
