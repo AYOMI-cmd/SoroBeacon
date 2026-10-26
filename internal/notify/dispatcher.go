@@ -102,8 +102,8 @@ type Dispatcher struct {
 	// digest is optional. When attached, channels with digest mode
 	// "window" accumulate alerts here and a summary is flushed once the
 	// window elapses.
-		deliveriesInFlight int
-	digest store.DigestQueue
+	deliveriesInFlight int
+	digest             store.DigestQueue
 	// disableAfterFailures is how many consecutive permanent failures
 	// auto-disable a channel. Zero — the default — never auto-disables:
 	// silently switching off someone's alerting because a webhook 404'd
@@ -910,4 +910,3 @@ func (d *Dispatcher) Shutdown(ctx context.Context, gracePeriod time.Duration) er
 	d.log.Info("shutting down dispatcher", "grace_period", gracePeriod)
 	return nil
 }
-
